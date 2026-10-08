@@ -142,3 +142,24 @@ See the [announcement PR](https://github.com/google-deepmind/mujoco_warp/pull/11
 # License
 
 MJWarp is released under the Apache 2.0 license. See [LICENSE](LICENSE) for details.
+
+## MPS / MLX (`mujoco_warp.mps`)
+
+Optional MLX (Metal) engine for Apple silicon; runs many worlds in one process. Warp has no Metal backend, so this is a parallel implementation, not a warp device.
+
+```bash
+uv sync --extra mlx
+```
+
+```python
+import mujoco, numpy as np
+from mujoco_warp.mps.model import convert
+from mujoco_warp.mps.batched_engine import BatchedEngine
+
+mjm = mujoco.MjModel.from_xml_path("model.xml")
+eng = BatchedEngine(convert(mjm), nworld=4096)   # one engine, N worlds
+eng.set_state(qpos, qvel, ctrl)                  # numpy (N, nq/nv/nu)
+qpos, qvel = eng.step_np()                       # numpy out; MLX eval handled internally
+```
+
+Verified: `USABLE: (4, 21) (4, 20) finite: True`. Validated for plane-vs-convex-mesh contacts; see `mujoco_warp/mps/README.md` for status and benchmarks.

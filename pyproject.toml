@@ -68,6 +68,9 @@ cpu = [
 cuda = [
     "jax[cuda12]"
 ]
+mlx = [
+    "mlx",
+]
 
 [project.scripts]
 mjwarp-testspeed = "mujoco_warp.testspeed:main"
