@@ -31,13 +31,19 @@ from mujoco_warp._src.types import Data as Data
 
 from mujoco_warp._src.bvh import refit_bvh as refit_bvh
 from mujoco_warp._src.bvh import refit_splat_bvh as refit_splat_bvh
+from mujoco_warp._src.camera import CameraModel as CameraModel
+from mujoco_warp._src.camera import CameraMotion as CameraMotion
+from mujoco_warp._src.camera import CameraSensor as CameraSensor
 from mujoco_warp._src.collision_driver import collision as collision
 from mujoco_warp._src.collision_driver import nxn_broadphase as nxn_broadphase
 from mujoco_warp._src.collision_driver import sap_broadphase as sap_broadphase
 from mujoco_warp._src.collision_primitive import primitive_narrowphase as primitive_narrowphase
 from mujoco_warp._src.collision_sdf import sdf_narrowphase as sdf_narrowphase
 from mujoco_warp._src.constraint import make_constraint as make_constraint
+from mujoco_warp._src.denoise import denoise as denoise
 from mujoco_warp._src.derivative import deriv_smooth_vel as deriv_smooth_vel
+from mujoco_warp._src.diff_render import DifferentiableRenderer as DifferentiableRenderer
+from mujoco_warp._src.event_camera import EventCamera as EventCamera
 from mujoco_warp._src.forward import discrete as discrete
 from mujoco_warp._src.forward import euler as euler
 from mujoco_warp._src.forward import forward as forward
@@ -63,7 +69,11 @@ from mujoco_warp._src.io import put_model as put_model
 from mujoco_warp._src.io import reset_data as reset_data
 from mujoco_warp._src.io import reset_data_keyframe as reset_data_keyframe
 from mujoco_warp._src.island import island as island
+from mujoco_warp._src.lidar import Lidar as Lidar
+from mujoco_warp._src.lidar import LidarScan as LidarScan
 from mujoco_warp._src.passive import passive as passive
+from mujoco_warp._src.path_trace import PathTracer as PathTracer
+from mujoco_warp._src.randomize import randomize_colors as randomize_colors
 from mujoco_warp._src.ray import ray as ray
 from mujoco_warp._src.ray import rays as rays
 from mujoco_warp._src.render import render as render
