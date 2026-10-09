@@ -1,3 +1,31 @@
+# MLX engines (`mujoco_warp.mps`)
+
+Two engines live here:
+
+1. **Robot engine (current)** — `rig.py` + `fused.py` + `robot.py`: world-batched
+   Metal kernels for arbitrary free/slide/hinge robot models with primitive
+   geoms (plane/sphere/capsule), pyramidal contacts, mask-Newton and Euler.
+   Public API:
+
+   ```python
+   from mujoco_warp.mps.robot import BatchedEngine
+
+   eng = BatchedEngine(mjm, nworld=4096)
+   eng.set_state(qpos, qvel, ctrl)   # numpy (N, nq/nv/nu)
+   qpos, qvel = eng.step_np(ctrl)
+   ```
+
+   Validate `uv run python -m mujoco_warp.mps.validate`; benchmark
+   `uv run python -m mujoco_warp.mps.bench`. On an M1 Pro with the humanoid
+   scene this reaches ~132k worlds/s (4096 worlds) vs ~12.2k worlds/s for the
+   warp CPU backend (~10.8x), tracking warp-CPU trajectories across contacts to
+   float32 noise (~3e-6 qpos / ~2e-4 qvel over 100 steps).
+
+2. **Legacy microduck reference** (below) — the original single-model engine and
+   its world-batched port, kept for reference.
+
+---
+
 # microduck on MLX
 
 World-batched implementation of the microduck simulation loop, written directly on

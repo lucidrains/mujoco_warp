@@ -145,21 +145,50 @@ MJWarp is released under the Apache 2.0 license. See [LICENSE](LICENSE) for deta
 
 ## MPS / MLX (`mujoco_warp.mps`)
 
-Optional MLX (Metal) engine for Apple silicon; runs many worlds in one process. Warp has no Metal backend, so this is a parallel implementation, not a warp device.
+Optional MLX (Metal) engine for Apple silicon; runs many worlds in one process. Warp has no Metal backend, so this is a parallel implementation of the rigid-body pipeline, not a warp device.
 
 ```bash
 uv sync --extra mlx
 ```
 
 ```python
-import mujoco, numpy as np
-from mujoco_warp.mps.model import convert
-from mujoco_warp.mps.batched_engine import BatchedEngine
+import mujoco
+from mujoco_warp.mps.robot import BatchedEngine
 
-mjm = mujoco.MjModel.from_xml_path("model.xml")
-eng = BatchedEngine(convert(mjm), nworld=4096)   # one engine, N worlds
-eng.set_state(qpos, qvel, ctrl)                  # numpy (N, nq/nv/nu)
-qpos, qvel = eng.step_np()                       # numpy out; MLX eval handled internally
+mjm = mujoco.MjModel.from_xml_path("mujoco_warp/test_data/humanoid/humanoid.xml")
+eng = BatchedEngine(mjm, nworld=4096)   # one engine, N worlds
+eng.set_state(qpos, qvel, ctrl)         # numpy (N, nq/nv/nu)
+qpos, qvel = eng.step_np(ctrl)          # numpy out; MLX eval handled internally
 ```
 
-Verified: `USABLE: (4, 21) (4, 20) finite: True`. Validated for plane-vs-convex-mesh contacts; see `mujoco_warp/mps/README.md` for status and benchmarks.
+Scope: free/slide/hinge joints, primitive geoms (plane, sphere, capsule),
+pyramidal cone, Euler integrator, joint motor/position actuators. Other model
+features raise at construction. Everything else is per-step per-world work
+fused into two Metal kernels (dynamics+collision+constraint rows; mask-Newton
+solve+Euler integration), one GPU thread per world.
+
+Validation against the warp CPU backend on the humanoid scene
+(`uv run python -m mujoco_warp.mps.validate`): one-step dynamics elements (M,
+bias, smooth, contact rows) match to float32 noise; 100-step trajectories track
+within ~3e-6 qpos / ~2e-4 qvel across contacts.
+
+Throughput (`uv run python -m mujoco_warp.mps.bench`, Apple M1 Pro, humanoid,
+higher is better):
+
+```
+  nworld | MLX worlds/s | warp-CPU worlds/s | speedup
+--------------------------------------------------------
+      64 |        8,157 |                -- |      --
+     256 |       19,889 |            12,357 |     1.6x
+    1024 |       64,944 |                -- |     5.3x*
+    4096 |      132,826 |                -- |    10.7x*
+   16384 |       99,193 |                -- |     8.0x*
+```
+
+*: warp-CPU saturates at ~12,200 - 14,100 worlds/s on this machine, so the
+speedup is measured against that saturated throughput. Relative to plain MuJoCo C
+stepping one world at a time (~47,000 worlds/s single-core, ~102,000 worlds/s with
+4 CPU worker threads), the MLX engine wins from roughly two thousand worlds up (~1.3x
+over multi-threaded C MuJoCo at peak). Peak MLX throughput is at a few
+thousand worlds; larger batches (16k) regress somewhat as the per-thread
+Newton/Cholesky working set exceeds scratch-memory sweet spots.
