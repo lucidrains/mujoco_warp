@@ -18,6 +18,7 @@ from typing import Tuple
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -5838,36 +5839,78 @@ def make_constraint(m: types.Model, d: types.Data):
             block_dim=tile_size,
           )
         else:
-          wp.launch_tiled(
-            _efc_contact_jac_dense(tile_size, m.opt.cone),
-            dim=(d.nworld, n_dof_blocks),
-            inputs=[
-              m.body_rootid,
-              m.geom_bodyid,
-              m.body_isdofancestor,
-              d.ne,
-              d.nf,
-              d.nl,
-              d.nefc,
-              d.qvel,
-              d.subtree_com,
-              d.cdof,
-              d.contact.efc_address,
-              d.efc.id,
-              d.njmax,
+          nim_ops = nim_cpu.get_ops()
+          if (
+            nim_ops is not None
+            and nim_cpu.enabled("contact_jac_dense")
+            and nim_cpu.dense_worthy(m.nv_pad)
+            and nim_cpu.is_contiguous(m.body_isdofancestor)
+            and nim_cpu.is_contiguous(d.subtree_com)
+            and nim_cpu.is_contiguous(d.cdof)
+            and nim_cpu.is_contiguous(d.qvel)
+            and nim_cpu.is_contiguous(d.efc.J)
+            and nim_cpu.is_contiguous(d.efc.Jqvel)
+            and nim_cpu.is_contiguous(d.efc.id)
+          ):
+            nim_ops.contact_jac_dense(
+              d.nworld,
+              m.nv,
               m.nv_pad,
-              d.contact.dim,
-              d.contact.geom,
-              d.contact.pos,
-              contact_frame_2d,
-              contact_friction_2d,
-            ],
-            outputs=[
-              d.efc.J,
-              d.efc.Jqvel,
-            ],
-            block_dim=tile_size,
-          )
+              d.njmax,
+              m.nbody,
+              d.contact.efc_address.shape[1],
+              int(m.opt.cone == types.ConeType.ELLIPTIC),
+              nim_cpu.ptr(m.body_isdofancestor),
+              nim_cpu.ptr(m.body_rootid),
+              nim_cpu.ptr(m.geom_bodyid),
+              nim_cpu.ptr(d.ne),
+              nim_cpu.ptr(d.nf),
+              nim_cpu.ptr(d.nl),
+              nim_cpu.ptr(d.nefc),
+              nim_cpu.ptr(d.qvel),
+              nim_cpu.ptr(d.subtree_com),
+              nim_cpu.ptr(d.cdof),
+              nim_cpu.ptr(d.contact.efc_address),
+              nim_cpu.ptr(d.efc.id),
+              nim_cpu.ptr(d.contact.dim),
+              nim_cpu.ptr(d.contact.geom),
+              nim_cpu.ptr(d.contact.pos),
+              nim_cpu.ptr(d.contact.frame),
+              nim_cpu.ptr(d.contact.friction),
+              nim_cpu.ptr(d.efc.J),
+              nim_cpu.ptr(d.efc.Jqvel),
+            )
+          else:
+            wp.launch_tiled(
+              _efc_contact_jac_dense(tile_size, m.opt.cone),
+              dim=(d.nworld, n_dof_blocks),
+              inputs=[
+                m.body_rootid,
+                m.geom_bodyid,
+                m.body_isdofancestor,
+                d.ne,
+                d.nf,
+                d.nl,
+                d.nefc,
+                d.qvel,
+                d.subtree_com,
+                d.cdof,
+                d.contact.efc_address,
+                d.efc.id,
+                d.njmax,
+                m.nv_pad,
+                d.contact.dim,
+                d.contact.geom,
+                d.contact.pos,
+                contact_frame_2d,
+                contact_friction_2d,
+              ],
+              outputs=[
+                d.efc.J,
+                d.efc.Jqvel,
+              ],
+              block_dim=tile_size,
+            )
 
       if m.flg_surfacevel:
         wp.launch(

@@ -71,6 +71,10 @@ cuda = [
 mlx = [
     "mlx",
 ]
+nim = [
+    "nimporter-plus",
+    "setuptools",
+]
 
 [project.scripts]
 mjwarp-testspeed = "mujoco_warp.testspeed:main"
@@ -126,7 +130,7 @@ testpaths = ["mujoco_warp"]
 norecursedirs = ["benchmarks", "contrib"]
 
 [tool.setuptools]
-package-data = { "mujoco_warp" = ["test_data/**"] }
+package-data = { "mujoco_warp" = ["test_data/**", "_src/*.nim", "_src/*.nim.cfg"] }
 
 [tool.setuptools.packages.find]
 include = ["mujoco_warp*"]

@@ -17,6 +17,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MAXVAL
@@ -3667,13 +3668,41 @@ def _factor_solve_blocks(
         block_dim=m.block_dim.small_cholesky,
       )
     else:
-      wp.launch_tiled(
-        _tile_cholesky_factorize_solve_block(tile),
-        dim=(d.nworld, tile.adr.size),
-        inputs=[m.qLD_block_adr, M, tile.elemid, tile.adr, y],
-        outputs=[x, L],
-        block_dim=m.block_dim.cholesky_factorize_solve,
-      )
+      nim_ops = nim_cpu.get_ops()
+      if (
+        nim_ops is not None
+        and nim_cpu.enabled("block_cholesky_factorize_solve")
+        and nim_cpu.dense_worthy(m.nv_pad)
+        and M.shape[1] == m.nC
+        and nim_cpu.is_contiguous(M)
+        and nim_cpu.is_contiguous(y)
+        and nim_cpu.is_contiguous(x)
+        and nim_cpu.is_contiguous(L)
+      ):
+        nim_ops.block_cholesky_factorize_solve(
+          d.nworld,
+          tile.adr.size,
+          tile.size,
+          tile.size * tile.size,
+          m.nC,
+          y.shape[1],
+          L.shape[1],
+          nim_cpu.ptr(tile.adr),
+          nim_cpu.ptr(tile.elemid),
+          nim_cpu.ptr(m.qLD_block_adr),
+          nim_cpu.ptr(M),
+          nim_cpu.ptr(y),
+          nim_cpu.ptr(x),
+          nim_cpu.ptr(L),
+        )
+      else:
+        wp.launch_tiled(
+          _tile_cholesky_factorize_solve_block(tile),
+          dim=(d.nworld, tile.adr.size),
+          inputs=[m.qLD_block_adr, M, tile.elemid, tile.adr, y],
+          outputs=[x, L],
+          block_dim=m.block_dim.cholesky_factorize_solve,
+        )
 
 
 def factor_solve_i(m, d, M, L, D, x, y):

@@ -22,6 +22,7 @@ import warp as wp
 from mujoco_warp._src import derivative
 from mujoco_warp._src import island
 from mujoco_warp._src import math
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src import smooth
 from mujoco_warp._src import support
 from mujoco_warp._src import types
@@ -2949,13 +2950,39 @@ def _cholesky_factorize_solve(
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
   if m.nv <= _BLOCK_CHOLESKY_DIM:
-    wp.launch_tiled(
-      _update_gradient_cholesky(m.nv, skip_noflip),
-      dim=d.nworld,
-      inputs=[ctx.grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
-      outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-      block_dim=m.block_dim.update_gradient_cholesky,
-    )
+    changed = ctx.state_changed_count if skip_noflip else d.nefc
+    nim_ops = nim_cpu.get_ops()
+    if (
+      nim_ops is not None
+      and nim_cpu.enabled("cholesky_solve_dense")
+      and nim_cpu.dense_worthy(m.nv_pad)
+      and ctx.grad.shape[1] == m.nv_pad
+      and nim_cpu.is_contiguous(ctx.grad)
+      and nim_cpu.is_contiguous(ctx.h)
+      and nim_cpu.is_contiguous(ctx.search)
+      and nim_cpu.is_contiguous(changed)
+    ):
+      nim_ops.cholesky_solve_dense(
+        d.nworld,
+        m.nv,
+        m.nv_pad,
+        int(skip_noflip),
+        nim_cpu.ptr(ctx.grad),
+        nim_cpu.ptr(ctx.h),
+        nim_cpu.ptr(changed),
+        nim_cpu.ptr(ctx.done),
+        nim_cpu.ptr(ctx.search),
+        nim_cpu.ptr(ctx.search_dot),
+        nim_cpu.ptr(ctx.newton_decrement),
+      )
+    else:
+      wp.launch_tiled(
+        _update_gradient_cholesky(m.nv, skip_noflip),
+        dim=d.nworld,
+        inputs=[ctx.grad, ctx.h, changed, ctx.done],
+        outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+        block_dim=m.block_dim.update_gradient_cholesky,
+      )
   else:
     wp.launch(
       _padding_h,
@@ -3368,22 +3395,50 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           block_dim=m.block_dim.update_gradient_JTDAJ_dense,
         )
       else:
-        wp.launch_tiled(
-          _update_gradient_JTDAJ_dense_tiled(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, m.M_colind.shape[0]),
-          dim=d.nworld,
-          inputs=[
-            m.M_colind,
-            m.M_hinit_i,
-            d.nefc,
-            m_mat,
-            d.efc.J,
-            d.efc.D,
-            d.efc.state,
-            ctx.done,
-          ],
-          outputs=[ctx.h],
-          block_dim=m.block_dim.update_gradient_JTDAJ_dense,
-        )
+        nim_ops = nim_cpu.get_ops()
+        nC = m.M_colind.shape[0]
+        if (
+          nim_ops is not None
+          and nim_cpu.enabled("jtda_j_dense")
+          and nim_cpu.dense_worthy(m.nv_pad)
+          and m_mat.shape[1] == nC
+          and d.efc.J.shape[2] == m.nv_pad
+          and nim_cpu.is_contiguous(m_mat)
+          and nim_cpu.is_contiguous(d.efc.J)
+          and nim_cpu.is_contiguous(ctx.h)
+        ):
+          nim_ops.jtda_j_dense(
+            d.nworld,
+            m.nv_pad,
+            d.njmax,
+            nC,
+            nim_cpu.ptr(m.M_colind),
+            nim_cpu.ptr(m.M_hinit_i),
+            nim_cpu.ptr(d.nefc),
+            nim_cpu.ptr(m_mat),
+            nim_cpu.ptr(d.efc.J),
+            nim_cpu.ptr(d.efc.D),
+            nim_cpu.ptr(d.efc.state),
+            nim_cpu.ptr(ctx.done),
+            nim_cpu.ptr(ctx.h),
+          )
+        else:
+          wp.launch_tiled(
+            _update_gradient_JTDAJ_dense_tiled(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, nC),
+            dim=d.nworld,
+            inputs=[
+              m.M_colind,
+              m.M_hinit_i,
+              d.nefc,
+              m_mat,
+              d.efc.J,
+              d.efc.D,
+              d.efc.state,
+              ctx.done,
+            ],
+            outputs=[ctx.h],
+            block_dim=m.block_dim.update_gradient_JTDAJ_dense,
+          )
 
     if is_discrete:
       wp.launch(
