@@ -20,12 +20,13 @@ import numpy as np
 
 from .fused import dyn_source
 from .fused import solve_source
+from .fused import solve_source_coop
 from .rig import Rig
 
 F = mx.float32
 
 _DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF")
-_SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "ITER", "LSITER", "WARMSTART", "EULERDAMP")
+_SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "ITER", "LSITER", "WARMSTART", "EULERDAMP", "TG")
 
 _DYN_INPUTS = ["qpos_in", "qvel_in", "ctrl_in", "nworld_buf", "mbf", "mif"]
 _SOLVE_TAIL = ["nworld_buf", "dof_damping", "mif", "opt_buf"]
@@ -54,7 +55,18 @@ _DYN_BASE_OUTS = [
   "ncon_out",
   "overflow_out",
 ]
-_DYN_KIN_OUTS = ["cdof_out", "subtree_com_out", "geom_xpos_out", "geom_xmat_out"]
+_DYN_KIN_OUTS = [
+  "cdof_out",
+  "subtree_com_out",
+  "geom_xpos_out",
+  "geom_xmat_out",
+  "xmat_out",
+  "xpos_out",
+  "cvel_out",
+  "xipos_out",
+  "cinert_out",
+  "pair_conct_out",
+]
 _SOLVE_OUTS = ["qpos_out", "qvel_out", "warm_out", "qacc_out", "niter_out"]
 
 # packed-buffer layout: floats then ints, in this order
@@ -99,6 +111,7 @@ _FLOAT_TABLES = [
   "dof_armature",
   "dof_damping",
   "opt_buf",
+  "mesh_vert",
 ]
 _INT_TABLES = [
   "body_parentid",
@@ -127,6 +140,11 @@ _INT_TABLES = [
   "pair_ndim",
   "dof_anc",
   "flag_buf",
+  "mesh_graph",
+  "pair_vadr",
+  "pair_gadr",
+  "pair_vertnum",
+  "pair_usegraph",
 ]
 
 
@@ -199,8 +217,20 @@ class BatchedEngine:
     contact_row_cap: int = 96,
     iterations: int | None = None,
     warmstart: bool = True,
+    coop: bool = True,
+    threadgroup: int = 32,
+    coop_max_worlds: int = 2048,
   ):
-    """Builds kernels and static buffers for `nworld` worlds of `mjm`."""
+    """Builds kernels and static buffers for `nworld` worlds of `mjm`.
+
+    `coop` runs the solve kernel with one threadgroup (`threadgroup` lanes)
+    cooperating on each world; it wins on latency for small batches and is
+    disabled above `coop_max_worlds` (or when threadgroup memory would exceed
+    the device budget), where the one-thread-per-world kernel has better
+    throughput.
+    """
+    if threadgroup < 1 or (threadgroup & (threadgroup - 1)) != 0:
+      raise ValueError(f"threadgroup must be a power of two, got {threadgroup}")
     rig = Rig(mjm, contact_row_cap)
     self.rig = rig
     self.nworld = nworld
@@ -267,6 +297,7 @@ class BatchedEngine:
       LSITER=max(1, rig.ls_iterations),
       WARMSTART=1 if self.warmstart else 0,
       EULERDAMP=1 if rig.eulerdamp else 0,
+      TG=threadgroup,
     )
 
     # ---- packed static tables
@@ -311,6 +342,7 @@ class BatchedEngine:
       "dof_armature": rig.dof_armature,
       "dof_damping": rig.dof_damping,
       "opt_buf": np.array([rig.timestep], np.float32),
+      "mesh_vert": rig.mesh_vert,
     }
     self._i_sources = {
       "body_parentid": rig.body_parentid,
@@ -339,6 +371,11 @@ class BatchedEngine:
       "pair_ndim": rig.pair_ndim,
       "dof_anc": rig.body_isdofancestor,
       "flag_buf": np.array([rig.broadphase_filter], np.int32),
+      "mesh_graph": rig.mesh_graph,
+      "pair_vadr": rig.pair_vadr,
+      "pair_gadr": rig.pair_gadr,
+      "pair_vertnum": rig.pair_vertnum,
+      "pair_usegraph": rig.pair_usegraph,
     }
     mbf_np, self.adr_f = _pack_tables(self._f_sources, _FLOAT_TABLES, np.float32)
     mif_np, self.adr_i = _pack_tables(self._i_sources, _INT_TABLES, np.int32)
@@ -367,6 +404,16 @@ class BatchedEngine:
       self._t_solve,
       {k: self.adr_i[k] for k in ("body_parentid", "body_jntadr", "body_jntnum", "jnt_type", "jnt_qposadr", "jnt_dofadr")},
     )
+    # threadgroup memory estimate for the cooperative solve (see fused.solve_source_coop)
+    tg_bytes = (2 * rig.nv * rig.nv + 10 * rig.nv + rig.nq + 6 * rig.rowcap + 3 * threadgroup) * 4
+    self.coop = bool(coop and nworld <= coop_max_worlds and tg_bytes <= 24 * 1024)
+    self.threadgroup = int(threadgroup)
+    if self.coop:
+      src_s, hdr_s = solve_source_coop(
+        self._t_solve,
+        {k: self.adr_i[k] for k in ("jnt_type", "jnt_qposadr", "jnt_dofadr")},
+        tg=self.threadgroup,
+      )
     self.solve_fn = mx.fast.metal_kernel(
       name="mps_solve",
       input_names=_SOLVE_INPUTS,
@@ -419,37 +466,52 @@ class BatchedEngine:
       grid=(nw, 1, 1),
       threadgroup=(32, 1, 1),
       output_shapes=[
-        (nw * self.nv * self.nv,),
-        (nw * self.nv,),
-        (nw * self.nv,),
-        (nw * self.rowcap * self.nv,),
-        (nw * self.rowcap,),
-        (nw * self.rowcap,),
-        (nw * self.rowcap,),
+        (nw, self.nv, self.nv),
+        (nw, self.nv),
+        (nw, self.nv),
+        (nw, self.rowcap, self.nv),
+        (nw, self.rowcap),
+        (nw, self.rowcap),
+        (nw, self.rowcap),
         (nw,),
         (nw,),
         (nw,),
       ]
-      + ([(nw * self.nv * 6,), (nw * self.nbody * 3,), (nw * self.ngeom * 3,), (nw * self.ngeom * 9,)] if kin else []),
-      output_dtypes=[F, F, F, F, F, F, F, mx.int32, mx.int32, mx.int32] + ([F] * 4 if kin else []),
+      + (
+        [
+          (nw, self.nv, 6),
+          (nw, self.nbody, 3),
+          (nw, self.ngeom, 3),
+          (nw, self.ngeom, 9),
+          (nw, self.nbody, 9),
+          (nw, self.nbody, 3),
+          (nw, self.nbody, 6),
+          (nw, self.nbody, 3),
+          (nw, self.nbody, 10),
+          (nw, self.rig.npairc),
+        ]
+        if kin
+        else []
+      ),
+      output_dtypes=[F, F, F, F, F, F, F, mx.int32, mx.int32, mx.int32]
+      + ([F] * 9 + [mx.int32] if kin else []),
     )
-    M, smooth, bias, J, D, aref, fl, nefc, ncon, overflow = dyn_out[:10]
-    self.M = mx.reshape(M, (nw, self.nv, self.nv))
-    self.smooth = mx.reshape(smooth, (nw, self.nv))
-    self.qfrc_bias = mx.reshape(bias, (nw, self.nv))
-    self.J = mx.reshape(J, (nw, self.rowcap, self.nv))
-    self.D = mx.reshape(D, (nw, self.rowcap))
-    self.aref = mx.reshape(aref, (nw, self.rowcap))
-    self.fl = mx.reshape(fl, (nw, self.rowcap))
-    self.nefc = nefc
-    self.ncon = ncon
-    self.overflow = overflow
+    self.M, self.smooth, self.qfrc_bias, self.J, self.D, self.aref, self.fl, self.nefc, self.ncon, self.overflow = (
+      dyn_out[:10]
+    )
     if kin:
-      cdof_o, subcom_o, gpos_o, gmat_o = dyn_out[10], dyn_out[11], dyn_out[12], dyn_out[13]
-      self.cdof = mx.reshape(cdof_o, (nw, self.nv, 6))
-      self.subtree_com = mx.reshape(subcom_o, (nw, self.nbody, 3))
-      self.geom_xpos = mx.reshape(gpos_o, (nw, self.ngeom, 3))
-      self.geom_xmat = mx.reshape(gmat_o, (nw, self.ngeom, 9))
+      (
+        self.cdof,
+        self.subtree_com,
+        self.geom_xpos,
+        self.geom_xmat,
+        self.xmat,
+        self.xpos,
+        self.cvel,
+        self.xipos,
+        self.cinert,
+        self.pair_conct,
+      ) = dyn_out[10:20]
 
   # --------------------------------------------------------------- step
   def step(self, kin: bool = False):
@@ -474,20 +536,15 @@ class BatchedEngine:
         self._solve_opt,
       ],
       template=self._solve_template,
-      grid=(nw, 1, 1),
-      threadgroup=(32, 1, 1),
+      grid=(nw * self.threadgroup if self.coop else nw, 1, 1),
+      threadgroup=(self.threadgroup if self.coop else 32, 1, 1),
       output_shapes=[
-        (nw * self.nq,),
-        (nw * self.nv,),
-        (nw * self.nv,),
-        (nw * self.nv,),
+        (nw, self.nq),
+        (nw, self.nv),
+        (nw, self.nv),
+        (nw, self.nv),
         (nw,),
       ],
       output_dtypes=[F, F, F, F, mx.int32],
     )
-    qpos_o, qvel_o, warm_o, acc_o, niter = out
-    self.qpos = mx.reshape(qpos_o, (nw, self.nq))
-    self.qvel = mx.reshape(qvel_o, (nw, self.nv))
-    self.warm = mx.reshape(warm_o, (nw, self.nv))
-    self.qacc = mx.reshape(acc_o, (nw, self.nv))
-    self.niter = niter
+    self.qpos, self.qvel, self.warm, self.qacc, self.niter = out

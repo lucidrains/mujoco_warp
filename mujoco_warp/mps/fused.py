@@ -69,6 +69,10 @@ static inline float3 g_mv(const thread float* m, float3 v) {
                 m[6] * v.x + m[7] * v.y + m[8] * v.z);
 }
 
+static inline float3 g_vertex(const device float* verts, int vadr, int idx) {
+  return float3(verts[(vadr + idx) * 3 + 0], verts[(vadr + idx) * 3 + 1], verts[(vadr + idx) * 3 + 2]);
+}
+
 static inline void g_motion_cross(const thread float* u, const thread float* v, thread float* out) {
   float3 u0 = float3(u[0], u[1], u[2]);
   float3 u1 = float3(u[3], u[4], u[5]);
@@ -145,9 +149,11 @@ static inline void g_kbimp(
   } else if (power == 1.0f) {
     imp = dmin + imp_x * (dmax - dmin);
   } else if (imp_x <= mid) {
-    imp = metal::clamp(dmin + (1.0f / metal::pow(mid, power - 1.0f)) * metal::pow(imp_x, power) * (dmax - dmin), dmin, dmax);
+    float ratio = (1.0f / metal::pow(mid, power - 1.0f)) * metal::pow(imp_x, power);
+    imp = metal::clamp(dmin + ratio * (dmax - dmin), dmin, dmax);
   } else {
-    imp = metal::clamp(dmin + (1.0f - (1.0f / metal::pow(1.0f - mid, power - 1.0f)) * metal::pow(1.0f - imp_x, power)) * (dmax - dmin), dmin, dmax);
+    float ratio = 1.0f - (1.0f / metal::pow(1.0f - mid, power - 1.0f)) * metal::pow(1.0f - imp_x, power);
+    imp = metal::clamp(dmin + ratio * (dmax - dmin), dmin, dmax);
   }
   kbimp[0] = k;
   kbimp[1] = b;
@@ -262,6 +268,33 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     f"""
   for (int d = 0; d < {NV}; ++d)
     for (int k = 0; k < 6; ++k) cdof_out[(w * {NV} + d) * 6 + k] = cdof[d * 6 + k];
+"""
+    if kin
+    else ""
+  )
+  kin_body = (
+    f"""
+  for (int b = 0; b < {NB}; ++b) {{
+    for (int k = 0; k < 3; ++k) xpos_out[(w * {NB} + b) * 3 + k] = xp[b * 3 + k];
+    for (int k = 0; k < 9; ++k) xmat_out[(w * {NB} + b) * 9 + k] = xm[b * 9 + k];
+    for (int k = 0; k < 6; ++k) cvel_out[(w * {NB} + b) * 6 + k] = cvel[b * 6 + k];
+    for (int k = 0; k < 3; ++k) xipos_out[(w * {NB} + b) * 3 + k] = xip[b * 3 + k];
+    for (int k = 0; k < 10; ++k) cinert_out[(w * {NB} + b) * 10 + k] = cin[b * 10 + k];
+  }}
+"""
+    if kin
+    else ""
+  )
+  kin_pconct_init = (
+    f"""
+  for (int p = 0; p < {NP}; ++p) pair_conct_out[w * {NP} + p] = 0;
+"""
+    if kin
+    else ""
+  )
+  kin_pconct_write = (
+    f"""
+    pair_conct_out[w * {NP} + p] = pct;
 """
     if kin
     else ""
@@ -496,7 +529,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     }}
     for (int k = 0; k < 6; ++k) cvel[b * 6 + k] = cv[k];
   }}
-
+{kin_body}
   // ==================================================== crb
   for (int i = 0; i < {NB} * 10; ++i) crb[i] = cin[i];
   for (int b = {NB} - 1; b > 0; --b) {{
@@ -607,8 +640,6 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   device float* Dw = D_out + ((long)w) * {RC};
   device float* arefw = aref_out + ((long)w) * {RC};
   device float* flw = fl_out + ((long)w) * {RC};
-  for (int i = 0; i < {RC} * {NV}; ++i) Jw[i] = 0.0f;
-  for (int i = 0; i < {RC}; ++i) flw[i] = 0.0f;
   int rowidx = 0;
   int conct = 0;
   int ovr = 0;
@@ -616,6 +647,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   // ---- friction-dof rows
   for (int k = 0; k < {NFR}; ++k) {{
     int dof = fr_dofs[k];
+    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;
     Jw[rowidx * {NV} + dof] = 1.0f;
     Dw[rowidx] = fr_D[k];
     arefw[rowidx] = -fr_b[k] * v[dof];
@@ -636,7 +668,9 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     float pos_lim = metal::min(dmin, dmax) - mg;
     if (pos_lim >= 0.0f) continue;
     float sgn = dmin < dmax ? 1.0f : -1.0f;
+    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;
     Jw[rowidx * {NV} + dof] = sgn;
+    flw[rowidx] = 0.0f;
     thread float kb[3];
     g_kbimp(&jnt_solref[j * 2], &jnt_solimp[j * 5], pos_lim, timestep, kb);
     float iw = dof_invweight0[dof];
@@ -647,6 +681,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   }}
 
   // ---- contact rows
+{kin_pconct_init}
   for (int p = 0; p < {NP}; ++p) {{
     if (ovr != 0) break;
     int g1 = pair_g1[p];
@@ -713,10 +748,11 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     float r2s = geom_size[g2 * 3 + 0];
     float hl1 = geom_size[g1 * 3 + 1];
     float hl2 = geom_size[g2 * 3 + 1];
-    float ds[2];
-    float3 psd[2];
-    float frms[2][9];
-    ds[0] = 1e6f; ds[1] = 1e6f;
+    float ds[4];
+    float3 psd[4];
+    float frms[4][9];
+    int npts = 1;
+    for (int i = 0; i < 4; ++i) ds[i] = 1e6f;
 
     if (op == 0) {{
       float3 nrm = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
@@ -725,6 +761,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       ds[0] = d; psd[0] = cp;
       g_make_frame(nrm, frms[0]);
     }} else if (op == 1) {{
+      npts = 2;
       float3 nrm = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
       float3 ax = float3(gm[g2 * 9 + 2], gm[g2 * 9 + 5], gm[g2 * 9 + 8]);
       float3 bvec = ax - nrm * g_dot3(nrm, ax);
@@ -769,7 +806,8 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       float3 cp = xa1 + n * (r1s + 0.5f * d);
       ds[0] = d; psd[0] = cp;
       g_make_frame(n, frms[0]);
-    }} else {{
+    }} else if (op == 4) {{
+      npts = 2;
       float3 ax1 = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
       float3 ax2 = float3(gm[g2 * 9 + 2], gm[g2 * 9 + 5], gm[g2 * 9 + 8]);
       float3 sv1 = ax1 * hl1;
@@ -878,6 +916,194 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
         ds[i] = cdist[i]; psd[i] = cpos[i];
         g_make_frame(cnor[i], frms[i]);
       }}
+    }} else if (op == 5) {{
+      // plane (g1) x convex mesh (g2): port of warp plane_convex (graph climb
+      // or exhaustive), mesh vertex/graph tables indexed by per-pair offsets
+      const float huge = 1e6f;
+      float3 pnrm = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
+      const thread float* mr = &gm[g2 * 9];
+      const device float* mv = &mesh_vert[0];
+      float3 dv = xa1 - xa2;
+      float3 pl = float3(
+        mr[0] * dv.x + mr[3] * dv.y + mr[6] * dv.z,
+        mr[1] * dv.x + mr[4] * dv.y + mr[7] * dv.z,
+        mr[2] * dv.x + mr[5] * dv.y + mr[8] * dv.z);
+      float3 nn = float3(
+        mr[0] * pnrm.x + mr[3] * pnrm.y + mr[6] * pnrm.z,
+        mr[1] * pnrm.x + mr[4] * pnrm.y + mr[7] * pnrm.z,
+        mr[2] * pnrm.x + mr[5] * pnrm.y + mr[8] * pnrm.z);
+      int vadr = pair_vadr[p];
+      int gadr = pair_gadr[p];
+      // graph offsets stride by the hull's vertex count (mesh_graph[graphadr])
+      int vnum = (pair_usegraph[p] != 0) ? mesh_graph[gadr] : pair_vertnum[p];
+      int idxs[4];
+      idxs[0] = -1; idxs[1] = -1; idxs[2] = -1; idxs[3] = -1;
+      float max_support = -huge;
+
+      if (pair_usegraph[p] == 0) {{
+        int aidx = -1;
+        for (int i = 0; i < vnum; ++i) {{
+          float3 vv = g_vertex(mv, vadr, i);
+          float sup = g_dot3(pl - vv, nn);
+          if (sup > max_support) {{ max_support = sup; aidx = i; }}
+        }}
+        if (max_support < 0.0f) continue;
+        float threshold = max_support - 1e-3f;
+        float3 av = g_vertex(mv, vadr, aidx);
+
+        int bidx = -1; float bdist = -huge;
+        for (int i = 0; i < vnum; ++i) {{
+          float3 vv = g_vertex(mv, vadr, i);
+          float sup = g_dot3(pl - vv, nn);
+          float msk = (sup > threshold) ? 0.0f : -huge;
+          float dd = g_dot3(av - vv, av - vv) + msk;
+          if (dd > bdist) {{ bdist = dd; bidx = i; }}
+        }}
+        float3 bv = g_vertex(mv, vadr, bidx);
+        float3 ab = g_cross(nn, av - bv);
+
+        int cidx = -1; float cdist = -huge;
+        for (int i = 0; i < vnum; ++i) {{
+          float3 vv = g_vertex(mv, vadr, i);
+          float sup = g_dot3(pl - vv, nn);
+          float msk = (sup > threshold) ? 0.0f : -huge;
+          float dd = metal::abs(g_dot3(av - vv, ab)) + msk;
+          if (dd > cdist) {{ cdist = dd; cidx = i; }}
+        }}
+        float3 cv = g_vertex(mv, vadr, cidx);
+        float3 ac = g_cross(nn, av - cv);
+        float3 bc = g_cross(nn, bv - cv);
+
+        int didx = -1; float ddist = -huge;
+        for (int i = 0; i < vnum; ++i) {{
+          float3 vv = g_vertex(mv, vadr, i);
+          float sup = g_dot3(pl - vv, nn);
+          float msk = (sup > threshold) ? 0.0f : -huge;
+          float dd = metal::abs(g_dot3(av - vv, ac)) + metal::abs(g_dot3(bv - vv, bc)) + msk;
+          if (dd > ddist) {{ ddist = dd; didx = i; }}
+        }}
+        idxs[0] = aidx; idxs[1] = bidx; idxs[2] = cidx; idxs[3] = didx;
+      }} else {{
+        int prev = -1; int imax = 0;
+        while (true) {{
+          prev = imax;
+          int ii = mesh_graph[gadr + 2 + imax];
+          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
+            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
+            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
+            float3 vv = g_vertex(mv, vadr, vidx);
+            float sup = g_dot3(pl - vv, nn);
+            if (sup > max_support) {{ max_support = sup; imax = subidx; }}
+            ii += 1;
+          }}
+          if (imax == prev) break;
+        }}
+        if (max_support < 0.0f) continue;
+        float threshold = metal::max(0.0f, max_support - 1e-3f);
+
+        float adist = -huge;
+        while (true) {{
+          prev = imax;
+          int ii = mesh_graph[gadr + 2 + imax];
+          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
+            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
+            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
+            float3 vv = g_vertex(mv, vadr, vidx);
+            float sup = g_dot3(pl - vv, nn);
+            float dd = (sup > threshold) ? sup : -huge;
+            if (dd > adist) {{ adist = dd; imax = subidx; }}
+            ii += 1;
+          }}
+          if (imax == prev) break;
+        }}
+        int ag = mesh_graph[gadr + 2 + vnum + imax];
+        float3 av = g_vertex(mv, vadr, ag);
+        idxs[0] = ag;
+
+        float bdist = -huge;
+        while (true) {{
+          prev = imax;
+          int ii = mesh_graph[gadr + 2 + imax];
+          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
+            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
+            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
+            float3 vv = g_vertex(mv, vadr, vidx);
+            float sup = g_dot3(pl - vv, nn);
+            float msk = (sup > threshold) ? 0.0f : -huge;
+            float dd = g_dot3(av - vv, av - vv) + msk;
+            if (dd > bdist) {{ bdist = dd; imax = subidx; }}
+            ii += 1;
+          }}
+          if (imax == prev) break;
+        }}
+        int bg = mesh_graph[gadr + 2 + vnum + imax];
+        float3 bv = g_vertex(mv, vadr, bg);
+        idxs[1] = bg;
+        float3 ab = g_cross(nn, av - bv);
+
+        float cdist = -huge;
+        while (true) {{
+          prev = imax;
+          int ii = mesh_graph[gadr + 2 + imax];
+          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
+            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
+            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
+            float3 vv = g_vertex(mv, vadr, vidx);
+            float sup = g_dot3(pl - vv, nn);
+            float msk = (sup > threshold) ? 0.0f : -huge;
+            float dd = metal::abs(g_dot3(av - vv, ab)) + msk;
+            if (dd > cdist) {{ cdist = dd; imax = subidx; }}
+            ii += 1;
+          }}
+          if (imax == prev) break;
+        }}
+        int cg = mesh_graph[gadr + 2 + vnum + imax];
+        float3 cv = g_vertex(mv, vadr, cg);
+        idxs[2] = cg;
+        float3 ac = g_cross(nn, av - cv);
+        float3 bc = g_cross(nn, bv - cv);
+
+        float ddist = -huge;
+        while (true) {{
+          prev = imax;
+          int ii = mesh_graph[gadr + 2 + imax];
+          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
+            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
+            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
+            float3 vv = g_vertex(mv, vadr, vidx);
+            float sup = g_dot3(pl - vv, nn);
+            float msk = (sup > threshold) ? 0.0f : -huge;
+            float dd = metal::abs(g_dot3(av - vv, ac)) + metal::abs(g_dot3(bv - vv, bc)) + msk;
+            if (dd > ddist) {{ ddist = dd; imax = subidx; }}
+            ii += 1;
+          }}
+          if (imax == prev) break;
+        }}
+        int dg = mesh_graph[gadr + 2 + vnum + imax];
+        idxs[3] = dg;
+      }}
+
+      // emit unique indices in slot order, transformed to the world frame
+      int slot = 0;
+      for (int ci = 3; ci >= 0; --ci) {{
+        int idx = idxs[ci];
+        int count = 0;
+        for (int cj = 0; cj <= ci; ++cj) if (idxs[cj] == idx) count += 1;
+        if (count != 1) continue;
+        float3 lv = g_vertex(mv, vadr, idx);
+        float3 wp = xa2 + float3(
+          mr[0] * lv.x + mr[1] * lv.y + mr[2] * lv.z,
+          mr[3] * lv.x + mr[4] * lv.y + mr[5] * lv.z,
+          mr[6] * lv.x + mr[7] * lv.y + mr[8] * lv.z);
+        float sup = g_dot3(pl - lv, nn);
+        float dist = -sup;
+        wp = wp - 0.5f * dist * pnrm;
+        ds[slot] = dist;
+        psd[slot] = wp;
+        g_make_frame(pnrm, frms[slot]);
+        slot += 1;
+      }}
+      npts = slot;
     }}
 
     float fric[5];
@@ -891,10 +1117,15 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     float3 com1 = float3(subcom[rt1 * 3 + 0], subcom[rt1 * 3 + 1], subcom[rt1 * 3 + 2]);
     float3 com2 = float3(subcom[rt2 * 3 + 0], subcom[rt2 * 3 + 1], subcom[rt2 * 3 + 2]);
 
-    for (int i = 0; i < 2; ++i) {{
+    int pct = 0;
+    for (int i = 0; i < npts; ++i) {{
       float pos_c = ds[i] - margin_c;
       if (pos_c >= 0.0f) continue;
       if (rowidx + nd > {RC}) {{ ovr = 1; break; }}
+      for (int dim = 0; dim < nd; ++dim) {{
+        for (int d = 0; d < {NV}; ++d) Jw[(rowidx + dim) * {NV} + d] = 0.0f;
+        flw[rowidx + dim] = 0.0f;
+      }}
       thread float kb[3];
       g_kbimp(&pair_solref[p * 2], &pair_solimp[p * 5], pos_c, timestep, kb);
       float Dv = 1.0f / metal::max(invw * (1.0f - kb[2]) / kb[2], 1e-15f);
@@ -916,16 +1147,21 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
         float3 jpd = jp2 - jp1;
         float3 jrd = (a2 != 0 ? ang : float3(0.0f)) - (a1 != 0 ? ang : float3(0.0f));
         float base0 = g_dot3(jpd, float3(frmi[0], frmi[1], frmi[2]));
+        float e1 = (nd > 1) ? g_dot3(jpd, float3(frmi[3], frmi[4], frmi[5])) : 0.0f;
+        float e2 = (nd > 2) ? g_dot3(jpd, float3(frmi[6], frmi[7], frmi[8])) : 0.0f;
+        float e3 = (nd > 4) ? g_dot3(jrd, float3(frmi[0], frmi[1], frmi[2])) : 0.0f;
+        float e4 = (nd > 6) ? g_dot3(jrd, float3(frmi[3], frmi[4], frmi[5])) : 0.0f;
+        float e5 = (nd > 8) ? g_dot3(jrd, float3(frmi[6], frmi[7], frmi[8])) : 0.0f;
         for (int dim = 0; dim < nd; ++dim) {{
           int dimd2 = dim / 2 + 1;
           float fri = fric[dimd2 - 1];
           float sgnd = fri * (1.0f - 2.0f * (float)(dim & 1));
-          float extra;
-          if (dimd2 == 1) extra = g_dot3(jpd, float3(frmi[3], frmi[4], frmi[5]));
-          else if (dimd2 == 2) extra = g_dot3(jpd, float3(frmi[6], frmi[7], frmi[8]));
-          else if (dimd2 == 3) extra = g_dot3(jrd, float3(frmi[0], frmi[1], frmi[2]));
-          else if (dimd2 == 4) extra = g_dot3(jrd, float3(frmi[3], frmi[4], frmi[5]));
-          else extra = g_dot3(jrd, float3(frmi[6], frmi[7], frmi[8]));
+          float extra = 0.0f;
+          if (dimd2 == 1) extra = e1;
+          else if (dimd2 == 2) extra = e2;
+          else if (dimd2 == 3) extra = e3;
+          else if (dimd2 == 4) extra = e4;
+          else extra = e5;
           float val = base0 + (nd > 1 ? sgnd * extra : 0.0f);
           Jw[(rowidx + dim) * {NV} + dof] = val;
           qv[dim] += val * v[dof];
@@ -937,7 +1173,9 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       }}
       rowidx += nd;
       conct += 1;
+      pct += 1;
     }}
+{kin_pconct_write}
   }}
 
   nefc_out[w] = rowidx;
@@ -969,20 +1207,24 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
 
   thread float M[{NV} * {NV}];
   for (int i = 0; i < {NV} * {NV}; ++i) M[i] = M_in[w * {NV} * {NV} + i];
-  thread float L[{NV} * {NV}];
-  for (int i = 0; i < {NV} * {NV}; ++i) L[i] = M[i];
-  g_chol_inplace(L, {NV});
-  thread float smooth[{NV}];
-  for (int i = 0; i < {NV}; ++i) smooth[i] = smooth_in[w * {NV} + i];
-  thread float qacc_smooth[{NV}];
-  g_chol_solve_fact(L, smooth, qacc_smooth, {NV});
 
   thread float acc[{NV}];
   if ({WS} != 0) {{
     for (int i = 0; i < {NV}; ++i) acc[i] = warm_in[w * {NV} + i];
   }} else {{
+    // factorization lives only on the cold path: with warmstart the smoothed
+    // acceleration is never read
+    thread float L[{NV} * {NV}];
+    for (int i = 0; i < {NV} * {NV}; ++i) L[i] = M[i];
+    g_chol_inplace(L, {NV});
+    thread float smooth0[{NV}];
+    for (int i = 0; i < {NV}; ++i) smooth0[i] = smooth_in[w * {NV} + i];
+    thread float qacc_smooth[{NV}];
+    g_chol_solve_fact(L, smooth0, qacc_smooth, {NV});
     for (int i = 0; i < {NV}; ++i) acc[i] = qacc_smooth[i];
   }}
+  thread float smooth[{NV}];
+  for (int i = 0; i < {NV}; ++i) smooth[i] = smooth_in[w * {NV} + i];
   int nefc = nefc_in[w];
   if (nefc > {RC}) nefc = {RC};
 
@@ -1018,22 +1260,31 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
   thread float qc[{NV}];
   thread float grad[{NV}];
   thread float h[{NV} * {NV}];
-  for (int i = 0; i < {NV}; ++i) {{
-    qc[i] = 0.0f;
-    for (int j = 0; j < {NV}; ++j) h[i * {NV} + j] = M[i * {NV} + j];
+  for (int i = 0; i < {NV}; ++i) qc[i] = 0.0f;
+
+  // lower-triangle Hessian rebuild (h is never read above the diagonal); deferred
+  // past the convergence check so a converged last Newton iteration skips it
+#define REBUILD_LH() \\
+  {{ \\
+    for (int i = 0; i < {NV}; ++i) \\
+      for (int j = 0; j <= i; ++j) h[i * {NV} + j] = M[i * {NV} + j]; \\
+    for (int r = 0; r < nefc; ++r) {{ \\
+      float dqr = squad[r] * Dd[r]; \\
+      if (dqr == 0.0f) continue; \\
+      const long jb = ((long)w * {RC} + r) * {NV}; \\
+      thread float jr[{NV}]; \\
+      for (int j = 0; j < {NV}; ++j) jr[j] = J_in[jb + j]; \\
+      for (int i = 0; i < {NV}; ++i) {{ \\
+        float dq2 = dqr * jr[i]; \\
+        for (int j = 0; j <= i; ++j) h[i * {NV} + j] += dq2 * jr[j]; \\
+      }} \\
+    }} \\
   }}
+  REBUILD_LH();
   for (int r = 0; r < nefc; ++r) {{
     const long jbase = ((long)w * {RC} + r) * {NV};
     float fr = force[r];
-    float dqr = squad[r] * Dd[r];
-    for (int i = 0; i < {NV}; ++i) {{
-      float ji = J_in[jbase + i];
-      qc[i] += fr * ji;
-      if (dqr != 0.0f) {{
-        float dq2 = dqr * ji;
-        for (int j = 0; j < {NV}; ++j) h[i * {NV} + j] += dq2 * J_in[jbase + j];
-      }}
-    }}
+    for (int i = 0; i < {NV}; ++i) qc[i] += fr * J_in[jbase + i];
   }}
   for (int i = 0; i < {NV}; ++i) grad[i] = Ma[i] - smooth[i] - qc[i];
 
@@ -1178,22 +1429,11 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
       force[r] = -g2;
       squad[r] = (h2 > 0.0f) ? 1.0f : 0.0f;
     }}
-    for (int i = 0; i < {NV}; ++i) {{
-      qc[i] = 0.0f;
-      for (int j = 0; j < {NV}; ++j) h[i * {NV} + j] = M[i * {NV} + j];
-    }}
+    for (int i = 0; i < {NV}; ++i) qc[i] = 0.0f;
     for (int r = 0; r < nefc; ++r) {{
       const long jbase = ((long)w * {RC} + r) * {NV};
       float fr = force[r];
-      float dqr = squad[r] * Dd[r];
-      for (int i = 0; i < {NV}; ++i) {{
-        float ji = J_in[jbase + i];
-        qc[i] += fr * ji;
-        if (dqr != 0.0f) {{
-          float dq2 = dqr * ji;
-          for (int j = 0; j < {NV}; ++j) h[i * {NV} + j] += dq2 * J_in[jbase + j];
-        }}
-      }}
+      for (int i = 0; i < {NV}; ++i) qc[i] += fr * J_in[jbase + i];
     }}
     float grad_dot = 0.0f;
     for (int i = 0; i < {NV}; ++i) {{
@@ -1207,6 +1447,7 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
       | ((0.5f * newton_dec / rescale < tol) ? 1 : 0);
     done = done | newly_done;
     if (done != 0) break;
+    REBUILD_LH();
   }}
 
   if ({ED} != 0) {{
@@ -1261,6 +1502,419 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
   }}
   niter_out[w] = nit;
 """
+  for name, off in sorted((adr_i or {}).items(), key=lambda x: -len(x[0])):
+    body = body.replace(f"{name}[", f"mif[{off} + ")
+  return body, _MSL_HELPERS
+
+
+# --------------------------------------------------------------------- K2 cooperative
+def solve_source_coop(t: dict, adr_i: dict[str, int] | None = None, tg: int = 32) -> tuple[str, str]:
+  """K2 source, cooperative: one threadgroup (TG threads) per world.
+
+  Templates: NJNT NQ NV RC ITER LSITER WARMSTART EULERDAMP TG.
+  Matrices and vectors live in threadgroup memory; row loops are lane-strided.
+  """
+  subs = {
+    "@NV@": str(t["NV"]),
+    "@NQ@": str(t["NQ"]),
+    "@NJ@": str(t["NJNT"]),
+    "@RC@": str(t["RC"]),
+    "@ITER@": str(t["ITER"]),
+    "@LSITER@": str(t["LSITER"]),
+    "@WS@": str(t["WARMSTART"]),
+    "@ED@": str(t["EULERDAMP"]),
+    "@TG@": str(tg),
+  }
+  body = r"""
+  int lane = (int)thread_position_in_threadgroup.x;
+  int w = (int)threadgroup_position_in_grid.x;
+  if (w >= nworld_buf[0]) return;
+
+  const float dt = opt_buf[0];
+  const float tol = opt_buf[1];
+  const float meaninertia = opt_buf[2];
+  const float ls_tol = opt_buf[3];
+
+  threadgroup float sh_M[@NV@ * @NV@];
+  threadgroup float sh_h[@NV@ * @NV@];
+  threadgroup float sh_smooth[@NV@], sh_acc[@NV@], sh_Ma[@NV@], sh_qc[@NV@], sh_grad[@NV@];
+  threadgroup float sh_search[@NV@], sh_mv[@NV@], sh_tmp[@NV@];
+  threadgroup float sh_qpos[@NQ@], sh_qvel[@NV@];
+  threadgroup float sh_Dd[@RC@], sh_fld[@RC@], sh_Jaref[@RC@], sh_force[@RC@], sh_squad[@RC@], sh_jv[@RC@];
+  threadgroup float sh_red[3 * @TG@];
+
+  // right-looking lower Cholesky on a threadgroup matrix; lane owns rows i%TG
+#define PAR_CHOL(A) \
+  { \
+    for (int k = 0; k < @NV@; ++k) { \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+      if (lane == (k % @TG@)) (A)[k * @NV@ + k] = metal::sqrt(metal::max((A)[k * @NV@ + k], 1e-30f)); \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+      float dk = (A)[k * @NV@ + k]; \
+      for (int i = lane; i < @NV@; i += @TG@) { \
+        if (i > k) (A)[i * @NV@ + k] = (A)[i * @NV@ + k] / dk; \
+      } \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+      for (int i = lane; i < @NV@; i += @TG@) { \
+        if (i > k) { \
+          float lik = (A)[i * @NV@ + k]; \
+          for (int j = k + 1; j <= i; ++j) (A)[i * @NV@ + j] -= lik * (A)[j * @NV@ + k]; \
+        } \
+      } \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  }
+
+  // forward/backward substitution with a factored threadgroup matrix (in-place safe)
+#define PAR_SOLVE(A, b, x) \
+  { \
+    for (int i = 0; i < @NV@; ++i) { \
+      if (lane == (i % @TG@)) { \
+        float s = (b)[i]; \
+        for (int j = 0; j < i; ++j) s -= (A)[i * @NV@ + j] * (x)[j]; \
+        (x)[i] = s / (A)[i * @NV@ + i]; \
+      } \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    for (int i = @NV@ - 1; i >= 0; --i) { \
+      if (lane == (i % @TG@)) { \
+        float s = (x)[i]; \
+        for (int j = i + 1; j < @NV@; ++j) s -= (A)[j * @NV@ + i] * (x)[j]; \
+        (x)[i] = s / (A)[i * @NV@ + i]; \
+      } \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+  }
+
+#define REDUCE3(a, b, c, r0, r1, r2) \
+  { \
+    sh_red[0 * @TG@ + lane] = (a); sh_red[1 * @TG@ + lane] = (b); sh_red[2 * @TG@ + lane] = (c); \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (int s = @TG@ / 2; s > 0; s >>= 1) { \
+      if (lane < s) { \
+        sh_red[0 * @TG@ + lane] += sh_red[0 * @TG@ + lane + s]; \
+        sh_red[1 * @TG@ + lane] += sh_red[1 * @TG@ + lane + s]; \
+        sh_red[2 * @TG@ + lane] += sh_red[2 * @TG@ + lane + s]; \
+      } \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    (r0) = sh_red[0 * @TG@]; (r1) = sh_red[1 * @TG@]; (r2) = sh_red[2 * @TG@]; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  }
+
+#define REDUCE1(a, r0) \
+  { \
+    sh_red[lane] = (a); \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (int s = @TG@ / 2; s > 0; s >>= 1) { \
+      if (lane < s) sh_red[lane] += sh_red[lane + s]; \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    (r0) = sh_red[0]; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  }
+
+  // ==================================================== load + acc start
+  for (int i = lane; i < @NV@ * @NV@; i += @TG@) { sh_M[i] = M_in[w * @NV@ * @NV@ + i]; sh_h[i] = sh_M[i]; }
+  for (int i = lane; i < @NV@; i += @TG@) sh_smooth[i] = smooth_in[w * @NV@ + i];
+  for (int i = lane; i < @NQ@; i += @TG@) sh_qpos[i] = qpos_in[w * @NQ@ + i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (@WS@ != 0) {
+    for (int i = lane; i < @NV@; i += @TG@) sh_acc[i] = warm_in[w * @NV@ + i];
+  } else {
+    PAR_CHOL(sh_h);
+    PAR_SOLVE(sh_h, sh_smooth, sh_acc);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  int nefc = nefc_in[w];
+  if (nefc > @RC@) nefc = @RC@;
+
+  // ==================================================== hoist rows + Ma
+  for (int r = lane; r < nefc; r += @TG@) {
+    sh_Dd[r] = D_in[w * @RC@ + r];
+    sh_fld[r] = fl_in[w * @RC@ + r];
+    float ss = 0.0f;
+    for (int i = 0; i < @NV@; ++i) ss += J_in[((long)w * @RC@ + r) * @NV@ + i] * sh_acc[i];
+    sh_Jaref[r] = ss - aref_in[w * @RC@ + r];
+  }
+  for (int i = lane; i < @NV@; i += @TG@) {
+    float ss = 0.0f;
+    for (int j = 0; j < @NV@; ++j) ss += sh_M[i * @NV@ + j] * sh_acc[j];
+    sh_Ma[i] = ss;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int r = lane; r < nefc; r += @TG@) {
+    float c2, g2, h2;
+    g_row_cost(sh_Jaref[r], sh_Dd[r], sh_fld[r], &c2, &g2, &h2);
+    sh_force[r] = -g2;
+    sh_squad[r] = (h2 > 0.0f) ? 1.0f : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int i = lane; i < @NV@; i += @TG@) {
+    float ss = 0.0f;
+    for (int r = 0; r < nefc; ++r) ss += sh_force[r] * J_in[((long)w * @RC@ + r) * @NV@ + i];
+    sh_qc[i] = ss;
+    sh_grad[i] = sh_Ma[i] - sh_smooth[i] - ss;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup float sh_Jr[@NV@];
+
+  // lower-triangle Hessian; each lane rebuilds only its own rows
+#define REBUILD_LH() \
+  { \
+    for (int i = lane; i < @NV@; i += @TG@) \
+      for (int j = 0; j <= i; ++j) sh_h[i * @NV@ + j] = sh_M[i * @NV@ + j]; \
+    for (int r = 0; r < nefc; ++r) { \
+      float dqr = sh_squad[r] * sh_Dd[r]; \
+      if (dqr == 0.0f) continue; \
+      const long jb = ((long)w * @RC@ + r) * @NV@; \
+      for (int k = lane; k < @NV@; k += @TG@) sh_Jr[k] = J_in[jb + k]; \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+      for (int i = lane; i < @NV@; i += @TG@) { \
+        float dq2 = dqr * sh_Jr[i]; \
+        for (int j = 0; j <= i; ++j) sh_h[i * @NV@ + j] += dq2 * sh_Jr[j]; \
+      } \
+      threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  }
+  REBUILD_LH();
+
+  // ==================================================== Newton
+  int done = 0;
+  int nit = 0;
+  for (int it = 0; it < @ITER@; ++it) {
+    nit = it + 1;
+    PAR_CHOL(sh_h);
+    for (int i = lane; i < @NV@; i += @TG@) sh_search[i] = -sh_grad[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    PAR_SOLVE(sh_h, sh_search, sh_search);
+    for (int i = lane; i < @NV@; i += @TG@) {
+      float sss = 0.0f;
+      for (int j = 0; j < @NV@; ++j) sss += sh_M[i * @NV@ + j] * sh_search[j];
+      sh_mv[i] = sss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float nd_loc = 0.0f;
+    for (int i = lane; i < @NV@; i += @TG@) nd_loc -= sh_grad[i] * sh_search[i];
+    float newton_dec;
+    REDUCE1(nd_loc, newton_dec);
+
+    for (int r = lane; r < nefc; r += @TG@) {
+      float ssr = 0.0f;
+      for (int i = 0; i < @NV@; ++i) ssr += J_in[((long)w * @RC@ + r) * @NV@ + i] * sh_search[i];
+      sh_jv[r] = ssr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float cs = 0.0f, gs = 0.0f, hs = 0.0f;
+    for (int i = lane; i < @NV@; i += @TG@) {
+      float mai = sh_Ma[i];
+      float smi = sh_smooth[i];
+      cs += 0.5f * sh_acc[i] * mai - sh_acc[i] * smi;
+      gs += (mai - smi) * sh_search[i];
+      hs += sh_search[i] * sh_mv[i];
+    }
+    float c_sm0, g_sm0, hs_pre;
+    REDUCE3(cs, gs, hs, c_sm0, g_sm0, hs_pre);
+
+#define PHI(alpha, pc, pg, phs) \
+  { \
+    float arv = alpha; \
+    float cc = 0.0f; \
+    float gg = 0.0f; \
+    float hh = 0.0f; \
+    for (int r = lane; r < nefc; r += @TG@) { \
+      float xrc = sh_Jaref[r] + arv * sh_jv[r]; \
+      float c2r, g2r, h2r; \
+      g_row_cost(xrc, sh_Dd[r], sh_fld[r], &c2r, &g2r, &h2r); \
+      cc += c2r; \
+      gg += g2r * sh_jv[r]; \
+      hh += h2r * sh_jv[r] * sh_jv[r]; \
+    } \
+    float cc_r, gg_r, hh_r; \
+    REDUCE3(cc, gg, hh, cc_r, gg_r, hh_r); \
+    *pc = c_sm0 + arv * g_sm0 + 0.5f * arv * arv * hs_pre + cc_r; \
+    *pg = g_sm0 + arv * hs_pre + gg_r; \
+    *phs = hs_pre + hh_r; \
+  }
+
+    float c0, g0, hs0;
+    PHI(0.0f, &c0, &g0, &hs0);
+
+    float snorm_loc = 0.0f;
+    for (int i = lane; i < @NV@; i += @TG@) snorm_loc += sh_search[i] * sh_search[i];
+    float snorm;
+    REDUCE1(snorm_loc, snorm);
+    snorm = metal::sqrt(snorm);
+    float gtol = metal::max(tol * ls_tol * snorm * (meaninertia * (float)@NV@), 1e-6f);
+
+    float lo_alpha_in = -g0 / metal::max(hs0, 1e-30f);
+    float ic, ig, ih;
+    PHI(lo_alpha_in, &ic, &ig, &ih);
+
+    float al = 0.0f;
+    float improvement = 0.0f;
+    if (metal::abs(ig) < gtol && ic < c0) {
+      al = lo_alpha_in;
+      improvement = c0 - ic;
+    } else {
+      int lo_less = ig < g0;
+      float loc = lo_less ? ic : c0;
+      float log_ = lo_less ? ig : g0;
+      float loh = lo_less ? ih : hs0;
+      float loa = lo_less ? lo_alpha_in : 0.0f;
+      float hic = lo_less ? c0 : ic;
+      float hig = lo_less ? g0 : ig;
+      float hih = lo_less ? hs0 : ih;
+      float hia = lo_less ? 0.0f : lo_alpha_in;
+      for (int lsi = 0; lsi < @LSITER@; ++lsi) {
+        float lna = loa - log_ / metal::max(loh, 1e-30f);
+        float hna = hia - hig / metal::max(hih, 1e-30f);
+        float mna = 0.5f * (loa + hia);
+        float lnc, lng, lnh, hnc, hng, hnh, mnc, mng, mnh;
+        PHI(lna, &lnc, &lng, &lnh);
+        PHI(hna, &hnc, &hng, &hnh);
+        PHI(mna, &mnc, &mng, &mnh);
+        int conv_lo = (metal::abs(lng) < gtol) & (lnc < c0);
+        int conv_hi = (metal::abs(hng) < gtol) & (hnc < c0);
+        int conv_mid = (metal::abs(mng) < gtol) & (mnc < c0);
+        int converged = conv_lo | conv_hi | conv_mid;
+        int swap_lo = 0;
+        int swap_hi = 0;
+        if (converged != 0) {
+          float bcp = 1e30f; float bcd = 0.0f; float bch = 0.0f; float bca = 0.0f;
+          if (conv_lo && lnc < bcp) { bcp = lnc; bcd = lng; bch = lnh; bca = lna; }
+          if (conv_hi && hnc < bcp) { bcp = hnc; bcd = hng; bch = hnh; bca = hna; }
+          if (conv_mid && mnc < bcp) { bcp = mnc; bcd = mng; bch = mnh; bca = mna; }
+          loc = bcp; log_ = bcd; loh = bch; loa = bca;
+          hic = bcp; hig = bcd; hih = bch; hia = bca;
+        } else {
+          int s1 = ((log_ < lng && lng < 0.0f) || (log_ > lng && lng > 0.0f)) ? 1 : 0;
+          if (s1) { loc = lnc; log_ = lng; loh = lnh; loa = lna; }
+          int s2 = ((log_ < mng && mng < 0.0f) || (log_ > mng && mng > 0.0f)) ? 1 : 0;
+          if (s2) { loc = mnc; log_ = mng; loh = mnh; loa = mna; }
+          int s3 = ((log_ < hng && hng < 0.0f) || (log_ > hng && hng > 0.0f)) ? 1 : 0;
+          if (s3) { loc = hnc; log_ = hng; loh = hnh; loa = hna; }
+          swap_lo = s1 | s2 | s3;
+          int t1 = (((hig < hng && hng < 0.0f) || (hig > hng && hng > 0.0f)) || (hig < 0.0f && hng > 0.0f)) ? 1 : 0;
+          if (t1) { hic = hnc; hig = hng; hih = hnh; hia = hna; }
+          int t2 = ((hig < mng && mng < 0.0f) || (hig > mng && mng > 0.0f)) ? 1 : 0;
+          if (t2) { hic = mnc; hig = mng; hih = mnh; hia = mna; }
+          int t3 = ((hig < lng && lng < 0.0f) || (hig > lng && lng > 0.0f)) ? 1 : 0;
+          if (t3) { hic = lnc; hig = lng; hih = lnh; hia = lna; }
+          swap_hi = t1 | t2 | t3;
+        }
+        int ls_done = (converged != 0)
+          | ((swap_lo | swap_hi) == 0 ? 1 : 0)
+          | ((loc < c0 && log_ < 0.0f && log_ > -gtol) ? 1 : 0)
+          | ((hic < c0 && hig > 0.0f && hig < gtol) ? 1 : 0);
+        int improved = (loc < c0) | (hic < c0);
+        int lo_better = loc < hic;
+        float ba = lo_better ? loa : hia;
+        float bdd = lo_better ? loc : hic;
+        if (improved != 0) {
+          al = ba;
+          improvement = c0 - bdd;
+        }
+        if (ls_done != 0) break;
+      }
+    }
+    if (done) al = 0.0f;
+
+    for (int i = lane; i < @NV@; i += @TG@) {
+      sh_acc[i] += al * sh_search[i];
+      sh_Ma[i] += al * sh_mv[i];
+    }
+    for (int r = lane; r < nefc; r += @TG@) sh_Jaref[r] += al * sh_jv[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int r = lane; r < nefc; r += @TG@) {
+      float c2, g2, h2;
+      g_row_cost(sh_Jaref[r], sh_Dd[r], sh_fld[r], &c2, &g2, &h2);
+      sh_force[r] = -g2;
+      sh_squad[r] = (h2 > 0.0f) ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gd_loc = 0.0f;
+    for (int i = lane; i < @NV@; i += @TG@) {
+      float ss = 0.0f;
+      for (int r = 0; r < nefc; ++r) ss += sh_force[r] * J_in[((long)w * @RC@ + r) * @NV@ + i];
+      sh_qc[i] = ss;
+      sh_grad[i] = sh_Ma[i] - sh_smooth[i] - ss;
+      gd_loc += sh_grad[i] * sh_grad[i];
+    }
+    float grad_dot;
+    REDUCE1(gd_loc, grad_dot);
+
+    float rescale = meaninertia * (float)@NV@;
+    int newly_done = (al == 0.0f)
+      | ((improvement / rescale < tol) ? 1 : 0)
+      | ((metal::sqrt(grad_dot) / rescale < tol) ? 1 : 0)
+      | ((0.5f * newton_dec / rescale < tol) ? 1 : 0);
+    done = done | newly_done;
+    if (done != 0) break;
+    REBUILD_LH();
+  }
+
+  // ==================================================== euler damping
+  if (@ED@ != 0) {
+    for (int i = lane; i < @NV@; i += @TG@) {
+      float sss = 0.0f;
+      for (int j = 0; j < @NV@; ++j) sss += sh_M[i * @NV@ + j] * sh_acc[j];
+      sh_tmp[i] = sss;
+    }
+    for (int i = lane; i < @NV@ * @NV@; i += @TG@) sh_h[i] = sh_M[i];
+    for (int i = lane; i < @NV@; i += @TG@) sh_h[i * @NV@ + i] += dt * dof_damping[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    PAR_CHOL(sh_h);
+    PAR_SOLVE(sh_h, sh_tmp, sh_acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ==================================================== integrate + write
+  for (int d = lane; d < @NV@; d += @TG@) sh_qvel[d] = qvel_in[w * @NV@ + d] + dt * sh_acc[d];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int j = lane; j < @NJ@; j += @TG@) {
+    int jt = jnt_type[j];
+    int qa = jnt_qposadr[j];
+    int dof = jnt_dofadr[j];
+    if (jt == 0) {
+      sh_qpos[qa + 0] += dt * sh_qvel[dof + 0];
+      sh_qpos[qa + 1] += dt * sh_qvel[dof + 1];
+      sh_qpos[qa + 2] += dt * sh_qvel[dof + 2];
+      float4 quat = g_normalize4(float4(sh_qpos[qa + 3], sh_qpos[qa + 4], sh_qpos[qa + 5], sh_qpos[qa + 6]));
+      float ax3 = dt * sh_qvel[dof + 3];
+      float ay3 = dt * sh_qvel[dof + 4];
+      float az3 = dt * sh_qvel[dof + 5];
+      float nrm = metal::sqrt(ax3 * ax3 + ay3 * ay3 + az3 * az3);
+      float3 axis = nrm > 0.0f ? float3(ax3, ay3, az3) / nrm : float3(1.0f, 0.0f, 0.0f);
+      float halfang = 0.5f * nrm;
+      float4 qr = float4(metal::cos(halfang), axis * metal::sin(halfang));
+      float4 resv = g_normalize4(g_qmul(quat, qr));
+      sh_qpos[qa + 3] = resv.x; sh_qpos[qa + 4] = resv.y; sh_qpos[qa + 5] = resv.z; sh_qpos[qa + 6] = resv.w;
+    } else if (jt == 2 || jt == 3) {
+      sh_qpos[qa] += dt * sh_qvel[dof];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int k = lane; k < @NQ@; k += @TG@) qpos_out[w * @NQ@ + k] = sh_qpos[k];
+  for (int d = lane; d < @NV@; d += @TG@) {
+    qvel_out[w * @NV@ + d] = sh_qvel[d];
+    warm_out[w * @NV@ + d] = sh_acc[d];
+    qacc_out[w * @NV@ + d] = sh_acc[d];
+  }
+  if (lane == 0) niter_out[w] = nit;
+"""
+  for key, val in subs.items():
+    body = body.replace(key, val)
   for name, off in sorted((adr_i or {}).items(), key=lambda x: -len(x[0])):
     body = body.replace(f"{name}[", f"mif[{off} + ")
   return body, _MSL_HELPERS

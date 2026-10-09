@@ -35,12 +35,13 @@ _DISABLE_UNSUPPORTED = int(
   | mujoco_warp.DisableBit.REFSAFE
 )
 
-# primitive narrowphase opcode ids (index = opcode)
+# narrowphase opcode ids (index = opcode)
 OP_PLANE_SPHERE = 0  # 1 point
 OP_PLANE_CAPSULE = 1  # 2 points
 OP_SPHERE_SPHERE = 2  # 1 point
 OP_SPHERE_CAPSULE = 3  # 1 point
 OP_CAPSULE_CAPSULE = 4  # 2 points
+OP_PLANE_MESH = 5  # up to 4 convex-hull points
 
 _GEOM = mujoco.mjtGeom
 _OPCODE_TABLE = {
@@ -49,10 +50,11 @@ _OPCODE_TABLE = {
   (_GEOM.mjGEOM_SPHERE, _GEOM.mjGEOM_SPHERE): OP_SPHERE_SPHERE,
   (_GEOM.mjGEOM_SPHERE, _GEOM.mjGEOM_CAPSULE): OP_SPHERE_CAPSULE,
   (_GEOM.mjGEOM_CAPSULE, _GEOM.mjGEOM_CAPSULE): OP_CAPSULE_CAPSULE,
+  (_GEOM.mjGEOM_PLANE, _GEOM.mjGEOM_MESH): OP_PLANE_MESH,
 }
 
 # max points emitted per opcode (plane-capsule: both capsule ends)
-POINTS_PER_OPCODE = (1, 2, 1, 1, 2)
+POINTS_PER_OPCODE = (1, 2, 1, 1, 2, 4)
 
 
 def _pair_material(mjm: mujoco.MjModel, pairid: int, g1: int, g2: int) -> dict:
@@ -126,6 +128,8 @@ class Rig:
         bool(np.any(np.asarray(mjm.actuator_damping) != 0.0) or np.any(np.asarray(mjm.actuator_dampingpoly) != 0.0)),
       ),
       ("fluid forces", bool(np.any(np.asarray(mjm.geom_fluid) != 0.0))),
+      ("geom adhesion", bool(np.any(np.asarray(mjm.geom_adhesion) != 0.0))),
+      ("geom surface velocity", bool(np.any(np.asarray(mjm.geom_surfacevel) != 0.0))),
       ("sleep", bool(int(mjm.opt.enableflags) & int(mujoco_warp.EnableBit.SLEEP))),
       ("unsupported disable flags", bool(int(mjm.opt.disableflags) & _DISABLE_UNSUPPORTED)),
       ("non-newton solver", SolverType(mjm.opt.solver) != SolverType.NEWTON),
@@ -135,7 +139,7 @@ class Rig:
 
     self.timestep = float(mjm.opt.timestep)
     self.gravity = np.array(mjm.opt.gravity, np.float32)
-    self.impratio = float(mjm.opt.impratio)
+    self.impratio = float(max(mjm.opt.impratio, MJ_MINVAL))
     self.impratio_invsqrt = 1.0 / np.sqrt(self.impratio)
     self.meaninertia = float(mjm.stat.meaninertia)
     self.tolerance = float(np.asarray(m.opt.tolerance.numpy()).reshape(-1)[0])  # warp raises the f32 floor to 1e-6
@@ -225,17 +229,30 @@ class Rig:
     self.nlim = int(len(self.limited_joints))
     self.nfrlim = self.nfr + self.nlim
 
+    # ---- mesh data for plane-convex contacts (indexed by vertex/graph offsets)
+    self.mesh_vert = a(mjm.mesh_vert, np.float32).reshape(-1)
+    self.mesh_graph = a(mjm.mesh_graph, np.int32).reshape(-1)
+
     # ---- contact candidate pairs (world-independent)
     gp = m.nxn_geom_pair_filtered.numpy().astype(np.int32)
     pids = m.nxn_pairid_filtered.numpy().astype(np.int32)
     ops, g1s, g2s, mats = [], [], [], []
+    vads, gads, vnums, uses = [], [], [], []
+    self.skipped_mesh_pairs = 0
     for k in range(len(gp)):
       if int(pids[k, 0]) < -1:
         continue
       g1, g2 = int(gp[k, 0]), int(gp[k, 1])
       lo, hi = (g1, g2) if int(mjm.geom_type[g1]) <= int(mjm.geom_type[g2]) else (g2, g1)
-      opcode = _OPCODE_TABLE.get((int(mjm.geom_type[lo]), int(mjm.geom_type[hi])))
+      types = (int(mjm.geom_type[lo]), int(mjm.geom_type[hi]))
+      opcode = _OPCODE_TABLE.get(types)
       if opcode is None:
+        if types == (_GEOM.mjGEOM_MESH, _GEOM.mjGEOM_MESH):
+          # convex-convex narrowphase is not implemented; skip (the MLX env
+          # treats self-collision-only geoms as non-colliding, like the
+          # legacy microduck batched engine)
+          self.skipped_mesh_pairs += 1
+          continue
         raise ValueError(
           f"MLX engine: unsupported collision pair geoms {g1}x{g2} (types {mjm.geom_type[lo]}x{mjm.geom_type[hi]})"
         )
@@ -243,11 +260,28 @@ class Rig:
       g1s.append(lo)
       g2s.append(hi)
       mats.append(_pair_material(mjm, int(pids[k, 0]), g1, g2))
+      if opcode == OP_PLANE_MESH:
+        mid = int(mjm.geom_dataid[hi])
+        vadr, vnum = int(mjm.mesh_vertadr[mid]), int(mjm.mesh_vertnum[mid])
+        gadr = int(mjm.mesh_graphadr[mid])
+        vads.append(vadr)
+        gads.append(gadr)
+        vnums.append(vnum)
+        uses.append(1 if (gadr != -1 and vnum >= 10) else 0)
+      else:
+        vads.append(0)
+        gads.append(0)
+        vnums.append(0)
+        uses.append(0)
 
     self.npairc = len(ops)
     self.pair_op = np.asarray(ops, np.int32)
     self.pair_g1 = np.asarray(g1s, np.int32)
     self.pair_g2 = np.asarray(g2s, np.int32)
+    self.pair_vadr = np.asarray(vads, np.int32)
+    self.pair_gadr = np.asarray(gads, np.int32)
+    self.pair_vertnum = np.asarray(vnums, np.int32)
+    self.pair_usegraph = np.asarray(uses, np.int32)
     self.pair_body1 = self.geom_bodyid[self.pair_g1].astype(np.int32)
     self.pair_body2 = self.geom_bodyid[self.pair_g2].astype(np.int32)
     if self.npairc > 0:

@@ -194,6 +194,148 @@ def test_humanoid_contact_trajectory():
   assert err_v < 1e-3, f"qvel diverged at step 50: {err_v}"
 
 
+def _plane_box_mesh_model():
+  """Box (inline mesh) free body on a plane; exercises the plane-convex narrowphase."""
+  verts = " ".join(f"{x} {y} {z}" for x in (-0.05, 0.05) for y in (-0.05, 0.05) for z in (-0.05, 0.05))
+  xml = f"""
+  <mujoco>
+    <option timestep="0.005" integrator="Euler"/>
+    <asset><mesh name="box" vertex="{verts}"/></asset>
+    <worldbody>
+      <geom type="plane" size="1 1 0.1" pos="0 0 0"/>
+      <body name="b" pos="0 0 0.049">
+        <joint type="free"/>
+        <geom type="mesh" mesh="box"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  return mujoco.MjModel.from_xml_string(xml)
+
+
+def test_plane_mesh_contact_one_step():
+  """Verifies plane-convex (mesh) contact rows match Warp CPU exactly."""
+  mjm = _plane_box_mesh_model()
+  m = mujoco_warp.put_model(mjm)
+  d = mujoco_warp.make_data(mjm, nworld=1)
+  qpos = np.array(mjm.qpos0, np.float32)[None]
+  qvel = np.zeros((1, mjm.nv), np.float32)
+  d.qpos.numpy()[:] = qpos
+  d.qvel.numpy()[:] = qvel
+  mujoco_warp.forward(m, d)
+
+  eng = BatchedEngine(mjm, nworld=1)
+  eng.set_state(qpos, qvel)
+  eng._dyn_dispatch(kin=True)
+
+  assert int(eng.ncon[0]) == int(d.nacon.numpy()[0]) == 4
+  assert int(eng.nefc[0]) == int(d.nefc.numpy()[0]) == 16
+  assert np.array(eng.pair_conct)[0, 0] == 4
+
+  n = int(d.nefc.numpy()[0])
+  np.testing.assert_allclose(np.array(eng.J)[0, :n], d.efc.J.numpy()[0, :n, : mjm.nv], atol=1e-6)
+  np.testing.assert_allclose(np.array(eng.aref)[0, :n], d.efc.aref.numpy()[0, :n], atol=1e-6)
+  np.testing.assert_allclose(np.array(eng.D)[0, :n], d.efc.D.numpy()[0, :n], atol=1e-6)
+
+
+def test_plane_mesh_trajectory():
+  """Verifies multi-step trajectory of a mesh box on a plane matches Warp CPU."""
+  mjm = _plane_box_mesh_model()
+  m = mujoco_warp.put_model(mjm)
+  d = mujoco_warp.make_data(mjm, nworld=1)
+
+  rng = np.random.default_rng(0)
+  qpos = np.array(mjm.qpos0, np.float32)[None]
+  qpos[:, 2] += 0.004
+  qvel = rng.normal(0, 0.05, (1, mjm.nv)).astype(np.float32)
+  d.qpos.numpy()[:] = qpos
+  d.qvel.numpy()[:] = qvel
+
+  eng = BatchedEngine(mjm, nworld=1)
+  eng.set_state(qpos, qvel)
+  for _ in range(50):
+    mujoco_warp.step(m, d)
+    eng.step()
+
+  qm, vm = eng.get_state()
+  assert np.abs(qm - d.qpos.numpy()).max() < 1e-5
+  assert np.abs(vm - d.qvel.numpy()).max() < 1e-4
+
+
+def test_mesh_mesh_pairs_skipped():
+  """Verifies unsupported convex-convex pairs are skipped, not fatal."""
+  verts = " ".join(f"{x} {y} {z}" for x in (-0.05, 0.05) for y in (-0.05, 0.05) for z in (-0.05, 0.05))
+  xml = f"""
+  <mujoco>
+    <option timestep="0.005" integrator="Euler"/>
+    <asset><mesh name="box" vertex="{verts}"/></asset>
+    <worldbody>
+      <body name="b1" pos="0 0 0.05"><joint type="free"/><geom type="mesh" mesh="box"/></body>
+      <body name="b2" pos="0 0 0.14"><joint type="free"/><geom type="mesh" mesh="box"/></body>
+    </worldbody>
+  </mujoco>
+  """
+  mjm = mujoco.MjModel.from_xml_string(xml)
+  eng = BatchedEngine(mjm, nworld=1)
+  assert eng.rig.npairc == 0
+  assert eng.rig.skipped_mesh_pairs == 1
+
+
+def test_coop_matches_single_thread_solver():
+  """Verifies the cooperative solver matches the single-thread solver over 50 steps."""
+  scene = "mujoco_warp/test_data/humanoid/humanoid.xml"
+  mjm = mujoco.MjModel.from_xml_path(scene)
+
+  rng = np.random.default_rng(0)
+  qpos = np.tile(np.array(mjm.qpos0, np.float32), (1, 1))
+  qpos[:, :3] += rng.normal(0, 0.005, (1, 3)).astype(np.float32)
+  qvel = rng.normal(0, 0.01, (1, mjm.nv)).astype(np.float32)
+  ctrl = rng.uniform(-0.3, 0.3, (1, mjm.nu)).astype(np.float32)
+
+  eng_coop = BatchedEngine(mjm, nworld=1, coop=True)
+  eng_single = BatchedEngine(mjm, nworld=1, coop=False)
+  assert eng_coop.coop and not eng_single.coop
+
+  eng_coop.set_state(qpos, qvel, ctrl)
+  eng_single.set_state(qpos, qvel, ctrl)
+  for _ in range(50):
+    eng_coop.step()
+    eng_single.step()
+
+  qc, vc = eng_coop.get_state()
+  qs, vs = eng_single.get_state()
+  assert np.abs(qc - qs).max() < 1e-4
+  assert np.abs(vc - vs).max() < 1e-3
+
+
+def test_coop_wide_model_lane_striding():
+  """Regression test for cooperative solve with nv > threadgroup (rows handled in strides)."""
+  chain = '<body pos="0.04 0 0"><joint type="hinge"/><geom type="capsule" size="0.02 0.03"/>'
+  xml = '<mujoco><option integrator="Euler"/><worldbody><body><joint type="free"/><geom type="capsule" size="0.02 0.05"/>'
+  xml += chain * 34 + "</body>" * 35 + "</worldbody></mujoco>"
+  mjm = mujoco.MjModel.from_xml_string(xml)
+  assert mjm.nv > 32
+
+  rng = np.random.default_rng(0)
+  qpos = np.tile(np.array(mjm.qpos0, np.float32), (2, 1))
+  qvel = rng.normal(0, 0.02, (2, mjm.nv)).astype(np.float32)
+
+  eng_coop = BatchedEngine(mjm, nworld=2, coop=True)
+  eng_single = BatchedEngine(mjm, nworld=2, coop=False)
+  assert eng_coop.coop
+  eng_coop.set_state(qpos, qvel)
+  eng_single.set_state(qpos, qvel)
+  for _ in range(10):
+    eng_coop.step()
+    eng_single.step()
+
+  qc, vc = eng_coop.get_state()
+  qs, vs = eng_single.get_state()
+  assert np.isfinite(qc).all() and np.isfinite(vc).all()
+  assert np.abs(qc - qs).max() < 1e-3
+  assert np.abs(vc - vs).max() < 1e-2
+
+
 def test_parallel_capsule_capsule_contact():
   """Regression test for parallel-axis capsule-capsule collisions (two-point branch)."""
   xml = """
@@ -268,8 +410,12 @@ def test_explicit_pair_material_params():
 
 _UNSUPPORTED_MODELS = {
   "gravcomp": "<worldbody><body gravcomp='1'><joint type='hinge'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>",
-  "stiffness_poly": "<worldbody><body><joint type='hinge' stiffness='5 0.3 0.02'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>",
-  "damping_poly": "<worldbody><body><joint type='hinge' damping='0.1 0.2 0.3'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>",
+  "stiffness_poly": (
+    "<worldbody><body><joint type='hinge' stiffness='5 0.3 0.02'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>"
+  ),
+  "damping_poly": (
+    "<worldbody><body><joint type='hinge' damping='0.1 0.2 0.3'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>"
+  ),
   "actuator_damping": (
     "<worldbody><body><joint name='h' type='hinge'/><geom type='capsule' size='0.02 0.1'/></body></worldbody>"
     "<actuator><motor joint='h' damping='0.5'/></actuator>"
@@ -277,6 +423,10 @@ _UNSUPPORTED_MODELS = {
   "fluid": (
     "<worldbody><body><joint type='free'/>"
     "<geom type='ellipsoid' size='0.05 0.06 0.07' fluidshape='ellipsoid'/></body></worldbody>"
+  ),
+  "adhesion": "<worldbody><body><joint type='free'/><geom type='sphere' size='0.05' adhesion='0.1'/></body></worldbody>",
+  "surfacevel": (
+    "<worldbody><body><joint type='free'/><geom type='sphere' size='0.05' surfacevel='0.1 0 0'/></body></worldbody>"
   ),
   "sleep": (
     "<option><flag sleep='enable'/></option>"

@@ -1,153 +1,77 @@
-# MLX engines (`mujoco_warp.mps`)
+# MLX Rigid-Body Engine (`mujoco_warp.mps`)
 
-Two engines live here:
+World-batched rigid-body simulation engine written directly on MLX (Metal) for Apple silicon, mirroring the `mujoco_warp` physics pipeline in float32.
 
-1. **Robot engine (current)** — `rig.py` + `fused.py` + `robot.py`: world-batched
-   Metal kernels for arbitrary free/slide/hinge robot models with primitive
-   geoms (plane/sphere/capsule), pyramidal contacts, mask-Newton and Euler.
-   Public API:
+Fused Metal kernels:
 
-   ```python
-   from mujoco_warp.mps.robot import BatchedEngine
+1. **K1 (`dyn`)**: Forward kinematics, local geom transforms, subtree CoM, composite rigid body inertia (`cinert`/`crb`), joint-space mass matrix $M$, spatial velocities and accelerations (`cvel`/`cacc`/`cdofdot`), recursive Newton-Euler bias forces (`qfrc_bias`), actuation, passive damping, and fused collision narrowphase + constraint row assembly (joint friction, hinge limits, pyramidal contacts).
+2. **K2 (`solve`)**: In-thread or cooperative Cholesky factorization, mask-Newton solver with linesearch, and Euler integration.
+3. **Cooperative solve (`coop`)**: For small-to-medium batches ($\le 2048$ worlds), one threadgroup (32 threads) cooperates per world using on-chip threadgroup memory (SRAM), reducing per-step latency ~4-5x. For larger batches ($> 2048$ worlds), the one-thread-per-world kernel maximizes parallel GPU throughput.
 
-   eng = BatchedEngine(mjm, nworld=4096)
-   eng.set_state(qpos, qvel, ctrl)   # numpy (N, nq/nv/nu)
-   qpos, qvel = eng.step_np(ctrl)
-   ```
-
-   Validate `uv run python -m mujoco_warp.mps.validate`; benchmark
-   `uv run python -m mujoco_warp.mps.bench`. On an M1 Pro with the humanoid
-   scene this reaches ~132k worlds/s (4096 worlds) vs ~12.2k worlds/s for the
-   warp CPU backend (~10.8x), tracking warp-CPU trajectories across contacts to
-   float32 noise (~3e-6 qpos / ~2e-4 qvel over 100 steps).
-
-2. **Legacy microduck reference** (below) — the original single-model engine and
-   its world-batched port, kept for reference.
+Supported scope: free, slide, and hinge joints; primitive collision geoms (plane, sphere, capsule); pyramidal contacts; Euler integrator; joint motor and position actuators.
 
 ---
-
-# microduck on MLX
-
-World-batched implementation of the microduck simulation loop, written directly on
-MLX (Metal) and validated against `mujoco_warp` CPU and MuJoCo. It mirrors
-mujoco_warp's algorithms, so trajectories track the CPU backends at float32 noise
-while running thousands of independent worlds in one process and one GPU.
-
-## Run it (one flag)
-
-```bash
-# batched MLX engine (Metal): all worlds in one pass
-uv run --with mlx --with mujoco-warp python -m microduck_mlx.run --backend mlx --worlds 4096 --steps 50
-
-# same batch on the mujoco_warp CPU backend
-uv run --with mlx --with mujoco-warp python -m microduck_mlx.run --backend cpu --worlds 8 --steps 20
-
-# plain MuJoCo, one world (reported as the world-sequential equivalent)
-uv run --with mlx --with mujoco-warp python -m microduck_mlx.run --backend mujoco --worlds 1 --steps 200
-```
-
-The default backend can be selected with an environment variable:
-
-```bash
-MICRODUCK_BACKEND=mlx uv run --with mlx --with mujoco-warp python -m microduck_mlx.run
-```
-
-Full benchmark scoreboard (same machine, Apple silicon):
-
-```bash
-uv run --with mlx --with mujoco-warp python -m microduck_mlx.bench_massive
-```
 
 ## Python API
 
 ```python
-from microduck_mlx.model import convert
-from microduck_mlx.batched_engine import BatchedEngine
+from mujoco_warp.mps.robot import BatchedEngine
 
-eng = BatchedEngine(convert(mjm), nworld=4096)   # one engine, N worlds
-eng.set_state(qpos, qvel, ctrl)                  # numpy in: (N, nq/nv/nu)
-qpos, qvel = eng.step_np(ctrl)                   # numpy out (eval handled internally)
-```
+# Initialize batched engine for N worlds
+eng = BatchedEngine(mjm, nworld=4096)
 
-Also `eng.set_ctrl(ctrl)` and `eng.get_state()` if you only want to update one side.
+# Set state from NumPy arrays (N, nq / nv / nu)
+eng.set_state(qpos, qvel, ctrl)
 
-MLX laziness is handled internally: the convenience methods take/return NumPy and
-evaluate when needed, so user code never needs `mx.array` or `mx.eval`. Staying in
-the lazy MLX graph (e.g. for custom fused kernels) is possible via the raw
-`eng.sim.*` arrays, but that is optional.
-Single-world, drop-in for `MicroduckGaitEnv`: `from microduck_mlx.env import MicroduckMlxEnv`; `obs = env.reset(seed)`; `obs, reward, term, trunc, info = env.step(action)`.
-
-## Validity
-
-`bstep` compares one full batched step against the validated single-world engine
-(which itself matches `mujoco_warp` CPU to ~1e-6): batched vs single-world is
-`dq ~= 5.8e-11`, `dv ~= 4.5e-8`.
-
-```bash
-uv run --with mlx --with mujoco-warp python /tmp/bstep.py   # see tests below
-uv run --with mlx --with mujoco-warp python -m microduck_mlx.batched_validate
-```
-
-## Measured (Apple M-series, MLX 0.32, MuJoCo 3.12)
-
-```
-CPU reference  | plain MuJoCo, 1 world      :      22.3 us/substep/world
-CPU reference  | mujoco_warp CPU, 1 world   :    5305.8 us/substep
-
-  nworld | MLX ms/substep |  us/world |  worlds/s | vs MuJoCo CPU | vs warp CPU
-------------------------------------------------------------------------------
-      64 |          49.31 |    770.47 |      1298 |          0.0x |      7x
-     512 |          53.44 |    104.38 |      9580 |          0.2x |     55x
-    2048 |          61.15 |     29.86 |     33489 |          0.8x |    192x
-    8192 |         107.90 |     13.17 |     75924 |          1.8x |    435x
-   16384 |         195.01 |     11.90 |     84016 |          2.0x |    482x
-```
-
-Crossover vs a sequential MuJoCo process is around ~3k worlds; above that the
-single MLX process wins per world and keeps scaling with batch. Small batches are
-latency-bound by the fixed per-step dispatch floor (~49 ms), which is the target
-of the remaining fusion work.
-
-## Files
-
-- `batched.py` — world-batched state/kinematics/com/CRB/velocities/RNE/M/actuation
-- `batched_kin.py` — fused MSL forward-kinematics tree pass
-- `batched_collision.py` — fused MSL plane/mesh convex-graph collision (exact warp port)
-- `batched_contact.py` — fused MSL contact-row assembly (J, D, aref)
-- `batched_engine.py` — constraints + mask-based Newton solver (MSL batched Cholesky) + Euler
-- `run.py` — one-flag runner (this file's examples)
-- `bench_massive.py` — CPU-vs-MLX scoreboard
-- `env.py`, `engine.py`, `sim.py` — validated single-world engine and env (reference)
-- `batched_validate.py`, `validate_stage1.py`, `validate_step.py` — numeric validation
-
-## Known limits / next steps
-
-- The batched path currently runs the physics loop; the reward/obs env wrapper is
-  only wired for the single-world reference env. A batched env (reward/termination
-  vectorized over worlds) is needed to drop into EPO training unchanged.
-- Contacts cover plane vs convex mesh (feet); no mesh/mesh self-collision, SDF,
-  heightfields, equality/tendon or gradients yet.
-- Next perf step: block-specialize solver rows (friction + limits are single-DOF,
-  only 32 contact rows need dense work) and fuse the solver iteration into MSL;
-  expected ~3-6x over sequential MuJoCo at 16k worlds.
-
-
-## Importing from mujoco_warp
-
-```bash
-uv sync --extra mlx
-```
-
-```python
-from mujoco_warp.mps.batched_engine import BatchedEngine
-from mujoco_warp.mps.model import convert
-
-eng = BatchedEngine(convert(mjm), nworld=4096)
-eng.set_state(qpos, qvel, ctrl)      # numpy
+# Step simulation and retrieve NumPy state (evaluation handled internally)
 qpos, qvel = eng.step_np(ctrl)
 ```
 
-This is an independent MLX engine (not a Warp device backend): Warp itself has no
-Metal backend, so the MPS support lives here as a parallel implementation of the
-rigid-body pipeline. Wiring it behind the `mujoco_warp` step API (backend switch)
-is the next step; for now it is imported explicitly.
+Direct stepping in the lazy MLX graph without host synchronization:
+
+```python
+eng.step()  # appends to pending MLX graph
+```
+
+---
+
+## Validation
+
+Validate numerical agreement against the `mujoco_warp` CPU backend:
+
+```bash
+uv run python -m mujoco_warp.mps.validate
+```
+
+Checks on the humanoid model across 100 simulation steps with random controls:
+- Trajectory drift remains at float32 noise level ($\sim 2.6 \times 10^{-6}$ max abs error in `qpos`, $\sim 1.3 \times 10^{-4}$ in `qvel`).
+- Active constraint count (`nefc`) and contact detections match bit-for-bit.
+
+---
+
+## Benchmark
+
+Run the benchmark scoreboard:
+
+```bash
+uv run python -m mujoco_warp.mps.bench
+```
+
+### Fairness Methodology
+- **Identical Initial State**: Both engines start from the exact same initial state (`qpos0`, zero velocities).
+- **Matched Warmup**: Both engines run 5 warmup steps to compile/cache kernels and warm up solver caches, then reset to identical initial states before timing starts.
+- **Synchronous Substep Evaluation**: MLX evaluates every substep (`eval_every=1`), ensuring GPU execution and synchronization complete for every step just as Warp CPU steps synchronously.
+
+### Humanoid Benchmark Results (Apple M1 Pro, 10 CPU cores / 16 GPU cores)
+
+```
+ worlds | MLX ms/substep | warp-CPU ms/substep | speedup
+--------+----------------+---------------------+--------
+     64 |           1.73 |                9.38 |     5.4x
+    256 |           2.30 |               24.09 |    10.5x
+   1024 |           4.59 |               88.19 |    19.2x
+   4096 |          12.85 |              336.25 |    26.2x
+```
+
+- At 4096 worlds, MLX runs at **~319,000 worlds/s** vs **~12,200 worlds/s** for `mujoco_warp` CPU (**26.2x speedup**).
+- At 16,384 worlds, MLX scales to **~330,000 worlds/s** (49.7 ms/substep).
