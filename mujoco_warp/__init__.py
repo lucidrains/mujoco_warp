@@ -73,7 +73,12 @@ from mujoco_warp._src.lidar import Lidar as Lidar
 from mujoco_warp._src.lidar import LidarScan as LidarScan
 from mujoco_warp._src.passive import passive as passive
 from mujoco_warp._src.path_trace import PathTracer as PathTracer
+from mujoco_warp._src.randomize import ActionLatency as ActionLatency
+from mujoco_warp._src.randomize import ObservationModel as ObservationModel
+from mujoco_warp._src.randomize import PhysicsRandomizer as PhysicsRandomizer
+from mujoco_warp._src.randomize import physics_batch_sizes as physics_batch_sizes
 from mujoco_warp._src.randomize import randomize_colors as randomize_colors
+from mujoco_warp._src.randomize import reset_worlds as reset_worlds
 from mujoco_warp._src.ray import ray as ray
 from mujoco_warp._src.ray import rays as rays
 from mujoco_warp._src.render import render as render

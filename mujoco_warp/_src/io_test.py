@@ -2200,9 +2200,48 @@ class IOTest(parameterized.TestCase):
           warp_util.check_toolkit_driver()
 
   def test_put_data_nefc_zero_dense(self):
-    """put_data succeeds for dense models with nefc=0 and non-empty efc_J."""
-    # A tendon with frictionloss causes MuJoCo to pre-allocate efc_J with
-    # size nv even when nefc=0, causing reshape((0, nv)) to fail.
+    """put_data succeeds for dense models with nefc=0 and empty efc_J."""
+    # Dense models with no active constraints must not trip J reshaping in put_data.
+    mjm = mujoco.MjModel.from_xml_string("""
+      <mujoco>
+        <worldbody>
+          <body pos="0 0 1">
+            <freejoint/>
+            <geom type="box" size="0.1 0.1 0.1" mass="1.0"/>
+            <site name="s1" pos="0 0 0.1"/>
+            <body pos="0.3 0 0">
+              <joint type="hinge" axis="0 0 1"/>
+              <geom type="sphere" size="0.05" mass="0.2"/>
+              <site name="s2" pos="0 0 -0.05"/>
+            </body>
+          </body>
+        </worldbody>
+        <tendon>
+          <spatial limited="true" range="0 0.5" damping="2.0" stiffness="10.0">
+            <site site="s1"/>
+            <site site="s2"/>
+          </spatial>
+        </tendon>
+      </mujoco>
+    """)
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_forward(mjm, mjd)
+
+    self.assertFalse(mujoco.mj_isSparse(mjm))
+    self.assertEqual(mjd.nefc, 0)
+
+    m = mjwarp.put_model(mjm)
+    d = mjwarp.put_data(mjm, mjd)
+
+    if m.is_sparse:
+      self.assertEqual(d.efc.J.shape[2], d.njmax * m.nv)
+    else:
+      self.assertEqual(d.efc.J.shape[2], m.nv_pad)
+
+  def test_put_data_friction_tendon_dense(self):
+    """put_data succeeds for dense models with a friction-tendon row in efc_J."""
+    # MuJoCo >=3.13 includes FRICTION_TENDON rows in nefc even when not sliding,
+    # so this also covers the non-empty dense efc_J reshape path.
     mjm = mujoco.MjModel.from_xml_string("""
       <mujoco>
         <worldbody>
@@ -2230,7 +2269,8 @@ class IOTest(parameterized.TestCase):
     mujoco.mj_forward(mjm, mjd)
 
     self.assertFalse(mujoco.mj_isSparse(mjm))
-    self.assertEqual(mjd.nefc, 0)
+    self.assertEqual(mjd.nefc, 1)
+    self.assertEqual(mujoco.mjtConstraint(mjd.efc_type[0]), mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
     m = mjwarp.put_model(mjm)
     d = mjwarp.put_data(mjm, mjd)
@@ -2239,6 +2279,7 @@ class IOTest(parameterized.TestCase):
       self.assertEqual(d.efc.J.shape[2], d.njmax * m.nv)
     else:
       self.assertEqual(d.efc.J.shape[2], m.nv_pad)
+      self.assertGreater(float(np.abs(d.efc.J.numpy()[0, 0, : m.nv]).sum()), 0.0)
 
   def test_mesh_randomize_geom_level(self):
     """Test per-world mesh assignment for geom-level tuples."""

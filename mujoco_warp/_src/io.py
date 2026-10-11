@@ -270,11 +270,17 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   batch_sizes = batch_sizes or {}
   model_fields = {f.name: f.type for f in dataclasses.fields(types.Model) if warp_util.is_array_spec(f.type)}
+  opt_fields = {f.name: f.type for f in dataclasses.fields(types.Option) if warp_util.is_array_spec(f.type)}
   for name, size in batch_sizes.items():
-    field_type = model_fields.get(name)
-    spec_shape = getattr(field_type, "shape", ())
-    if not spec_shape or spec_shape[0] != "*":
-      raise ValueError(f"Model field {name!r} is not a batched array field.")
+    if name.startswith("opt."):
+      field_type = opt_fields.get(name[4:])
+      if field_type is None or getattr(field_type, "shape", ())[:1] != ("*",):
+        raise ValueError(f"Model field {name!r} is not a batched array field.")
+    else:
+      field_type = model_fields.get(name)
+      spec_shape = getattr(field_type, "shape", ())
+      if not spec_shape or spec_shape[0] != "*":
+        raise ValueError(f"Model field {name!r} is not a batched array field.")
     if size < 1:
       raise ValueError(f"batch_sizes[{name!r}] must be positive, got {size}.")
 
@@ -414,7 +420,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   # place opt on device
   for f in dataclasses.fields(types.Option):
     if warp_util.is_array_spec(f.type):
-      setattr(opt, f.name, _create_array(getattr(opt, f.name), f.type, {"*": 1}))
+      batch_size = batch_sizes.get("opt." + f.name, 1)
+      setattr(opt, f.name, _create_array(getattr(opt, f.name), f.type, {"*": 1}, batch_size))
     else:
       setattr(opt, f.name, f.type(getattr(opt, f.name)))
 
