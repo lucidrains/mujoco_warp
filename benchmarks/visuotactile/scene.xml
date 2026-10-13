@@ -1,0 +1,77 @@
+<mujoco model="visuotactile">
+
+  <option timestep="0.002">
+    <flag filterparent="disable"/>
+  </option>
+
+  <visual>
+    <headlight ambient=".7 .7 .7" diffuse=".3 .3 .3"/>
+    <map znear="0.01"/>
+    <scale contactwidth=".005" contactheight=".2"/>
+  </visual>
+
+  <asset>
+    <mesh name="gel_pad" file="gel_pad.stl" inertia="shell"/>
+    <texture name="grid" type="2d" builtin="checker" width="256" height="256" rgb1=".15 .2 .25" rgb2=".25 .3 .35"/>
+    <material name="grid" texture="grid" texrepeat="4 4"/>
+    <material name="gel" rgba=".85 .85 .8 1"/>
+  </asset>
+
+  <default>
+    <geom solref="0.004 1"/>
+  </default>
+
+  <worldbody>
+    <light pos="0.4 0 1.2" dir="-0.3 0 -1" diffuse=".9 .9 .9"/>
+    <camera name="overview" pos="0.35 -0.55 0.55" xyaxes="0.8 0.6 0 -0.3 0.45 0.85"/>
+    <geom name="floor" type="plane" size="2 2 0.01" material="grid"/>
+
+    <!-- flat pad: spring-pressed sphere (all probes use the same press) -->
+    <body name="pad0" pos="-0.15 -0.10 0.30">
+      <geom name="pad0_core" type="box" size="0.012 0.010 0.004" rgba=".35 .35 .4 1"/>
+      <geom name="pad0_gel" type="mesh" mesh="gel_pad" pos="0 0 0.0055" mass="0" contype="0" conaffinity="0" material="gel"/>
+      <body name="probe0" pos="0.004 -0.002 0.0105">
+        <joint name="probe0_joint" type="slide" axis="0 0 1" stiffness="50" springref="-0.006" damping="0.02"/>
+        <geom mass="0.005" type="sphere" size="0.005" rgba=".9 .4 .3 1"/>
+      </body>
+    </body>
+
+    <!-- 30 degrees about y: box -->
+    <body name="pad1" pos="-0.05 0.10 0.30" quat="0.965926 0 0.258819 0">
+      <geom name="pad1_core" type="box" size="0.012 0.010 0.004" rgba=".35 .35 .4 1"/>
+      <geom name="pad1_gel" type="mesh" mesh="gel_pad" pos="0 0 0.0055" mass="0" contype="0" conaffinity="0" material="gel"/>
+      <body name="probe1" pos="-0.003 0.001 0.0105">
+        <joint name="probe1_joint" type="slide" axis="0 0 1" stiffness="50" springref="-0.006" damping="0.02"/>
+        <geom mass="0.005" type="box" size="0.004 0.004 0.003" rgba=".9 .7 .3 1"/>
+      </body>
+    </body>
+
+    <!-- 60 degrees about x: capsule -->
+    <body name="pad2" pos="0.08 -0.10 0.30" quat="0.866025 -0.5 0 0">
+      <geom name="pad2_core" type="box" size="0.012 0.010 0.004" rgba=".35 .35 .4 1"/>
+      <geom name="pad2_gel" type="mesh" mesh="gel_pad" pos="0 0 0.0055" mass="0" contype="0" conaffinity="0" material="gel"/>
+      <body name="probe2" pos="0.002 0.003 0.0125">
+        <joint name="probe2_joint" type="slide" axis="0 0 1" stiffness="50" springref="-0.006" damping="0.02"/>
+        <geom mass="0.005" type="capsule" size="0.003 0.005" rgba=".4 .7 .9 1"/>
+      </body>
+    </body>
+
+    <!-- vertical, facing +x: ellipsoid -->
+    <body name="pad3" pos="0.18 0.10 0.30" quat="0.707107 0 0.707107 0">
+      <geom name="pad3_core" type="box" size="0.012 0.010 0.004" rgba=".35 .35 .4 1"/>
+      <geom name="pad3_gel" type="mesh" mesh="gel_pad" pos="0 0 0.0055" mass="0" contype="0" conaffinity="0" material="gel"/>
+      <body name="probe3" pos="0.003 0.002 0.0090">
+        <joint name="probe3_joint" type="slide" axis="0 0 1" stiffness="50" springref="-0.006" damping="0.02"/>
+        <geom mass="0.005" type="ellipsoid" size="0.005 0.004 0.003" rgba=".5 .9 .5 1"/>
+      </body>
+    </body>
+
+  </worldbody>
+
+  <sensor>
+    <tactile geom="pad0_gel" mesh="gel_pad"/>
+    <tactile geom="pad1_gel" mesh="gel_pad"/>
+    <tactile geom="pad2_gel" mesh="gel_pad"/>
+    <tactile geom="pad3_gel" mesh="gel_pad"/>
+  </sensor>
+</mujoco>

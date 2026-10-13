@@ -139,6 +139,31 @@ Key capabilities:
 
 See the [announcement PR](https://github.com/google-deepmind/mujoco_warp/pull/1113) for more details.
 
+# Visuotactile Sensing
+
+MJWarp includes a batched **visuotactile (GelSight-style)** sensor simulator. A sensor is a gel pad collision geom whose surface indentation is sampled through contact distance queries at a configurable resolution, softened with a Gaussian blur, shaded with a configurable LED ring, soft raymarched shadows and an optional marker lattice, and optionally passed through a `CameraSensor` noise model. The smooth parts of the pipeline are differentiable under `warp.Tape` w.r.t. `d.geom_xpos` and `d.geom_xmat`.
+
+Key capabilities:
+- Batched over worlds and sensors, heterogeneous resolutions
+- GelSight Mini / DIGIT presets, or MuJoCo `<tactile>` XML sensors via `from_tactile_sensors`
+- Depth, force, normal, RGB, marker image and marker flow outputs
+- No extra assets required: works directly from collision geoms
+- Available as a benchmark scene: `benchmarks/visuotactile`
+
+```python
+import mujoco
+import mujoco_warp as mjw
+
+mjm = mujoco.MjModel.from_xml_path("finger.xml")
+m = mjw.put_model(mjm)
+d = mjw.make_data(mjm)
+sensor = mjw.gelsight_mini(mjm.geom("gel").id)
+renderer = mjw.VisuotactileRenderer(m, [sensor], fields=("depth", "rgb", "marker"))
+mjw.step(m, d)
+frame = renderer.render(m, d)
+image = frame.numpy("rgb", 0)  # (nworld, height, width, 3)
+```
+
 # License
 
 MJWarp is released under the Apache 2.0 license. See [LICENSE](LICENSE) for details.

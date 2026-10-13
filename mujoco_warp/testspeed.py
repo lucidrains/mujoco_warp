@@ -47,8 +47,10 @@ _FUNCS = {
   for n, f in inspect.getmembers(mjw, inspect.isfunction)
   if inspect.signature(f).parameters.keys() == {"m", "d"} or inspect.signature(f).parameters.keys() == {"m", "d", "rc"}
 }
+# "visuotactile" renders the model's tactile sensors via a configured renderer.
+_FUNCTION_CHOICES = sorted(set(_FUNCS) | {"visuotactile"})
 
-_FUNCTION = flags.DEFINE_enum("function", "step", _FUNCS.keys(), "the function to benchmark")
+_FUNCTION = flags.DEFINE_enum("function", "step", _FUNCTION_CHOICES, "the function to benchmark")
 _CLEAR_WARP_CACHE = flags.DEFINE_bool("clear_warp_cache", False, "clear warp caches (kernel, LTO, CUDA compute)")
 _MEASURE_ALLOC = flags.DEFINE_bool("measure_alloc", False, "print a report of contacts and constraints per step")
 _MEASURE_SOLVER = flags.DEFINE_bool("measure_solver", False, "print a report of solver iterations per step")
@@ -144,7 +146,7 @@ def _main(argv: Sequence[str]):
   elif len(argv) > 2:
     raise app.UsageError("Too many command-line arguments.")
 
-  if _FUNCTION.value not in _FUNCS:
+  if _FUNCTION.value not in _FUNCTION_CHOICES:
     raise ValueError(f"Unknown function: {_FUNCTION.value}")
 
   wp.config.log_level = wp.LOG_WARNING if flags.FLAGS["verbosity"].value < 1 else wp.LOG_INFO
@@ -168,7 +170,8 @@ def _main(argv: Sequence[str]):
 
   mjm = cli.load_model(path)
   free_mem_at_init = wp.get_device(device).free_memory
-  m, d, rc, ctrls = cli.init_structs(_FUNCS[_FUNCTION.value], mjm)
+  init_fn = _FUNCS.get(_FUNCTION.value, _FUNCS["step"])
+  m, d, rc, ctrls = cli.init_structs(init_fn, mjm)
   warn_overflow = m.opt.warn_overflow
   m.opt.warn_overflow = warn_overflow if _OVERFLOW_BEHAVIOR.value == "continue" else 0
   timestep = m.opt.timestep.numpy()[0]
@@ -295,6 +298,19 @@ def _main(argv: Sequence[str]):
       mjw.render(m, d, rc)
 
     jit_duration = cli.unroll(refit_and_render, m, d, rc, render_callback, ctrls)
+  elif _FUNCTION.value == "visuotactile":
+    # Render the model's tactile sensors; buffers are preallocated (and warmed
+    # before capture) so the unrolled function stays allocation-free.
+    sensors = mjw.from_tactile_sensors(mjm, resolution=(cli.VISUOTACTILE_HEIGHT.value, cli.VISUOTACTILE_WIDTH.value))
+    renderer = mjw.VisuotactileRenderer(m, sensors, fields=("depth", "rgb"))
+    frame = renderer.allocate(d.nworld)
+    renderer.render(m, d, out=frame)
+
+    def step_and_tactile(m, d):
+      mjw.step(m, d)
+      renderer.render(m, d, out=frame)
+
+    jit_duration = cli.unroll(step_and_tactile, m, d, rc, callback, ctrls)
   else:
     jit_duration = cli.unroll(_FUNCS[_FUNCTION.value], m, d, rc, callback, ctrls)
 

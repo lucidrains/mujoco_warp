@@ -140,3 +140,12 @@ from mujoco_warp._src.types import SolverType as SolverType
 from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
+from mujoco_warp._src.visuotactile import GelOptics as GelOptics
+from mujoco_warp._src.visuotactile import Led as Led
+from mujoco_warp._src.visuotactile import MarkerPattern as MarkerPattern
+from mujoco_warp._src.visuotactile import VisuotactileFrame as VisuotactileFrame
+from mujoco_warp._src.visuotactile import VisuotactileRenderer as VisuotactileRenderer
+from mujoco_warp._src.visuotactile import VisuotactileSensor as VisuotactileSensor
+from mujoco_warp._src.visuotactile import digit as digit
+from mujoco_warp._src.visuotactile import from_tactile_sensors as from_tactile_sensors
+from mujoco_warp._src.visuotactile import gelsight_mini as gelsight_mini

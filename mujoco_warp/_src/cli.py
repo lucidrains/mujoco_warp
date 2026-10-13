@@ -74,6 +74,9 @@ RENDER_BACKFACE_CULLING = flags.DEFINE_bool(
 )
 RENDER_SKYBOX = flags.DEFINE_bool("render_skybox", True, "render skybox texture if available")
 
+VISUOTACTILE_WIDTH = flags.DEFINE_integer("visuotactile_width", 160, "visuotactile image width (pixels)")
+VISUOTACTILE_HEIGHT = flags.DEFINE_integer("visuotactile_height", 120, "visuotactile image height (pixels)")
+
 
 def load_model(path: epath.Path) -> mujoco.MjModel:
   """Load a MuJoCo model from a path, handling resources and plugins."""
