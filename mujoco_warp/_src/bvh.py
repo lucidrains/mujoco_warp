@@ -1229,7 +1229,7 @@ def build_splat_bvh(
 ) -> tuple:
   """Creates a splat BVH for a set of splats."""
   count = splat_position.shape[0]
-  splat_group = np.empty(count, dtype=np.int32)
+  splat_group = np.zeros(count, dtype=np.int32)
   for group_id in range(len(splat_adr) - 1):
     splat_group[splat_adr[group_id] : splat_adr[group_id + 1]] = group_id
 

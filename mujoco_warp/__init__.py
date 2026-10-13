@@ -22,6 +22,11 @@ try:
 except metadata.PackageNotFoundError:
   __version__ = "unknown"
 
+from mujoco_warp._src import deterministic as _deterministic
+
+# must run before any _src kernel module is imported so shared and unique modules pick up the mode
+_deterministic.configure_from_env()
+
 # isort: off
 from mujoco_warp._src.forward import step as step
 from mujoco_warp._src.types import Model as Model
@@ -42,6 +47,8 @@ from mujoco_warp._src.collision_sdf import sdf_narrowphase as sdf_narrowphase
 from mujoco_warp._src.constraint import make_constraint as make_constraint
 from mujoco_warp._src.denoise import denoise as denoise
 from mujoco_warp._src.derivative import deriv_smooth_vel as deriv_smooth_vel
+from mujoco_warp._src.deterministic import get_deterministic as get_deterministic
+from mujoco_warp._src.deterministic import set_deterministic as set_deterministic
 from mujoco_warp._src.diff_render import DifferentiableRenderer as DifferentiableRenderer
 from mujoco_warp._src.event_camera import EventCamera as EventCamera
 from mujoco_warp._src.forward import discrete as discrete

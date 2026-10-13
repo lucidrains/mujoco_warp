@@ -161,7 +161,7 @@ def _shadow_visibility(
 
 
 @wp.kernel(module="unique", enable_backward=True)
-def _contact_gather_kernel(
+def _contact_gather_bits(
   # Model:
   geom_bodyid: wp.array[int],
   # Data in:
@@ -170,11 +170,8 @@ def _contact_gather_kernel(
   nacon_in: wp.array[int],
   # In:
   pad_body: wp.array[int],
-  max_geoms: int,
   # Out:
   seen_out: wp.array3d[wp.uint32],
-  count_out: wp.array2d[int],
-  cand_out: wp.array3d[int],
 ):
   sens, conid = wp.tid()
   nacon = nacon_in[0]
@@ -204,11 +201,29 @@ def _contact_gather_kernel(
 
   worldid = contact_worldid_in[conid]
 
-  # One reservation per distinct geom per sensor and world.
+  # one bit per geom; no consumed return -> single pass under deterministic mode
   word_idx = other // 32
   bit_mask = wp.uint32(1) << wp.uint32(other % 32)
-  old_seen = wp.atomic_or(seen_out[worldid, sens], word_idx, bit_mask)
-  if (old_seen & bit_mask) == wp.uint32(0):
+  wp.atomic_or(seen_out[worldid, sens], word_idx, bit_mask)
+
+
+@wp.kernel(module="unique", enable_backward=True, grid_stride=False)
+def _contact_gather_list(
+  # In:
+  max_geoms: int,
+  # Data in:
+  seen_in: wp.array3d[wp.uint32],
+  # Out:
+  count_out: wp.array2d[int],
+  cand_out: wp.array3d[int],
+):
+  worldid, sens, word_idx = wp.tid()
+  bits = seen_in[worldid, sens, word_idx]
+  for bit in range(32):
+    if (bits & (wp.uint32(1) << wp.uint32(bit))) == wp.uint32(0):
+      continue
+    other = 32 * word_idx + bit
+    # ascending (word, bit) -> canonical candidates
     idx = wp.atomic_add(count_out[worldid], sens, 1)
     if idx < max_geoms:
       cand_out[worldid, sens, idx] = other
@@ -1109,10 +1124,16 @@ class VisuotactileRenderer:
     count.zero_()
     cand.fill_(-1)
     wp.launch(
-      _contact_gather_kernel,
+      _contact_gather_bits,
       dim=(nsens, d.naconmax),
-      inputs=[m.geom_bodyid, d.contact.geom, d.contact.worldid, d.nacon, self._pad_body, self.max_geoms],
-      outputs=[seen, count, cand],
+      inputs=[m.geom_bodyid, d.contact.geom, d.contact.worldid, d.nacon, self._pad_body],
+      outputs=[seen],
+    )
+    wp.launch(
+      _contact_gather_list,
+      dim=(nworld, nsens, self._nwords),
+      inputs=[self.max_geoms, seen],
+      outputs=[count, cand],
     )
 
     for i, rt in enumerate(self._rt):

@@ -130,6 +130,8 @@ def _run_benchmark(bm: dict, input_dir: Path) -> dict:
     "mjwarp-testspeed",
     (benchmark_root / bm["mjcf"]).as_posix(),
     f"--clear_warp_cache={_ARGS.clear_warp_cache}",
+    f"--deterministic={_ARGS.deterministic}",
+    f"--deterministic_max_records={_ARGS.deterministic_max_records}",
     "--format=short",
     "--event_trace=true",
     "--memory=true",
@@ -179,6 +181,18 @@ def main():
     default=True,
     type=lambda v: v.lower() not in ("false", "0"),
     help="clear warp caches (kernel, LTO, CUDA compute)",
+  )
+  parser.add_argument(
+    "--deterministic",
+    default="off",
+    choices=["off", "run_to_run", "gpu_to_gpu"],
+    help="Warp deterministic execution mode for bit-reproducible runs",
+  )
+  parser.add_argument(
+    "--deterministic_max_records",
+    default=0,
+    type=int,
+    help="per-target, per-thread bound for deterministic scatter records",
   )
 
   _ARGS = parser.parse_args()

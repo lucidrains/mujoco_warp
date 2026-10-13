@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import warnings
+
 import warp as wp
 
 from mujoco_warp._src import types
@@ -27,6 +29,8 @@ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 # tree_asleep value for fully awake tree
 K_AWAKE_VAL = -(1 + types.MJ_MINAWAKE)
+
+_warned = False
 
 
 @wp.func
@@ -170,6 +174,14 @@ def _update_sleep_dofs(
 @event_scope
 def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0):
   """Computes sleeping arrays from tree_asleep."""
+  global _warned
+  if not _warned and wp.config.deterministic != wp.DeterministicMode.NOT_GUARANTEED:
+    warnings.warn(
+      "EnableBit.SLEEP is excluded from the deterministic guarantee: _wake_tree races on tree_asleep",
+      stacklevel=2,
+    )
+    _warned = True
+
   wp.launch(
     _zero_sleep_counters,
     dim=d.nworld,

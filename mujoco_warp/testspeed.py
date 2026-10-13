@@ -58,6 +58,17 @@ _NUM_BUCKETS = flags.DEFINE_integer("num_buckets", 10, "number of buckets to sum
 _MEMORY = flags.DEFINE_bool("memory", False, "print memory report")
 _INFO = flags.DEFINE_bool("info", False, "print extra Model and Data info")
 _FORMAT = flags.DEFINE_enum("format", "human", ["human", "short", "json"], "output format")
+_DETERMINISTIC = flags.DEFINE_enum(
+  "deterministic",
+  "off",
+  ["off", "run_to_run", "gpu_to_gpu"],
+  "Warp deterministic execution mode for bit-reproducible runs",
+)
+_DETERMINISTIC_MAX_RECORDS = flags.DEFINE_integer(
+  "deterministic_max_records",
+  0,
+  "per-target, per-thread bound for deterministic scatter records (0 = Warp's code-generated bound)",
+)
 _OVERFLOW_BEHAVIOR = flags.DEFINE_enum(
   "overflow_behavior", "error", ["error", "continue"], "behavior when simulation overflow occurs"
 )
@@ -154,6 +165,9 @@ def _main(argv: Sequence[str]):
   device = wp.get_device(cli.DEVICE.value)
   if device == "cpu":
     raise ValueError("testspeed available for gpu only")
+
+  if _DETERMINISTIC.value != "off":
+    mjw.set_deterministic(_DETERMINISTIC.value, max_records=_DETERMINISTIC_MAX_RECORDS.value)
 
   if _CLEAR_WARP_CACHE.value:
     wp.clear_kernel_cache()
