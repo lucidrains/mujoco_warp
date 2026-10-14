@@ -2204,25 +2204,30 @@ def _preprocess_tactile_contacts_kernel(warn_overflow: int):
     weld_geom_count_out: wp.array2d[int],
     weld_geom_list_out: wp.array3d[int],
   ):
-    worldid, tactile_idx, word_idx = wp.tid()
-    bits = weld_geom_seen_in[worldid, tactile_idx, word_idx]
-    for bit in range(32):
-      if (bits & (wp.uint32(1) << wp.uint32(bit))) == wp.uint32(0):
+    worldid, tactile_idx = wp.tid()
+    nwords = weld_geom_seen_in.shape[2]
+    idx = int(0)
+    for word_idx in range(nwords):
+      bits = weld_geom_seen_in[worldid, tactile_idx, word_idx]
+      if bits == wp.uint32(0):
         continue
-      geom = 32 * word_idx + bit
-      # ascending (word, bit) -> canonical list; consumed atomic_add replays deterministically
-      idx = wp.atomic_add(weld_geom_count_out[worldid], tactile_idx, 1)
-      if idx < MJ_MAXCONPAIR:
-        weld_geom_list_out[worldid, tactile_idx, idx] = geom
-      else:
-        if wp.static(bool(warn_overflow & OverflowType.TACTILE)):
-          if idx == MJ_MAXCONPAIR:
-            wp.printf(
-              "tactile sensor collision pair overflow: number of contacting geoms >= %u\n"
-              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.TACTILE (or = 0 for all)\n",
-              MJ_MAXCONPAIR,
-            )
-        wp.atomic_or(overflow_out, worldid, int(OverflowType.TACTILE))
+      for bit in range(32):
+        if (bits & (wp.uint32(1) << wp.uint32(bit))) == wp.uint32(0):
+          continue
+        geom = 32 * word_idx + bit
+        if idx < MJ_MAXCONPAIR:
+          weld_geom_list_out[worldid, tactile_idx, idx] = geom
+        else:
+          if wp.static(bool(warn_overflow & OverflowType.TACTILE)):
+            if idx == MJ_MAXCONPAIR:
+              wp.printf(
+                "tactile sensor collision pair overflow: number of contacting geoms >= %u\n"
+                "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.TACTILE (or = 0 for all)\n",
+                MJ_MAXCONPAIR,
+              )
+          wp.atomic_or(overflow_out, worldid, int(OverflowType.TACTILE))
+        idx += 1
+    weld_geom_count_out[worldid, tactile_idx] = idx
 
   return _tactile_contact_bits, _tactile_contact_list
 
@@ -2648,7 +2653,7 @@ def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False):
     )
     wp.launch(
       list_kernel,
-      dim=(d.nworld, m.ntactileweld, nwords),
+      dim=(d.nworld, m.ntactileweld),
       inputs=[
         weld_geom_seen,
       ],

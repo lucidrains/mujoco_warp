@@ -45,7 +45,7 @@ def _event_kernel(
   events_out: wp.array2d[int],
 ):
   worldid, pixel = wp.tid()
-  log_radiance = wp.log(_luma(hdr[worldid, pixel]) + _EPS)
+  log_radiance = wp.log(wp.max(_luma(hdr[worldid, pixel]), 0.0) + _EPS)
   if initialize != 0:
     ref_out[worldid, pixel] = log_radiance
     events_out[worldid, pixel] = 0
@@ -103,6 +103,8 @@ class EventCamera:
     Returns:
       Per-pixel event polarity: +1 (ON), -1 (OFF) or 0, shape (nworld, npixel).
     """
+    if hdr.shape != self.ref.shape:
+      raise ValueError(f"hdr shape {hdr.shape} != expected {self.ref.shape}.")
     initialize = 0 if self._initialized else 1
     wp.launch(
       _event_kernel,

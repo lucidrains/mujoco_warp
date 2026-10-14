@@ -87,7 +87,7 @@ class BatchedEngine:
     else:
       low = dmin + imp_x * (dmax - dmin)
       mid_curve = dmin + (1.0 / mid ** (power - 1.0)) * imp_x**power * (dmax - dmin)
-      high_curve = 1.0 - (1.0 / (1.0 - mid) ** (power - 1.0)) * (1.0 - imp_x) ** power
+      high_curve = dmin + (1.0 - (1.0 / (1.0 - mid) ** (power - 1.0)) * (1.0 - imp_x) ** power) * (dmax - dmin)
       imp = np.where(
         imp_x <= 0.0, dmin,
         np.where(

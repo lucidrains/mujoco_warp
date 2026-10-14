@@ -84,7 +84,7 @@ def _create_solver_context(
   njmax = d.njmax
 
   alloc_h = m.opt.solver == types.SolverType.NEWTON
-  alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
+  alloc_hfactor = alloc_h and (nv > _BLOCK_CHOLESKY_DIM or nim_cpu.get_ops() is not None)
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
 
@@ -1420,13 +1420,79 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
     ctx: SolverContext.
     fuse_jv: Whether jv is computed in-kernel (True) or pre-computed (False).
   """
+  incremental = _use_incremental(m)
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("linesearch_iterative_dense")
+    and not m.is_sparse
+    and m.opt.cone == types.ConeType.PYRAMIDAL
+    and d.efc.J.shape[1] == d.njmax
+    and d.efc.J.shape[2] == m.nv_pad
+    and d.efc.D.shape[1] == d.njmax
+    and d.efc.frictionloss.shape[1] == d.njmax
+    and ctx.Jaref.shape[1] == d.njmax
+    and ctx.jv.shape[1] == d.njmax
+    and ctx.search.shape[1] == m.nv
+    and ctx.mv.shape[1] == m.nv
+    and nim_cpu.is_contiguous(d.qfrc_smooth)
+    and nim_cpu.is_contiguous(d.efc.J)
+    and nim_cpu.is_contiguous(d.efc.D)
+    and nim_cpu.is_contiguous(d.efc.frictionloss)
+    and nim_cpu.is_contiguous(ctx.Jaref)
+    and nim_cpu.is_contiguous(ctx.search)
+    and nim_cpu.is_contiguous(ctx.mv)
+    and nim_cpu.is_contiguous(ctx.jv)
+    and nim_cpu.is_contiguous(d.qacc)
+    and nim_cpu.is_contiguous(d.efc.Ma)
+  ):
+    nim_ops.linesearch_iterative_dense(
+      d.nworld,
+      m.nv,
+      m.nv_pad,
+      d.njmax,
+      m.opt.ls_iterations,
+      int(fuse_jv),
+      int(incremental),
+      m.opt.tolerance.shape[0],
+      m.opt.ls_tolerance.shape[0],
+      m.stat.meaninertia.shape[0],
+      d.qfrc_smooth.shape[1],
+      d.qacc.shape[1],
+      d.efc.Ma.shape[1],
+      nim_cpu.ptr(m.opt.tolerance),
+      nim_cpu.ptr(m.opt.ls_tolerance),
+      nim_cpu.ptr(m.stat.meaninertia),
+      nim_cpu.ptr(d.ne),
+      nim_cpu.ptr(d.nf),
+      nim_cpu.ptr(d.nefc),
+      nim_cpu.ptr(d.qfrc_smooth),
+      nim_cpu.ptr(d.efc.J),
+      nim_cpu.ptr(d.efc.D),
+      nim_cpu.ptr(d.efc.frictionloss),
+      nim_cpu.ptr(ctx.search_unchanged),
+      nim_cpu.ptr(ctx.Jaref),
+      nim_cpu.ptr(ctx.search),
+      nim_cpu.ptr(ctx.search_dot),
+      nim_cpu.ptr(ctx.mv),
+      nim_cpu.ptr(ctx.jv),
+      nim_cpu.ptr(ctx.done),
+      nim_cpu.ptr(d.qacc),
+      nim_cpu.ptr(d.efc.Ma),
+      nim_cpu.ptr(d.overflow),
+      nim_cpu.ptr(ctx.improvement),
+      nim_cpu.ptr(ctx.alpha),
+      nim_cpu.ptr(ctx.ls_exhausted),
+    )
+    return
+
   wp.launch_tiled(
     _linesearch_iterative_kernel(
       m.opt.ls_iterations,
       m.opt.cone,
       fuse_jv,
       m.is_sparse,
-      _use_incremental(m),
+      incremental,
       int(m.opt.warn_overflow),
     ),
     dim=d.nworld,
@@ -2949,40 +3015,48 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
-  if m.nv <= _BLOCK_CHOLESKY_DIM:
-    changed = ctx.state_changed_count if skip_noflip else d.nefc
-    nim_ops = nim_cpu.get_ops()
-    if (
-      nim_ops is not None
-      and nim_cpu.enabled("cholesky_solve_dense")
-      and nim_cpu.dense_worthy(m.nv_pad)
-      and ctx.grad.shape[1] == m.nv_pad
-      and nim_cpu.is_contiguous(ctx.grad)
-      and nim_cpu.is_contiguous(ctx.h)
-      and nim_cpu.is_contiguous(ctx.search)
-      and nim_cpu.is_contiguous(changed)
-    ):
-      nim_ops.cholesky_solve_dense(
-        d.nworld,
-        m.nv,
-        m.nv_pad,
-        int(skip_noflip),
-        nim_cpu.ptr(ctx.grad),
-        nim_cpu.ptr(ctx.h),
-        nim_cpu.ptr(changed),
-        nim_cpu.ptr(ctx.done),
-        nim_cpu.ptr(ctx.search),
-        nim_cpu.ptr(ctx.search_dot),
-        nim_cpu.ptr(ctx.newton_decrement),
-      )
-    else:
-      wp.launch_tiled(
-        _update_gradient_cholesky(m.nv, skip_noflip),
-        dim=d.nworld,
-        inputs=[ctx.grad, ctx.h, changed, ctx.done],
-        outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-        block_dim=m.block_dim.update_gradient_cholesky,
-      )
+  changed = ctx.state_changed_count if skip_noflip else d.nefc
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("cholesky_solve_dense")
+    and nim_cpu.dense_worthy(m.nv_pad)
+    and ctx.grad.shape[1] == m.nv_pad
+    and nim_cpu.is_contiguous(ctx.grad)
+    and nim_cpu.is_contiguous(ctx.h)
+    and nim_cpu.is_contiguous(ctx.search)
+    and nim_cpu.is_contiguous(changed)
+  ):
+    has_hfactor = ctx.hfactor.shape[1] == m.nv_pad and nim_cpu.is_contiguous(ctx.hfactor)
+    has_quad_changed = (
+      skip_unchanged
+      and ctx.quad_changed_count.size == d.nworld
+      and nim_cpu.is_contiguous(ctx.quad_changed_count)
+    )
+    nim_ops.cholesky_solve_dense(
+      d.nworld,
+      m.nv,
+      m.nv_pad,
+      int(skip_noflip),
+      nim_cpu.ptr(ctx.grad),
+      nim_cpu.ptr(ctx.h),
+      nim_cpu.ptr(changed),
+      nim_cpu.ptr(ctx.done),
+      nim_cpu.ptr(ctx.search),
+      nim_cpu.ptr(ctx.search_dot),
+      nim_cpu.ptr(ctx.newton_decrement),
+      nim_cpu.ptr(ctx.hfactor) if has_hfactor else 0,
+      int(skip_unchanged and has_hfactor),
+      nim_cpu.ptr(ctx.quad_changed_count) if has_quad_changed else 0,
+    )
+  elif m.nv <= _BLOCK_CHOLESKY_DIM:
+    wp.launch_tiled(
+      _update_gradient_cholesky(m.nv, skip_noflip),
+      dim=d.nworld,
+      inputs=[ctx.grad, ctx.h, changed, ctx.done],
+      outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+      block_dim=m.block_dim.update_gradient_cholesky,
+    )
   else:
     wp.launch(
       _padding_h,
@@ -3405,6 +3479,8 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           and d.efc.J.shape[2] == m.nv_pad
           and nim_cpu.is_contiguous(m_mat)
           and nim_cpu.is_contiguous(d.efc.J)
+          and nim_cpu.is_contiguous(d.efc.D)
+          and nim_cpu.is_contiguous(d.efc.state)
           and nim_cpu.is_contiguous(ctx.h)
         ):
           nim_ops.jtda_j_dense(
@@ -3970,6 +4046,31 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
     _update_gradient(m, d, ctx, compact=compact)
 
 
+_CPU_SOLVER_CTX_CACHE: dict[tuple, SolverContext] = {}
+
+
+def _get_solver_context(m: types.Model, d: types.Data) -> SolverContext:
+  if d.qacc.device.is_cpu and not getattr(wp._src.context.runtime, "tape", None):
+    key = (
+      d.nworld,
+      m.nv,
+      m.nv_pad,
+      d.njmax,
+      int(m.opt.solver),
+      bool(_use_incremental(m)),
+      bool(nim_cpu.get_ops() is not None),
+    )
+    ctx = _CPU_SOLVER_CTX_CACHE.get(key)
+    if ctx is None:
+      ctx = _create_solver_context(m, d)
+      _CPU_SOLVER_CTX_CACHE[key] = ctx
+    else:
+      ctx.grad.zero_()
+      ctx.ls_exhausted.zero_()
+    return ctx
+  return _create_solver_context(m, d)
+
+
 @event_scope
 def solve(m: types.Model, d: types.Data):
   if m.opt.enableflags & types.EnableBit.SLEEP:
@@ -3984,7 +4085,7 @@ def solve(m: types.Model, d: types.Data):
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
   else:
-    ctx = _create_solver_context(m, d)
+    ctx = _get_solver_context(m, d)
     _solve(m, d, ctx)
 
   if (m.opt.enableflags & types.EnableBit.SLEEP) and m.opt.integrator == types.IntegratorType.DISCRETE and m.ntree > 1:
@@ -4004,6 +4105,115 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     d = dataclasses.replace(d, qfrc_smooth=qfrc_smooth_eff)
 
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+  nim_ops = nim_cpu.get_ops() if d.qacc.device.is_cpu else None
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("newton_solve_dense")
+    and not compact
+    and not m.is_sparse
+    and m.opt.solver == types.SolverType.NEWTON
+    and m.opt.cone == types.ConeType.PYRAMIDAL
+    and m.opt.integrator != types.IntegratorType.DISCRETE
+    and m.nv >= 1
+    and d.M.is_contiguous
+    and d.qfrc_smooth.is_contiguous
+    and d.qacc_smooth.is_contiguous
+    and d.qacc_warmstart.is_contiguous
+    and d.qacc.is_contiguous
+    and d.qfrc_constraint.is_contiguous
+    and d.efc.J.is_contiguous
+    and d.efc.D.is_contiguous
+    and d.efc.aref.is_contiguous
+    and d.efc.frictionloss.is_contiguous
+    and d.efc.force.is_contiguous
+    and d.efc.Ma.is_contiguous
+    and d.efc.state.is_contiguous
+    and ctx.Jaref.is_contiguous
+    and ctx.search.is_contiguous
+    and ctx.mv.is_contiguous
+    and ctx.jv.is_contiguous
+    and ctx.grad.is_contiguous
+    and ctx.h.is_contiguous
+    and ctx.quad_changed_ids.is_contiguous
+    and d.efc.J.shape[1] == d.njmax
+    and d.efc.J.shape[2] == m.nv_pad
+    and ctx.grad.shape[1] == m.nv_pad
+    and ctx.search.shape[1] == m.nv
+    and ctx.mv.shape[1] == m.nv
+    and ctx.h.shape[1] == m.nv_pad
+    and ctx.h.shape[2] == m.nv_pad
+  ):
+    has_hfactor = (
+      ctx.hfactor.shape[1] == m.nv_pad
+      and ctx.hfactor.shape[2] == m.nv_pad
+      and ctx.hfactor.is_contiguous
+    )
+    nim_ops.newton_solve_dense(
+      d.nworld,
+      m.nv,
+      m.nv_pad,
+      d.njmax,
+      m.nC,
+      m.opt.iterations,
+      m.opt.ls_iterations,
+      1 if warmstart else 0,
+      m.opt.tolerance.shape[0],
+      m.opt.ls_tolerance.shape[0],
+      m.stat.meaninertia.shape[0],
+      d.qfrc_smooth.shape[1],
+      d.qacc_smooth.shape[1],
+      d.qacc_warmstart.shape[1],
+      d.qacc.shape[1],
+      d.qfrc_constraint.shape[1],
+      d.efc.Ma.shape[1],
+      m.opt.tolerance.ptr,
+      m.opt.ls_tolerance.ptr,
+      m.stat.meaninertia.ptr,
+      m.M_colind.ptr,
+      m.M_hinit_i.ptr,
+      m.M_mulm_rowadr.ptr,
+      m.M_mulm_col.ptr,
+      m.M_mulm_madr.ptr,
+      d.ne.ptr,
+      d.nf.ptr,
+      d.nefc.ptr,
+      d.solver_niter.ptr,
+      d.overflow.ptr,
+      d.M.ptr,
+      d.qfrc_smooth.ptr,
+      d.qacc_smooth.ptr,
+      d.qacc_warmstart.ptr,
+      d.qacc.ptr,
+      d.qfrc_constraint.ptr,
+      d.efc.J.ptr,
+      d.efc.D.ptr,
+      d.efc.aref.ptr,
+      d.efc.frictionloss.ptr,
+      d.efc.force.ptr,
+      d.efc.Ma.ptr,
+      d.efc.state.ptr,
+      ctx.quad_changed_ids.ptr,
+      ctx.quad_changed_count.ptr,
+      ctx.state_changed_count.ptr,
+      ctx.Jaref.ptr,
+      ctx.search.ptr,
+      ctx.search_dot.ptr,
+      ctx.mv.ptr,
+      ctx.jv.ptr,
+      ctx.grad.ptr,
+      ctx.grad_dot.ptr,
+      ctx.newton_decrement.ptr,
+      ctx.grad_scale.ptr,
+      ctx.improvement.ptr,
+      ctx.alpha.ptr,
+      ctx.h.ptr,
+      ctx.hfactor.ptr if has_hfactor else 0,
+      ctx.search_unchanged.ptr,
+      ctx.done.ptr,
+      ctx.ls_exhausted.ptr,
+    )
+    return
+
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse),
     dim=(d.nworld, m.nv),

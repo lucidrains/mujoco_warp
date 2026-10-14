@@ -173,7 +173,7 @@ def gradient_check(mjm, m, d, renderer) -> float:
       wp.launch(_pick_kernel, dim=1, inputs=[arr, pix], outputs=[out])
     tape.backward(out)
     grad_all = d.geom_xpos.grad.numpy()[0].copy()
-    d.geom_xpos.grad = None
+    d.geom_xpos.grad.zero_()
 
     target = int(np.argmax(np.abs(grad_all).sum(axis=1)))
     grad = grad_all[target]

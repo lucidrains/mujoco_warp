@@ -47,6 +47,7 @@ from mujoco_warp._src.render import _make_cast_ray
 from mujoco_warp._src.render import _make_sample_texture
 from mujoco_warp._src.render import sample_skybox
 from mujoco_warp._src.render import shade_splats
+from mujoco_warp._src.render import vertex_normal
 from mujoco_warp._src.render_util import pack_rgba_to_uint32
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import Data
@@ -295,9 +296,9 @@ def _make_surface(sample_texture: wp.Function, use_textures: bool, use_vertex_no
           tri = mesh_facenormal[mesh_faceadr[mesh_id] + f]
           adr = mesh_normaladr[mesh_id]
           vec = (
-            mesh_normal[adr + tri[0]] * bary_u
-            + mesh_normal[adr + tri[1]] * bary_v
-            + mesh_normal[adr + tri[2]] * (1.0 - bary_u - bary_v)
+            vertex_normal(mesh_normal[adr + tri[0]], face) * bary_u
+            + vertex_normal(mesh_normal[adr + tri[1]], face) * bary_v
+            + vertex_normal(mesh_normal[adr + tri[2]], face) * (1.0 - bary_u - bary_v)
           )
           normal = wp.normalize(mat @ vec)
 
@@ -803,12 +804,15 @@ def _build_kernel(m: Model, rc: RenderContext, max_bounces: int, roulette_start:
       t1, b1 = _onb(n)
       if wp.randf(rng) < p_spec:
         l = _sample_ggx_vndf(n, t1, b1, v, alpha, wp.randf(rng), wp.randf(rng))
-        pdf = _pdf_ggx_vndf(n, v, alpha, l)
       else:
         l = _sample_cosine_hemisphere(n, t1, b1, wp.randf(rng), wp.randf(rng))
-        pdf = wp.max(wp.dot(n, l), 0.0) * _INV_PI
       ndotl = wp.dot(n, l)
-      if ndotl <= 0.0 or pdf <= 0.0:
+      if ndotl <= 0.0:
+        break
+      pdf_spec = _pdf_ggx_vndf(n, v, alpha, l)
+      pdf_diff = ndotl * _INV_PI
+      pdf = p_spec * pdf_spec + (1.0 - p_spec) * pdf_diff
+      if pdf <= 0.0:
         break
       f_bsdf = _bsdf_eval(albedo, f0, alpha, n, v, l)
       throughput = wp.cw_mul(throughput, f_bsdf) * (ndotl / pdf)

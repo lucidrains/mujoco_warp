@@ -160,12 +160,16 @@ def _pack_tables(sources: dict, names: list[str], dtype) -> tuple[np.ndarray, di
 
 
 def mx_int_arr(x):
-  """Device int32 buffer from a numpy array (dtype clamped)."""
+  """Device int32 buffer from a numpy or MLX array (dtype clamped)."""
+  if isinstance(x, mx.array):
+    return x if x.dtype == mx.int32 else x.astype(mx.int32)
   return mx.array(np.ascontiguousarray(np.asarray(x), dtype=np.int32), dtype=mx.int32)
 
 
 def mx_f32_arr(x):
-  """Device float32 buffer from a numpy array (dtype clamped)."""
+  """Device float32 buffer from a numpy or MLX array (dtype clamped)."""
+  if isinstance(x, mx.array):
+    return x if x.dtype == F else x.astype(F)
   return mx.array(np.ascontiguousarray(np.asarray(x), dtype=np.float32))
 
 
@@ -405,7 +409,7 @@ class BatchedEngine:
       {k: self.adr_i[k] for k in ("body_parentid", "body_jntadr", "body_jntnum", "jnt_type", "jnt_qposadr", "jnt_dofadr")},
     )
     # threadgroup memory estimate for the cooperative solve (see fused.solve_source_coop)
-    tg_bytes = (2 * rig.nv * rig.nv + 10 * rig.nv + rig.nq + 6 * rig.rowcap + 3 * threadgroup) * 4
+    tg_bytes = (2 * rig.nv * rig.nv + 9 * rig.nv + rig.nq + 6 * rig.rowcap + 3 * threadgroup) * 4
     self.coop = bool(coop and nworld <= coop_max_worlds and tg_bytes <= 24 * 1024)
     self.threadgroup = int(threadgroup)
     if self.coop:
@@ -430,11 +434,12 @@ class BatchedEngine:
     self.qvel = mx.zeros((nworld, rig.nv), dtype=F)
     self.ctrl = mx.zeros((nworld, rig.nu), dtype=F)
     self.warm = mx.zeros((nworld, rig.nv), dtype=F)
+    self._qpos0_mx = mx_f32_arr(np.broadcast_to(rig.qpos0[None], (nworld, rig.nq)))
     self._nw_buf = mx_int_arr(np.array([nworld], np.int32))
 
   # --------------------------------------------------------------- state io
   def set_state(self, qpos, qvel, ctrl=None):
-    """NumPy in: (nworld, nq), (nworld, nv), optional (nworld, nu)."""
+    """NumPy or MLX in: (nworld, nq), (nworld, nv), optional (nworld, nu)."""
     self.qpos = mx_f32_arr(qpos)
     self.qvel = mx_f32_arr(qvel)
     if ctrl is not None:
@@ -442,8 +447,27 @@ class BatchedEngine:
     self.warm = mx.zeros((self.nworld, self.nv), dtype=F)
 
   def set_ctrl(self, ctrl):
-    """NumPy in: (nworld, nu)."""
+    """NumPy or MLX in: (nworld, nu)."""
     self.ctrl = mx_f32_arr(ctrl)
+
+  def reset_worlds(self, mask, qpos=None, qvel=None, ctrl=None):
+    """Selectively resets masked worlds on GPU without host synchronization.
+
+    `mask` is a boolean or 0/1 array of shape `(nworld,)`. Worlds where `mask`
+    is true receive `qpos` (default `qpos0`), `qvel` (default 0), `ctrl` (if
+    provided), and zeroed solver warmstart.
+    """
+    m = mask if isinstance(mask, mx.array) else mx.array(np.asarray(mask, dtype=bool))
+    if m.dtype != mx.bool_:
+      m = m != 0
+    m2 = m[:, None]
+    qpos_new = self._qpos0_mx if qpos is None else mx_f32_arr(qpos)
+    qvel_new = mx.zeros_like(self.qvel) if qvel is None else mx_f32_arr(qvel)
+    self.qpos = mx.where(m2, qpos_new, self.qpos)
+    self.qvel = mx.where(m2, qvel_new, self.qvel)
+    self.warm = mx.where(m2, mx.zeros_like(self.warm), self.warm)
+    if ctrl is not None:
+      self.ctrl = mx.where(m2, mx_f32_arr(ctrl), self.ctrl)
 
   def get_state(self):
     """NumPy out (force-evaluates the pending graph): (qpos, qvel)."""
@@ -514,8 +538,10 @@ class BatchedEngine:
       ) = dyn_out[10:20]
 
   # --------------------------------------------------------------- step
-  def step(self, kin: bool = False):
+  def step(self, kin: bool = False, ctrl=None):
     """One simulation step; `kin=True` records validation intermediates."""
+    if ctrl is not None:
+      self.set_ctrl(ctrl)
     nw = self.nworld
     self._dyn_dispatch(kin)
     out = self.solve_fn(

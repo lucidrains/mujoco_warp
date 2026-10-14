@@ -78,6 +78,28 @@ def _kernel_modules() -> dict[int, wp.Module]:
     for obj in vars(module).values():
       if isinstance(obj, wp.Kernel) and obj.module is not None:
         modules[id(obj.module)] = obj.module
+
+  user_modules = getattr(getattr(wp, "_src", None), "context", None)
+  if user_modules is not None:
+    for mname, mod in list(getattr(user_modules, "user_modules", {}).items()):
+      if mod is not None and (mname == "mujoco_warp" or mname.startswith("mujoco_warp.")):
+        modules[id(mod)] = mod
+
+  warp_util = sys.modules.get("mujoco_warp._src.warp_util")
+  if warp_util is not None:
+    def _collect(val):
+      if isinstance(val, wp.Kernel) and val.module is not None:
+        modules[id(val.module)] = val.module
+      elif isinstance(val, (tuple, list)):
+        for item in val:
+          _collect(item)
+      elif isinstance(val, dict):
+        for item in val.values():
+          _collect(item)
+
+    for cached in list(getattr(warp_util, "_KERNEL_CACHE", {}).values()):
+      _collect(cached)
+
   return modules
 
 
@@ -119,12 +141,14 @@ def set_deterministic(
 
 def configure_from_env() -> "wp.DeterministicMode | None":
   """Applies `MJWARP_DETERMINISTIC` / `MJWARP_DETERMINISTIC_MAX_RECORDS` at import time."""
+  max_records_raw = os.environ.get(ENV_MAX_RECORDS)
+  max_records = None
+  if max_records_raw is not None:
+    max_records = int(max_records_raw)
+    if max_records < 0:
+      raise ValueError(f"max_records must be a non-negative integer, got {max_records_raw!r}")
+    wp.config.deterministic_max_records = max_records
   raw = os.environ.get(ENV_MODE)
   if raw is None:
     return None
-  resolved = _normalize(raw)
-  wp.config.deterministic = resolved
-  max_records = os.environ.get(ENV_MAX_RECORDS)
-  if max_records is not None:
-    wp.config.deterministic_max_records = int(max_records)
-  return resolved
+  return set_deterministic(raw, max_records=max_records, force=True)

@@ -67,13 +67,15 @@ def is_contiguous(a) -> bool:
 def get_ops():
   """Return the compiled Nim ops module, or None when unavailable."""
   global _OPS, _TRIED
+  if not wp.get_device().is_cpu:
+    return None
+  if os.environ.get("MUJOCO_WARP_DISABLE_NIM", ""):
+    return None
+  if getattr(getattr(wp._src.context, "runtime", None), "tape", None) is not None:
+    return None
   if _TRIED:
     return _OPS
   _TRIED = True
-  if os.environ.get("MUJOCO_WARP_DISABLE_NIM", ""):
-    return None
-  if not wp.get_device().is_cpu:
-    return None
   try:
     import nimporter_plus  # noqa: F401
   except ImportError:

@@ -121,7 +121,29 @@ def physics_batch_sizes(nworld: int, groups=_DEFAULT_GROUPS) -> dict[str, int]:
       fields.update(_PHYSICS_GROUPS[group])
     except KeyError:
       raise ValueError(f"unknown physics group {group!r}; expected one of {sorted(_PHYSICS_GROUPS)}.") from None
+  if "body_mass" in fields:
+    fields.add("body_subtreemass")
   return {name: nworld for name in sorted(fields)}
+
+
+@wp.kernel
+def _subtreemass_kernel(
+  # In:
+  body_parentid: wp.array[int],
+  body_mass: wp.array2d[float],
+  mask: wp.array[bool],
+  # Out:
+  body_subtreemass: wp.array2d[float],
+):
+  w = wp.tid()
+  if not mask[w]:
+    return
+  nbody = body_mass.shape[1]
+  for b in range(nbody):
+    body_subtreemass[w, b] = body_mass[w, b]
+  for b in range(nbody - 1, 0, -1):
+    pid = body_parentid[b]
+    body_subtreemass[w, pid] = body_subtreemass[w, pid] + body_subtreemass[w, b]
 
 
 @cache_kernel
@@ -330,13 +352,19 @@ class PhysicsRandomizer:
         field_amount[field] = max(field_amount.get(field, 0.0), amount)
 
     # fields sharing a cluster draw the same jitter per (world, element)
-    clusters = {_SHARED_DRAW.get(name, name) for name in field_amount}
+    use_body_cluster = amounts.get("body", 0.0) > 0.0
+    def _cluster_for(name: str) -> str:
+      if name in ("body_mass", "body_inertia"):
+        return "body" if use_body_cluster else name
+      return _SHARED_DRAW.get(name, name)
+
+    clusters = {_cluster_for(name) for name in field_amount}
     streams = {cluster: i for i, cluster in enumerate(sorted(clusters))}
 
     self.m = m
     self._entries: list[_Entry] = []
     for name, amount in sorted(field_amount.items()):
-      stream = streams[_SHARED_DRAW.get(name, name)]
+      stream = streams[_cluster_for(name)]
       if name == "opt.gravity":
         target = m.opt.gravity
         if target.ndim != 1:
@@ -366,7 +394,12 @@ class PhysicsRandomizer:
       base = wp.clone(target)
       self._entries.append(_Entry(name, target, base, kind, slot, amount, stream))
 
-    nw = max((e.target.shape[0] for e in self._entries), default=1)
+    self._has_body_mass = "body_mass" in field_amount
+    if self._has_body_mass and m.body_subtreemass.shape[0] < m.body_mass.shape[0]:
+      sub_np = np.broadcast_to(m.body_subtreemass.numpy(), (m.body_mass.shape[0], m.nbody)).copy()
+      m.body_subtreemass = wp.array(sub_np, dtype=float, device=m.body_mass.device)
+
+    nw = max((e.target.shape[0] for e in self._entries), default=m.body_mass.shape[0])
     self.alpha = wp.ones(nw, dtype=float)
 
   def sample(self, seed: int = 0, epoch: int = 0, worlds: wp.array | None = None) -> None:
@@ -380,7 +413,7 @@ class PhysicsRandomizer:
         reproducible regardless of which other worlds were resampled. Each
         world's half-width is `group amount * alpha[world]`.
     """
-    nw = max((e.target.shape[0] for e in self._entries), default=1)
+    nw = max((e.target.shape[0] for e in self._entries), default=self.alpha.shape[0])
     for entry in self._entries:
       if entry.target.shape[0] not in (1, nw):
         raise ValueError(
@@ -401,6 +434,17 @@ class PhysicsRandomizer:
         wp.launch(_scale_vec3_slot_kernel(entry.slot), dim=entry.target.shape, inputs=args, outputs=[entry.target])
       else:
         wp.launch(_scale_2d_kernel(entry.kind), dim=entry.target.shape, inputs=args, outputs=[entry.target])
+
+    if self._has_body_mass:
+      if self.m.body_subtreemass.shape[0] < self.m.body_mass.shape[0]:
+        sub_np = np.broadcast_to(self.m.body_subtreemass.numpy(), (self.m.body_mass.shape[0], self.m.nbody)).copy()
+        self.m.body_subtreemass = wp.array(sub_np, dtype=float, device=self.m.body_mass.device)
+      wp.launch(
+        _subtreemass_kernel,
+        dim=self.m.body_mass.shape[0],
+        inputs=[self.m.body_parentid, self.m.body_mass, mask],
+        outputs=[self.m.body_subtreemass],
+      )
 
   def adapt(
     self,
@@ -537,6 +581,8 @@ def reset_worlds(
     ctrl_init: Optional per-world initial controls, shape (nworld, nu).
   """
   nw = d.nworld
+  if done.shape != (nw,):
+    raise ValueError(f"done mask has shape {done.shape}, expected {(nw,)}.")
 
   def _as_array(x, shape):
     if x is None:
@@ -618,7 +664,7 @@ def _latency_hold_kernel(
   w = wp.tid()
   if age[w] <= 0:
     rng = wp.rand_init(seed, (step * 73856093) ^ (w * 19349663))
-    age[w] = int(wp.randf(rng) * float(max_hold + 1))  # 0 = fresh every step
+    age[w] = wp.min(int(wp.randf(rng) * float(max_hold + 1)), max_hold)  # 0 = fresh every step
     fresh[w] = True
   else:
     age[w] = age[w] - 1
@@ -734,6 +780,9 @@ class ActionLatency:
 
   def apply(self, ctrl: wp.array) -> None:
     """Pushes `ctrl` into the pipeline and writes the delayed/held command to `d.ctrl`."""
+    expected = (self.d.nworld, self.m.nu)
+    if ctrl.shape != expected:
+      raise ValueError(f"ctrl has shape {ctrl.shape}, expected {expected}.")
     depth = self.max_delay + 1
     cursor = self._cursor % depth
     wp.launch(
@@ -788,7 +837,7 @@ def _obs_hold_kernel(
   w = wp.tid()
   if age[w] <= 0:
     rng = wp.rand_init(seed, (step * 73856093) ^ (w * 19349663))
-    age[w] = int(wp.randf(rng) * float(max_hold + 1))  # 0 = fresh every step
+    age[w] = wp.min(int(wp.randf(rng) * float(max_hold + 1)), max_hold)  # 0 = fresh every step
     fresh[w] = True
   else:
     age[w] = age[w] - 1

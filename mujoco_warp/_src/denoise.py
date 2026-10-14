@@ -53,7 +53,7 @@ def _demod_kernel(
 ):
   worldid, i = wp.tid()
   a = albedo[worldid, base + i]
-  rgb = wp.vec3(a[0], a[1], a[2])
+  rgb = wp.vec3(wp.max(a[0], 1.0e-4), wp.max(a[1], 1.0e-4), wp.max(a[2], 1.0e-4))
   irr_out[worldid, i] = wp.cw_div(hdr[worldid, base + i], rgb)
   max_a = wp.max(wp.max(rgb[0], rgb[1]), wp.max(rgb[2], 1.0e-2))
   var_out[worldid, i] = variance[worldid, base + i] / (max_a * max_a)
@@ -214,7 +214,7 @@ def denoise(
     normal_arr = wp.zeros((nworld, 1), dtype=wp.vec3)
 
   use_demod = albedo is not None
-  use_normal = use_demod and normal is not None
+  use_normal = normal is not None
   kernel = _make_atrous(variance is not None, depth is not None, use_demod, use_normal)
 
   src = hdr
@@ -259,7 +259,7 @@ def denoise(
         1 << it,
         sigma_color,
         sigma_depth,
-        2.0 * spatial_sigma * spatial_sigma,
+        spatial_sigma * spatial_sigma,
       ],
       outputs=[dst],
     )

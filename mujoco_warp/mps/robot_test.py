@@ -552,3 +552,79 @@ def test_collision_sensor_pair_excluded_from_contacts():
   mjm = mujoco.MjModel.from_xml_string(xml)
   eng = BatchedEngine(mjm, nworld=1)
   assert eng.rig.npairc == 0
+
+
+def test_reset_worlds_and_mlx_inputs():
+  """Verifies zero-copy MLX array inputs and selective world resets on GPU."""
+  xml = """
+  <mujoco>
+    <option timestep="0.005" integrator="Euler"/>
+    <worldbody>
+      <body name="b1" pos="0 0 0.5">
+        <joint name="j1" type="hinge"/>
+        <geom type="capsule" size="0.02 0.1"/>
+      </body>
+    </worldbody>
+    <actuator>
+      <motor joint="j1"/>
+    </actuator>
+  </mujoco>
+  """
+  mjm = mujoco.MjModel.from_xml_string(xml)
+  eng = BatchedEngine(mjm, nworld=4)
+  qpos = mx.array([[0.1], [0.2], [0.3], [0.4]], dtype=mx.float32)
+  qvel = mx.array([[1.0], [2.0], [3.0], [4.0]], dtype=mx.float32)
+  ctrl = mx.array([[0.5], [-0.5], [0.2], [-0.2]], dtype=mx.float32)
+  eng.set_state(qpos, qvel, ctrl)
+  eng.step(ctrl=ctrl)
+
+  mask = mx.array([True, False, True, False])
+  eng.reset_worlds(mask)
+  q_out, v_out = eng.get_state()
+  np.testing.assert_allclose(q_out[0], mjm.qpos0, atol=1e-6)
+  np.testing.assert_allclose(q_out[2], mjm.qpos0, atol=1e-6)
+  np.testing.assert_allclose(v_out[0], 0.0, atol=1e-6)
+  np.testing.assert_allclose(v_out[2], 0.0, atol=1e-6)
+  assert abs(float(q_out[1, 0]) - 0.2) > 1e-4
+  assert abs(float(q_out[3, 0]) - 0.4) > 1e-4
+
+
+@pytest.mark.parametrize("coop", [False, True])
+def test_unconstrained_fast_path(coop: bool):
+  """Verifies nefc == 0 uses direct Cholesky solve with niter == 0 and matches Warp CPU."""
+  xml = """
+  <mujoco>
+    <option timestep="0.005" integrator="Euler"/>
+    <worldbody>
+      <body name="b1" pos="0 0 1.0">
+        <joint name="j1" type="hinge" damping="0.5"/>
+        <geom type="capsule" size="0.02 0.1"/>
+      </body>
+    </worldbody>
+    <actuator>
+      <motor joint="j1"/>
+    </actuator>
+  </mujoco>
+  """
+  mjm = mujoco.MjModel.from_xml_string(xml)
+  m = mujoco_warp.put_model(mjm)
+  d = mujoco_warp.make_data(mjm, nworld=2)
+  qpos = np.array([[0.3], [-0.4]], np.float32)
+  qvel = np.array([[1.2], [-0.8]], np.float32)
+  ctrl = np.array([[0.5], [-0.2]], np.float32)
+  d.qpos.numpy()[:] = qpos
+  d.qvel.numpy()[:] = qvel
+  d.ctrl.numpy()[:] = ctrl
+  mujoco_warp.step(m, d)
+
+  eng = BatchedEngine(mjm, nworld=2, coop=coop)
+  eng.set_state(qpos, qvel, ctrl)
+  eng.step()
+
+  assert np.all(np.array(eng.nefc) == 0)
+  assert np.all(np.array(eng.niter) == 0)
+  np.testing.assert_allclose(np.array(eng.qacc), d.qacc.numpy(), rtol=1e-5, atol=1e-5)
+  qm, vm = eng.get_state()
+  np.testing.assert_allclose(qm, d.qpos.numpy(), rtol=1e-5, atol=1e-6)
+  np.testing.assert_allclose(vm, d.qvel.numpy(), rtol=1e-5, atol=1e-6)
+

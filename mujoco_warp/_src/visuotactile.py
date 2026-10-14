@@ -116,14 +116,14 @@ def _sample_depth(
   # Bilinear sample of the depth grid at gel-frame (x, y).
   u = (x / gel_width + 0.5) * float(width) - 0.5
   v = (0.5 - y / gel_height) * float(height) - 0.5
-  u0 = int(wp.floor(u))
-  v0 = int(wp.floor(v))
-  u1 = wp.min(u0 + 1, width - 1)
-  v1 = wp.min(v0 + 1, height - 1)
-  u0 = wp.max(u0, 0)
-  v0 = wp.max(v0, 0)
-  fu = u - wp.floor(u)
-  fv = v - wp.floor(v)
+  raw_u0 = int(wp.floor(u))
+  raw_v0 = int(wp.floor(v))
+  u0 = wp.clamp(raw_u0, 0, width - 1)
+  v0 = wp.clamp(raw_v0, 0, height - 1)
+  u1 = wp.clamp(raw_u0 + 1, 0, width - 1)
+  v1 = wp.clamp(raw_v0 + 1, 0, height - 1)
+  fu = wp.clamp(u - wp.floor(u), 0.0, 1.0)
+  fv = wp.clamp(v - wp.floor(v), 0.0, 1.0)
   h00 = grid[worldid, v0 * width + u0]
   h10 = grid[worldid, v0 * width + u1]
   h01 = grid[worldid, v1 * width + u0]
@@ -146,13 +146,18 @@ def _shadow_visibility(
   steps: int,
   softness: float,
 ) -> float:
-  # March toward the LED; occluded where the surface (z = -depth) rises above the ray.
+  # March toward the LED; occluded where the surface (z = -depth <= 0) rises above the ray.
+  if steps <= 0 or dist <= 1.0e-8 or p[2] >= 0.0:
+    return 1.0
+  march_dist = dist
+  if ldir[2] > 1.0e-8:
+    march_dist = wp.min(dist, -p[2] / ldir[2])
   vis = float(1.0)
   for k in range(1, steps + 1):
     t = float(k) / float(steps + 1)
-    sx = p[0] + ldir[0] * dist * t
-    sy = p[1] + ldir[1] * dist * t
-    sz = p[2] + ldir[2] * dist * t
+    sx = p[0] + ldir[0] * march_dist * t
+    sy = p[1] + ldir[1] * march_dist * t
+    sz = p[2] + ldir[2] * march_dist * t
     if sx > -0.5 * gel_width and sx < 0.5 * gel_width and sy > -0.5 * gel_height and sy < 0.5 * gel_height:
       hs = _sample_depth(depth_in, worldid, width, height, gel_width, gel_height, sx, sy)
       penetration = -hs - sz
@@ -178,6 +183,8 @@ def _contact_gather_bits(
   if conid >= nacon:
     return
 
+  worldid = int(0)
+  other = int(-1)
   contact_geom = contact_geom_in[conid]
   geom1 = contact_geom[0]
   geom2 = contact_geom[1]
@@ -191,7 +198,6 @@ def _contact_gather_bits(
   body = pad_body[sens]
   body1 = geom_bodyid[geom1]
   body2 = geom_bodyid[geom2]
-  other = int(-1)
   if body1 == body and body2 != body:
     other = geom2
   elif body2 == body and body1 != body:
@@ -217,16 +223,21 @@ def _contact_gather_list(
   count_out: wp.array2d[int],
   cand_out: wp.array3d[int],
 ):
-  worldid, sens, word_idx = wp.tid()
-  bits = seen_in[worldid, sens, word_idx]
-  for bit in range(32):
-    if (bits & (wp.uint32(1) << wp.uint32(bit))) == wp.uint32(0):
+  worldid, sens = wp.tid()
+  nwords = seen_in.shape[2]
+  idx = int(0)
+  for word_idx in range(nwords):
+    bits = seen_in[worldid, sens, word_idx]
+    if bits == wp.uint32(0):
       continue
-    other = 32 * word_idx + bit
-    # ascending (word, bit) -> canonical candidates
-    idx = wp.atomic_add(count_out[worldid], sens, 1)
-    if idx < max_geoms:
-      cand_out[worldid, sens, idx] = other
+    for bit in range(32):
+      if (bits & (wp.uint32(1) << wp.uint32(bit))) == wp.uint32(0):
+        continue
+      other = 32 * word_idx + bit
+      if idx < max_geoms:
+        cand_out[worldid, sens, idx] = other
+      idx += 1
+  count_out[worldid, sens] = idx
 
 
 @wp.kernel(module="unique", enable_backward=True)
@@ -267,6 +278,12 @@ def _depth_kernel(
   force_out: wp.array2d[float],
 ):
   worldid, pix = wp.tid()
+  num_cand = wp.min(count_in[worldid, sens], max_geoms)
+  if num_cand <= 0:
+    depth_out[worldid, pix] = 0.0
+    force_out[worldid, pix] = 0.0
+    return
+
   row = pix // width
   col = pix % width
 
@@ -276,18 +293,21 @@ def _depth_kernel(
   p_gel = frame_pos + frame_x * x + frame_y * y
   p_world = geom_xmat_in[worldid, pad_geom] @ p_gel + geom_xpos_in[worldid, pad_geom]
 
-  num_cand = wp.min(count_in[worldid, sens], max_geoms)
   depth = float(0.0)
   for k in range(num_cand):
     g = cand_in[worldid, sens, k]
     if g < 0:
       continue
     gtype = geom_type[g]
+    if gtype == GeomType.PLANE or gtype == GeomType.HFIELD:
+      continue
     dataid = geom_dataid[worldid % geom_dataid.shape[0], g]
-    if gtype == GeomType.MESH and mesh_octadr[dataid] == -1:
+    if gtype == GeomType.MESH and (dataid < 0 or mesh_octadr[dataid] == -1):
+      continue
+    plugin_id = geom_plugin_index[g]
+    if gtype == GeomType.SDF and plugin_id == -1 and (dataid < 0 or mesh_octadr[dataid] == -1):
       continue
     p_local = wp.transpose(geom_xmat_in[worldid, g]) @ (p_world - geom_xpos_in[worldid, g])
-    plugin_id = geom_plugin_index[g]
     # SDF plugins live in the original mesh frame (matches MuJoCo C).
     if gtype == GeomType.SDF and plugin_id != -1 and dataid >= 0:
       p_local = rot_vec_quat(p_local, mesh_quat[dataid]) + mesh_pos[dataid]
@@ -417,7 +437,9 @@ def _shade_kernel(
       irradiance += leds_rgb[i] * (leds_intensity[i] * ndotl * att * vis)
       if specular > 0.0:
         hvec = wp.normalize(ldir + view)
-        irradiance += leds_rgb[i] * (leds_intensity[i] * specular * wp.pow(wp.max(wp.dot(normal, hvec), 0.0), shininess) * vis)
+        ndoth = wp.dot(normal, hvec)
+        if ndoth > 1.0e-8:
+          irradiance += leds_rgb[i] * (leds_intensity[i] * specular * wp.pow(ndoth, shininess) * att * vis)
 
   rgb = wp.cw_mul(base_rgb, irradiance)
 
@@ -431,7 +453,7 @@ def _shade_kernel(
     cj = wp.round(qy / marker_spacing_y - 0.5)
     cx = (ci + 0.5) * marker_spacing_x
     cy = (cj + 0.5) * marker_spacing_y
-    dd = wp.sqrt((qx - cx) * (qx - cx) + (qy - cy) * (qy - cy))
+    dd = wp.sqrt((qx - cx) * (qx - cx) + (qy - cy) * (qy - cy) + 1.0e-12)
     cov = 1.0 - _smoothstep(marker_radius - marker_softness, marker_radius + marker_softness, dd)
     marker = cov
     mix = marker_alpha * cov
@@ -786,15 +808,15 @@ def _geom_extent(m: Model, geom_id: int) -> tuple[tuple[float, float], float, np
   identity = np.eye(3)
   zero = np.zeros(3)
   if geom_type == GeomType.BOX:
-    return (float(size[0]), float(size[1])), float(size[2]), identity, zero
+    return (2.0 * float(size[0]), 2.0 * float(size[1])), float(size[2]), identity, zero
   if geom_type == GeomType.SPHERE:
-    return (float(size[0]), float(size[0])), float(size[0]), identity, zero
+    return (2.0 * float(size[0]), 2.0 * float(size[0])), float(size[0]), identity, zero
   if geom_type == GeomType.CAPSULE:
-    return (float(size[0]), float(size[0])), float(size[0] + size[1]), identity, zero
+    return (2.0 * float(size[0]), 2.0 * float(size[0])), float(size[0] + size[1]), identity, zero
   if geom_type == GeomType.CYLINDER:
-    return (float(size[0]), float(size[0])), float(size[1]), identity, zero
+    return (2.0 * float(size[0]), 2.0 * float(size[0])), float(size[1]), identity, zero
   if geom_type == GeomType.ELLIPSOID:
-    return (float(size[0]), float(size[1])), float(size[2]), identity, zero
+    return (2.0 * float(size[0]), 2.0 * float(size[1])), float(size[2]), identity, zero
   if geom_type == GeomType.MESH:
     return _mesh_geom_extent(m, geom_id)
   raise ValueError(
@@ -1119,6 +1141,16 @@ class VisuotactileRenderer:
       out = self.allocate(nworld)
 
     buf = self._backing(nworld)
+    for sbuf in buf["sensors"]:
+      for arr in sbuf.values():
+        if arr.grad is not None:
+          arr.grad.zero_()
+    for field in self.fields:
+      arrs = getattr(out, field)
+      if exists(arrs):
+        for arr in arrs:
+          if arr.grad is not None:
+            arr.grad.zero_()
     seen, count, cand = buf["seen"], buf["count"], buf["cand"]
     seen.zero_()
     count.zero_()
@@ -1131,7 +1163,7 @@ class VisuotactileRenderer:
     )
     wp.launch(
       _contact_gather_list,
-      dim=(nworld, nsens, self._nwords),
+      dim=(nworld, nsens),
       inputs=[self.max_geoms, seen],
       outputs=[count, cand],
     )

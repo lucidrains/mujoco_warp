@@ -5851,6 +5851,7 @@ def make_constraint(m: types.Model, d: types.Data):
             and nim_cpu.is_contiguous(d.efc.J)
             and nim_cpu.is_contiguous(d.efc.Jqvel)
             and nim_cpu.is_contiguous(d.efc.id)
+            and nim_cpu.is_contiguous(d.contact.efc_address)
           ):
             nim_ops.contact_jac_dense(
               d.nworld,

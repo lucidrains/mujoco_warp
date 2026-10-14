@@ -176,10 +176,11 @@ def _build_kernel(m: Model, rc: RenderContext, temperature: float):
         emission += w * (albedo_i * emis_i)
         w_sum += w
 
-      hit_point = hit_point / w_sum
-      normal = wp.normalize(normal)
-      albedo = albedo / w_sum
-      emission = emission / w_sum
+      inv_w = 1.0 / wp.max(w_sum, 1.0e-12)
+      hit_pt = hit_point * inv_w
+      surf_normal = normal / wp.sqrt(wp.dot(normal, normal) + 1.0e-12)
+      surf_albedo = albedo * inv_w
+      surf_emission = emission * inv_w
 
       # Direct lighting (Lambertian, no shadows).
       irradiance = wp.vec3(0.0, 0.0, 0.0)
@@ -192,20 +193,20 @@ def _build_kernel(m: Model, rc: RenderContext, temperature: float):
               l_dir = -light_xdir_in[worldid, li]
               light_radiance = light_diffuse[worldid % light_diffuse.shape[0], li] * _PI
             else:
-              to_light = light_xpos_in[worldid, li] - hit_point
-              dist_light = wp.length(to_light)
-              l_dir = to_light / wp.max(dist_light, 1.0e-9)
+              to_light = light_xpos_in[worldid, li] - hit_pt
+              dist_light = wp.sqrt(wp.dot(to_light, to_light) + 1.0e-12)
+              l_dir = to_light / dist_light
               attenuation = 1.0
               if wp.static(not light_attenuation_is_default):
                 att = light_attenuation[worldid % light_attenuation.shape[0], li]
                 attenuation = wp.safe_div(1.0, wp.dot(wp.vec3(1.0, dist_light, dist_light * dist_light), att))
               light_radiance = light_diffuse[worldid % light_diffuse.shape[0], li] * _PI * attenuation
-            ndotl = wp.max(wp.dot(normal, l_dir), 0.0)
+            ndotl = wp.max(wp.dot(surf_normal, l_dir), 0.0)
             irradiance += light_radiance * ndotl
 
       # Hard visibility against the background: straight-through at silhouettes.
       background_weight = wp.where(d_min >= _FAR, 1.0, 0.0)
-      radiance = emission + wp.cw_mul(albedo, irradiance) * (1.0 / _PI)
+      radiance = surf_emission + wp.cw_mul(surf_albedo, irradiance) * (1.0 / _PI)
       rgb_out[worldid, pix0 + rayid] = radiance * (1.0 - background_weight) + background * background_weight
     else:
       rgb_out[worldid, pix0 + rayid] = wp.static(background)

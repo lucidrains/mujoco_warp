@@ -179,7 +179,7 @@ def sensor_sample(
 ) -> wp.vec3:
   """Applies exposure, shot noise, read noise and saturation to linear radiance."""
   signal = wp.cw_mul(radiance, wp.vec3(exposure * gain, exposure * gain, exposure * gain))
-  signal = wp.min(wp.max(signal, wp.vec3(0.0, 0.0, 0.0)), wp.vec3(full_well_e, full_well_e, full_well_e))
+  signal = wp.max(signal, wp.vec3(0.0, 0.0, 0.0))
   # Poisson shot noise approximated as signal + sqrt(signal) * N(0, 1).
   shot = wp.vec3(
     noise1[0] * wp.sqrt(signal[0]),

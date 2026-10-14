@@ -86,15 +86,16 @@ def _scan_post_kernel(
   hit_out: wp.array2d[int],
 ):
   worldid, rayid = wp.tid()
-  rng = wp.rand_init(seed, worldid * dist.shape[1] + rayid)
+  rng = wp.rand_init(seed + 0x9E3779B9, worldid * dist.shape[1] + rayid)
   gi = geomid[worldid, rayid]
-  if gi < 0:
+  raw_dist = dist[worldid, rayid]
+  if gi < 0 or raw_dist > max_range:
     ranges_out[worldid, rayid] = max_range
     points_out[worldid, rayid] = pnt[worldid, rayid] + vec[worldid, rayid] * max_range
     intensity_out[worldid, rayid] = 0.0
     hit_out[worldid, rayid] = 0
     return
-  r = dist[worldid, rayid]
+  r = raw_dist
   if range_sigma > 0.0:
     r += wp.randn(rng) * range_sigma
   r = wp.clamp(r, 0.0, max_range)
