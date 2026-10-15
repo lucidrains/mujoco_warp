@@ -5,6 +5,9 @@ Ports the pair filtering (`io.py` nxn pair tables), contact material mixing
 reusing a `mujoco_warp.put_model` result so candidate pairs match the warp
 backend exactly. Everything here is per-run constant; per-world variation lives
 in the kernels driven by these tables.
+
+Collision scope: primitives, plane-convex meshes, and plugin SDFs (bolt/nut
+kinds; metric NIST threading needs `examples/alphanist` scenes + AABB patch).
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ OP_SPHERE_SPHERE = 2  # 1 point
 OP_SPHERE_CAPSULE = 3  # 1 point
 OP_CAPSULE_CAPSULE = 4  # 2 points
 OP_PLANE_MESH = 5  # up to 4 convex-hull points
+OP_SDF = 6  # 1 point (halton initpoints + gradient descent, mjwarp-style)
 
 _GEOM = mujoco.mjtGeom
 _OPCODE_TABLE = {
@@ -53,8 +57,59 @@ _OPCODE_TABLE = {
   (_GEOM.mjGEOM_PLANE, _GEOM.mjGEOM_MESH): OP_PLANE_MESH,
 }
 
-# max points emitted per opcode (plane-capsule: both capsule ends)
-POINTS_PER_OPCODE = (1, 2, 1, 1, 2, 4)
+# geom types a plugin SDF can pair with (analytic SDFs in the MSL helper)
+_SDF_PARTNER_TYPES = {
+  _GEOM.mjGEOM_SDF,
+  _GEOM.mjGEOM_PLANE,
+  _GEOM.mjGEOM_SPHERE,
+  _GEOM.mjGEOM_CAPSULE,
+  _GEOM.mjGEOM_BOX,
+}
+
+# SDF kinds implemented by the MSL helpers (see fused._MSL_SDF)
+KIND_BOLT = 0
+KIND_NUT = 1
+
+# max points emitted per opcode (plane-capsule: both capsule ends;
+# SDF: the 6 smallest-distinct candidates, matching the mps kernel arrays)
+POINTS_PER_OPCODE = (1, 2, 1, 1, 2, 4, 6)
+
+
+def _sdf_plugin_kinds() -> dict:
+  """Resolves the global plugin type ids of the supported metric SDF plugins."""
+  xml = """<mujoco><extension>
+    <plugin plugin="mujoco.sdf.bolt"><instance name="b"/></plugin>
+    <plugin plugin="mujoco.sdf.nut"><instance name="n"/></plugin>
+    </extension>
+    <asset>
+    <mesh name="bm"><plugin instance="b"/></mesh>
+    <mesh name="nm"><plugin instance="n"/></mesh>
+    </asset>
+    <worldbody>
+    <body><geom type="sdf" name="bg" mesh="bm"><plugin instance="b"/></geom>
+    <geom type="sdf" name="ng" mesh="nm"><plugin instance="n"/></geom></body>
+    </worldbody></mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  kinds = {}
+  for gname, kind in (("bg", KIND_BOLT), ("ng", KIND_NUT)):
+    g = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, gname)
+    kinds[int(m.plugin[m.geom_plugin[g]])] = kind
+  return kinds
+
+
+def _plugin_attrs(mjm: mujoco.MjModel, instance: int) -> list[float]:
+  """Parses the config attribute values of a plugin instance (strings -> floats)."""
+  start = int(mjm.plugin_attradr[instance])
+  end = int(mjm.plugin_attradr[instance + 1]) if instance + 1 < mjm.nplugin else len(mjm.plugin_attr)
+  chunk, out = [], []
+  for v in mjm.plugin_attr[start:end]:
+    if v == 0:
+      if chunk:
+        out.append(float("".join(chr(int(x)) for x in chunk)))
+        chunk = []
+    else:
+      chunk.append(v)
+  return out
 
 
 def _pair_material(mjm: mujoco.MjModel, pairid: int, g1: int, g2: int) -> dict:
@@ -99,7 +154,7 @@ def _pair_material(mjm: mujoco.MjModel, pairid: int, g1: int, g2: int) -> dict:
 
 
 class Rig:
-  """Static per-model tables for the batched MLX engine (primitive geoms)."""
+  """Static per-model tables for the batched MLX engine."""
 
   def __init__(self, mjm: mujoco.MjModel, contact_row_cap: int = 96):
     """Builds static tables; raises on unsupported model features."""
@@ -119,7 +174,6 @@ class Rig:
       ("non-fixed actuator gains", bool(np.any(mjm.actuator_gaintype != int(mujoco.mjtGain.mjGAIN_FIXED)))),
       ("non-none/affine actuator bias", bool(np.any(mjm.actuator_biastype > int(mujoco.mjtBias.mjBIAS_AFFINE)))),
       ("heightfield geoms", bool(np.any(mjm.geom_type == mujoco.mjtGeom.mjGEOM_HFIELD))),
-      ("sdf geoms", bool(np.any(mjm.geom_type == mujoco.mjtGeom.mjGEOM_SDF))),
       ("body gravcomp", bool(np.any(np.asarray(mjm.body_gravcomp) != 0.0))),
       ("joint stiffness polynomial", bool(np.any(np.asarray(mjm.jnt_stiffnesspoly) != 0.0))),
       ("dof damping polynomial", bool(np.any(np.asarray(mjm.dof_dampingpoly) != 0.0))),
@@ -222,6 +276,26 @@ class Rig:
     # dof ancestors per body: (nbody, nv) bitmap, from warp put_model
     self.body_isdofancestor = m.body_isdofancestor.numpy().astype(np.int8)[:, : self.nv].copy()
 
+    # ---- SDF geoms: plugin kind + radius (attr[0]) for the MSL SDF helpers
+    kinds = _sdf_plugin_kinds()
+    self.geom_sdf_kind = np.full(self.ngeom, -1, np.int32)
+    self.geom_sdf_attr = np.zeros(self.ngeom * 3, np.float32)
+    for g in range(self.ngeom):
+      if int(mjm.geom_type[g]) != _GEOM.mjGEOM_SDF:
+        continue
+      inst = int(mjm.geom_plugin[g])
+      if inst == -1:
+        raise ValueError(f"MLX engine: sdf geom {g} has no plugin instance")
+      ptype = int(mjm.plugin[inst])
+      kind = kinds.get(ptype)
+      if kind is None:
+        raise ValueError(f"MLX engine: unsupported SDF plugin type {ptype} on geom {g} (only bolt/nut)")
+      self.geom_sdf_kind[g] = kind
+      attrs = _plugin_attrs(mjm, inst)
+      self.geom_sdf_attr[g * 3] = float(attrs[0]) if attrs else 0.0
+    self.sdf_initpoints = max(1, int(mjm.opt.sdf_initpoints))
+    self.sdf_iterations = max(1, int(mjm.opt.sdf_iterations))
+
     # ---- candidate static rows
     self.friction_dofs = np.nonzero(mjm.dof_frictionloss > 0.0)[0]
     self.limited_joints = m.jnt_limited_slide_hinge_adr.numpy().astype(np.int32)
@@ -232,6 +306,19 @@ class Rig:
     # ---- mesh data for plane-convex contacts (indexed by vertex/graph offsets)
     self.mesh_vert = a(mjm.mesh_vert, np.float32).reshape(-1)
     self.mesh_graph = a(mjm.mesh_graph, np.int32).reshape(-1)
+
+    # mesh face data: the plane-convex manifold follows MuJoCo's mjc_PlaneConvex
+    # (deepest vertex + the max-area quad of the incident face most anti-aligned
+    # with the plane normal)
+
+    self.mesh_polynormal = a(mjm.mesh_polynormal, np.float32).reshape(-1)
+    self.mesh_polymapadr = a(mjm.mesh_polymapadr, np.int32).reshape(-1)
+    self.mesh_polymapnum = a(mjm.mesh_polymapnum, np.int32).reshape(-1)
+    self.mesh_polymap = a(mjm.mesh_polymap, np.int32).reshape(-1)
+    self.mesh_polyadr = a(mjm.mesh_polyadr, np.int32).reshape(-1)
+    self.mesh_polyvertadr = a(mjm.mesh_polyvertadr, np.int32).reshape(-1)
+    self.mesh_polyvertnum = a(mjm.mesh_polyvertnum, np.int32).reshape(-1)
+    self.mesh_polyvert = a(mjm.mesh_polyvert, np.int32).reshape(-1)
 
     # ---- contact candidate pairs (world-independent)
     gp = m.nxn_geom_pair_filtered.numpy().astype(np.int32)
@@ -245,7 +332,13 @@ class Rig:
       g1, g2 = int(gp[k, 0]), int(gp[k, 1])
       lo, hi = (g1, g2) if int(mjm.geom_type[g1]) <= int(mjm.geom_type[g2]) else (g2, g1)
       types = (int(mjm.geom_type[lo]), int(mjm.geom_type[hi]))
-      opcode = _OPCODE_TABLE.get(types)
+      if _GEOM.mjGEOM_SDF in types:
+        # SDF pairs: plugin SDFs (bolt/nut) vs each other or analytic partners
+        if not all(t in _SDF_PARTNER_TYPES for t in types):
+          raise ValueError(f"MLX engine: unsupported SDF collision pair geoms {g1}x{g2} (types {types})")
+        opcode = OP_SDF
+      else:
+        opcode = _OPCODE_TABLE.get(types)
       if opcode is None:
         if types == (_GEOM.mjGEOM_MESH, _GEOM.mjGEOM_MESH):
           # convex-convex narrowphase is not implemented; skip (the MLX env
@@ -282,6 +375,13 @@ class Rig:
     self.pair_gadr = np.asarray(gads, np.int32)
     self.pair_vertnum = np.asarray(vnums, np.int32)
     self.pair_usegraph = np.asarray(uses, np.int32)
+
+    # per-pair polygon base offset (mesh + polyadr), for the plane-convex face
+    # manifold; -1 when the second geom carries no mesh polygon data
+
+    self.pair_polyadr = np.asarray([
+      int(mjm.mesh_polyadr[int(mjm.geom_dataid[g2])]) if int(mjm.geom_dataid[g2]) >= 0 else -1 for g2 in g2s
+    ], np.int32)
     self.pair_body1 = self.geom_bodyid[self.pair_g1].astype(np.int32)
     self.pair_body2 = self.geom_bodyid[self.pair_g2].astype(np.int32)
     if self.npairc > 0:

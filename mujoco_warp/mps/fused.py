@@ -69,8 +69,13 @@ static inline float3 g_mv(const thread float* m, float3 v) {
                 m[6] * v.x + m[7] * v.y + m[8] * v.z);
 }
 
-static inline float3 g_vertex(const device float* verts, int vadr, int idx) {
-  return float3(verts[(vadr + idx) * 3 + 0], verts[(vadr + idx) * 3 + 1], verts[(vadr + idx) * 3 + 2]);
+// 0.5 * |(c - a) x (d - b)|, the quadrilateral area MuJoCo's hull4f maximizes
+
+static inline float g_area4(float3 va, float3 vb, float3 vc, float3 vd) {
+  float3 ca = va - vc;
+  float3 db = vb - vd;
+  float3 cr = g_cross(ca, db);
+  return 0.5f * metal::sqrt(g_dot3(cr, cr));
 }
 
 static inline void g_motion_cross(const thread float* u, const thread float* v, thread float* out) {
@@ -268,21 +273,205 @@ static inline void g_row_cost_shifted(
 }
 """
 
+# ------------------------------------------------------------------ SDF helpers
+# Port of the mjwarp SDF collision path (collision_sdf.py: sdf/clearance/
+# compute_grad/gradient_step + halton initpoints) with the metric NIST nut/bolt
+# SDFs from examples/alphanist/sdf_m.py, evaluated in unit space and scaled
+# back (the fixed absolute line-search constants need unit-sized geometry).
+_MSL_SDF = r"""
+static inline float g_frac(float x) { return x - metal::floor(x); }
+
+static inline float g_iso_pitch(float r) {
+  if (r > 0.0085f) return 0.0025f;   // M20
+  if (r > 0.007f) return 0.0020f;    // M16
+  if (r > 0.005f) return 0.00175f;   // M12
+  if (r > 0.003f) return 0.00125f;   // M8
+  return 0.0007f;                    // M4
+}
+
+// rotated hex apothem coordinate (kinds shared with the bolt/nut SDFs)
+static inline float g_hex_coord_x(float3 p) {
+  float k = 6.0f / 3.141592653589793f / 2.0f;
+  float angle = -metal::floor(metal::atan2(p.y, p.x) * k + 0.5f) / k;
+  float s0 = metal::sin(angle);
+  float s1 = metal::sin(angle + 1.570796326794897f);
+  return s1 * p.x - s0 * p.y;
+}
+
+static inline float g_sdf_thread(float3 p, float r, float pit) {
+  float rho2 = metal::sqrt(p.x * p.x + p.y * p.y) - r;
+  float az = metal::atan2(p.y, p.x);
+  float tri = metal::abs(g_frac(p.z / pit - az / 6.283185307179586f) - 0.5f);
+  return (rho2 + 0.5f * pit - tri * pit) * 0.7071067811865476f;
+}
+
+static inline float g_sdf_bolt_unit(float3 p, float r, float pit) {
+  float U = 12.0f * pit;
+  float rho2 = metal::sqrt(p.x * p.x + p.y * p.y) - r;
+  float thr = g_sdf_thread(p, r, pit);
+  float body = metal::max(thr, -(U * 0.5f - metal::abs(p.z + U * 0.5f)));
+  float cone = (p.z - rho2) * 0.7071067811865476f;
+  body = metal::max(body, -(cone + U * 0.7071067811865476f));
+  float head = g_hex_coord_x(p) - 1.5f * r;
+  head = metal::max(head, metal::abs(p.z + U * 0.25f) - U * 0.25f);
+  head = metal::max(head, (p.z + rho2 - 0.22f * U) * 0.7071067811865476f);
+  return metal::min(body, head);
+}
+
+static inline float g_sdf_nut_unit(float3 p, float r, float pit) {
+  float U = 12.0f * pit;
+  float rho2 = metal::sqrt(p.x * p.x + p.y * p.y) - r;
+  float thr = g_sdf_thread(p, r, pit);
+  float cone = (p.z - rho2) * 0.7071067811865476f;
+  float hole = metal::max(thr, -(cone + U * 0.5f * 0.7071067811865476f));
+  hole = metal::min(hole, -cone - 0.05f * U * 0.7071067811865476f);
+  float head = g_hex_coord_x(p) - 1.5f * r;
+  head = metal::max(head, metal::abs(p.z + U * 0.25f) - U * 0.25f);
+  head = metal::max(head, (p.z + rho2 - 0.22f * U) * 0.7071067811865476f);
+  return metal::max(head, -hole);
+}
+
+static inline float g_sdf_bolt_m(float3 p, float r) {
+  float s = 2.0f * r / 0.51f;
+  return s * g_sdf_bolt_unit(p / s, r / s, g_iso_pitch(r) / s);
+}
+
+static inline float g_sdf_nut_m(float3 p, float r) {
+  float s = 2.0f * r / 0.51f;
+  return s * g_sdf_nut_unit(p / s, r / s, g_iso_pitch(r) / s);
+}
+
+// geom types (mjtGeom): 0 plane, 2 sphere, 3 capsule, 6 box, 8 sdf
+static inline float g_sdf_eval(int gtype, float3 p, float3 sz, int kind, float radius) {
+  if (gtype == 0) return p.z;
+  if (gtype == 2) return metal::sqrt(g_dot3(p, p)) - sz.x;
+  if (gtype == 3) {
+    float zc = metal::clamp(p.z, -sz.y, sz.y);
+    float3 v = float3(p.x, p.y, p.z - zc);
+    return metal::sqrt(g_dot3(v, v)) - sz.x;
+  }
+  if (gtype == 6) {
+    float3 a = metal::abs(p) - sz;
+    float3 b = metal::max(a, float3(0.0f));
+    return metal::sqrt(g_dot3(b, b)) + metal::min(metal::max(a.x, metal::max(a.y, a.z)), 0.0f);
+  }
+  return kind == 0 ? g_sdf_bolt_m(p, radius) : g_sdf_nut_m(p, radius);
+}
+
+static inline float3 g_sdf_grad(int gtype, float3 p, float3 sz, int kind, float radius) {
+  const float eps = 1e-6f;
+  float f0 = g_sdf_eval(gtype, p, sz, kind, radius);
+  float3 dx = float3(eps, 0.0f, 0.0f);
+  float3 dy = float3(0.0f, eps, 0.0f);
+  float3 dz = float3(0.0f, 0.0f, eps);
+  return float3(
+    (g_sdf_eval(gtype, p + dx, sz, kind, radius) - f0) / eps,
+    (g_sdf_eval(gtype, p + dy, sz, kind, radius) - f0) / eps,
+    (g_sdf_eval(gtype, p + dz, sz, kind, radius) - f0) / eps);
+}
+
+static inline float g_sdf_clearance(
+  int t1, float3 p1, float3 p2, float3 s1, float3 s2, int k1, int k2, float r1, float r2, bool inter
+) {
+  float a = g_sdf_eval(t1, p1, s1, k1, r1);
+  float b = g_sdf_eval(8, p2, s2, k2, r2);
+  if (inter) return metal::max(a, b);
+  return a + b + metal::abs(metal::max(a, b));
+}
+
+static inline float3 g_sdf_compute_grad(
+  int t1, float3 p1, float3 p2, float3 s1, float3 s2, int k1, int k2, float r1, float r2,
+  const thread float* rel_mat, bool inter
+) {
+  float A = g_sdf_eval(t1, p1, s1, k1, r1);
+  float B = g_sdf_eval(8, p2, s2, k2, r2);
+  float3 gr1 = g_sdf_grad(t1, p1, s1, k1, r1);
+  float3 gr2 = g_sdf_grad(8, p2, s2, k2, r2);
+  float3 g1t = float3(
+    rel_mat[0] * gr1.x + rel_mat[3] * gr1.y + rel_mat[6] * gr1.z,
+    rel_mat[1] * gr1.x + rel_mat[4] * gr1.y + rel_mat[7] * gr1.z,
+    rel_mat[2] * gr1.x + rel_mat[5] * gr1.y + rel_mat[8] * gr1.z);
+  if (inter) return A > B ? g1t : gr2;
+  float mv = metal::max(A, B);
+  float3 mg = A > B ? g1t : gr2;
+  float sgn = mv > 0.0f ? 1.0f : (mv < 0.0f ? -1.0f : 0.0f);
+  return gr2 + g1t + mg * sgn;
+}
+
+// one mjwarp gradient_step (x lives in g2-local, rel_mat maps g2 -> g1)
+static inline void g_sdf_step(
+  int t1, thread float* x, float3 s1, float3 s2, int k1, int k2, float r1, float r2,
+  const thread float* rel_mat, float3 rel_pos, int niter, bool inter, thread float* dist_out, thread float* x_out
+) {
+  const float amin = 1e-4f;
+  const float rho = 0.5f;
+  const float c = 0.1f;
+  float3 xv = float3(x[0], x[1], x[2]);
+  float dist = 1e10f;
+  for (int i = 0; i < niter; ++i) {
+    float alpha = 2.0f;
+    float3 x2 = xv;
+    float3 x1 = g_mv(rel_mat, x2) + rel_pos;
+    float3 grad = g_sdf_compute_grad(t1, x1, x2, s1, s2, k1, k2, r1, r2, rel_mat, inter);
+    float dist0 = g_sdf_clearance(t1, x1, x2, s1, s2, k1, k2, r1, r2, inter);
+    float gd = g_dot3(grad, grad);
+    if (gd < 1e-12f) {
+      dist_out[0] = dist0;
+      x_out[0] = xv.x; x_out[1] = xv.y; x_out[2] = xv.z;
+      return;
+    }
+    float wolfe = -c * alpha * gd;
+    while (true) {
+      alpha *= rho;
+      wolfe *= rho;
+      xv = x2 - grad * alpha;
+      x1 = g_mv(rel_mat, xv) + rel_pos;
+      dist = g_sdf_clearance(t1, x1, xv, s1, s2, k1, k2, r1, r2, inter);
+      if (alpha <= amin || (dist - dist0) <= wolfe) break;
+    }
+    if (dist > dist0) {
+      dist_out[0] = dist0;
+      x_out[0] = x2.x; x_out[1] = x2.y; x_out[2] = x2.z;
+      return;
+    }
+  }
+  dist_out[0] = dist;
+  x_out[0] = xv.x; x_out[1] = xv.y; x_out[2] = xv.z;
+}
+
+static inline float g_halton(int index, int base) {
+  float f = 1.0f;
+  float r = 0.0f;
+  int i = index;
+  while (i > 0) {
+    f = f / (float)base;
+    r = r + f * (float)(i % base);
+    i = i / base;
+  }
+  return r;
+}
+"""
+
 
 # --------------------------------------------------------------------- K1 dyn+rows
-def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool = False) -> tuple[str, str]:
+def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool = False, adr_s: dict[str, int] | None = None) -> tuple[str, str]:
   """Returns (source, header) for the K1 dyn kernel (source is the kernel body).
 
-  Templates: NBODY NJNT NQ NV NGEOM NCHAIN NU NP RC NFR NLIM BF.
+  Templates: NBODY NJNT NQ NV NGEOM NCHAIN NU NP RC NFR NLIM BF MBS.
 
   `adr_f`/`adr_i` give the packed-buffer offsets of the static model tables
-  (fewer device buffers than Metal's per-kernel limit). `kin=True` adds
-  intermediates for validation (cdof, subtree_com, geom poses).
+  (fewer device buffers than Metal's per-kernel limit). Float tables are read
+  per world (`mbf[w * MBS + adr]`), so any of them (gravity, geom_quat/pos,
+  body_mass, actuator gains, pair friction, ...) can differ per world - that is
+  what per-world ramps/terrain and per-world domain randomization ride on.
+  `kin=True` adds intermediates for validation (cdof, subtree_com, geom poses).
   """
   NB, NJ, NQ, NV = t["NBODY"], t["NJNT"], t["NQ"], t["NV"]
   NGE, NCH, NU = t["NGEOM"], t["NCHAIN"], t["NU"]
   NP, RC = t["NP"], t["RC"]
   NFR, NLIM, BF = t["NFR"], t["NLIM"], t["BF"]
+  MBS = t["MBS"]
+  SDFPTS, SDFIT = t["SDFPTS"], t["SDFIT"]
 
   kin_geom = (
     f"""
@@ -339,9 +528,122 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     else ""
   )
 
+  # SDF narrowphase (op 6): halton initpoints in the AABB intersection (g1
+  # frame) + mjwarp's gradient descent; the deepest point wins. Port of
+  # mjwarp _sdf_narrowphase + gradient_descent, single point per pair.
+  sdf_branch = f"""    else if (op == 6) {{
+      int k1s = geom_sdf_kind[g1];
+      int k2s = geom_sdf_kind[g2];
+      float r1sf = geom_sdf_attr[g1 * 3];
+      float r2sf = geom_sdf_attr[g2 * 3];
+      int t1sf = geom_type_i[g1];
+      float3 sz1 = float3(geom_size[g1 * 3 + 0], geom_size[g1 * 3 + 1], geom_size[g1 * 3 + 2]);
+      float3 sz2 = float3(geom_size[g2 * 3 + 0], geom_size[g2 * 3 + 1], geom_size[g2 * 3 + 2]);
+      // rel_mat = gm1^T * gm2 (maps g2-local -> g1-local), rel_pos likewise
+      thread float relmat[9];
+      relmat[0] = gm[g1 * 9 + 0] * gm[g2 * 9 + 0] + gm[g1 * 9 + 3] * gm[g2 * 9 + 3] + gm[g1 * 9 + 6] * gm[g2 * 9 + 6];
+      relmat[1] = gm[g1 * 9 + 0] * gm[g2 * 9 + 1] + gm[g1 * 9 + 3] * gm[g2 * 9 + 4] + gm[g1 * 9 + 6] * gm[g2 * 9 + 7];
+      relmat[2] = gm[g1 * 9 + 0] * gm[g2 * 9 + 2] + gm[g1 * 9 + 3] * gm[g2 * 9 + 5] + gm[g1 * 9 + 6] * gm[g2 * 9 + 8];
+      relmat[3] = gm[g1 * 9 + 1] * gm[g2 * 9 + 0] + gm[g1 * 9 + 4] * gm[g2 * 9 + 3] + gm[g1 * 9 + 7] * gm[g2 * 9 + 6];
+      relmat[4] = gm[g1 * 9 + 1] * gm[g2 * 9 + 1] + gm[g1 * 9 + 4] * gm[g2 * 9 + 4] + gm[g1 * 9 + 7] * gm[g2 * 9 + 7];
+      relmat[5] = gm[g1 * 9 + 1] * gm[g2 * 9 + 2] + gm[g1 * 9 + 4] * gm[g2 * 9 + 5] + gm[g1 * 9 + 7] * gm[g2 * 9 + 8];
+      relmat[6] = gm[g1 * 9 + 2] * gm[g2 * 9 + 0] + gm[g1 * 9 + 5] * gm[g2 * 9 + 3] + gm[g1 * 9 + 8] * gm[g2 * 9 + 6];
+      relmat[7] = gm[g1 * 9 + 2] * gm[g2 * 9 + 1] + gm[g1 * 9 + 5] * gm[g2 * 9 + 4] + gm[g1 * 9 + 8] * gm[g2 * 9 + 7];
+      relmat[8] = gm[g1 * 9 + 2] * gm[g2 * 9 + 2] + gm[g1 * 9 + 5] * gm[g2 * 9 + 5] + gm[g1 * 9 + 8] * gm[g2 * 9 + 8];
+      float3 dpos = xa2 - xa1;
+      float3 relpos = float3(
+        gm[g1 * 9 + 0] * dpos.x + gm[g1 * 9 + 3] * dpos.y + gm[g1 * 9 + 6] * dpos.z,
+        gm[g1 * 9 + 1] * dpos.x + gm[g1 * 9 + 4] * dpos.y + gm[g1 * 9 + 7] * dpos.z,
+        gm[g1 * 9 + 2] * dpos.x + gm[g1 * 9 + 5] * dpos.y + gm[g1 * 9 + 8] * dpos.z);
+      float3 c1 = float3(geom_aabb[g1 * 6 + 0], geom_aabb[g1 * 6 + 1], geom_aabb[g1 * 6 + 2]);
+      float3 h1 = float3(geom_aabb[g1 * 6 + 3], geom_aabb[g1 * 6 + 4], geom_aabb[g1 * 6 + 5]);
+      float3 c2 = float3(geom_aabb[g2 * 6 + 0], geom_aabb[g2 * 6 + 1], geom_aabb[g2 * 6 + 2]);
+      float3 h2 = float3(geom_aabb[g2 * 6 + 3], geom_aabb[g2 * 6 + 4], geom_aabb[g2 * 6 + 5]);
+      // box2 in g1 frame: exact AABB of the 8 transformed corners (matches
+      // mjwarp transform_aabb, which the halton initpoints depend on)
+      float3 c2g_min = float3(1e30f);
+      float3 c2g_max = float3(-1e30f);
+      for (int jj = 0; jj < 8; ++jj) {{
+        float3 v = float3(
+          h2.x * ((jj & 1) != 0 ? 1.0f : -1.0f),
+          h2.y * ((jj & 2) != 0 ? 1.0f : -1.0f),
+          h2.z * ((jj & 4) != 0 ? 1.0f : -1.0f));
+        float3 fv = g_mv(relmat, v + c2) + relpos;
+        c2g_min = metal::min(c2g_min, fv);
+        c2g_max = metal::max(c2g_max, fv);
+      }}
+      float3 bmin = metal::max(c1 - h1, c2g_min);
+      float3 bmax = metal::min(c1 + h1, c2g_max);
+      // keep the 6 smallest-distinct candidates (warp writes every initpoint
+      // result; the row filter below drops the non-contacting ones)
+      thread float cand_d[6];
+      thread float cand_x[18];
+      for (int ii = 0; ii < 6; ++ii) cand_d[ii] = 1e9f;
+      if (bmax.x >= bmin.x && bmax.y >= bmin.y && bmax.z >= bmin.z) {{
+        float3 bext = bmax - bmin;
+        for (int ii = 0; ii < {SDFPTS}; ++ii) {{
+          float3 xg1 = bmin + bext * float3(g_halton(ii, 2), g_halton(ii, 3), g_halton(ii, 5));
+          float3 xw = g_mv(&gm[g1 * 9], xg1) + xa1;
+          float3 dd = xw - xa2;
+          thread float xx[3];
+          xx[0] = gm[g2 * 9 + 0] * dd.x + gm[g2 * 9 + 3] * dd.y + gm[g2 * 9 + 6] * dd.z;
+          xx[1] = gm[g2 * 9 + 1] * dd.x + gm[g2 * 9 + 4] * dd.y + gm[g2 * 9 + 7] * dd.z;
+          xx[2] = gm[g2 * 9 + 2] * dd.x + gm[g2 * 9 + 5] * dd.y + gm[g2 * 9 + 8] * dd.z;
+          thread float dout[1];
+          thread float xout[3];
+          dout[0] = 1e9f;
+          xout[0] = xx[0]; xout[1] = xx[1]; xout[2] = xx[2];
+          g_sdf_step(t1sf, xx, sz1, sz2, k1s, k2s, r1sf, r2sf, relmat, relpos, {SDFIT}, false, dout, xout);
+          g_sdf_step(t1sf, xout, sz1, sz2, k1s, k2s, r1sf, r2sf, relmat, relpos, 1, true, dout, xout);
+          if (dout[0] < cand_d[5]) {{
+            int slot = 5;
+            while (slot > 0 && cand_d[slot - 1] > dout[0]) {{
+              cand_d[slot] = cand_d[slot - 1];
+              cand_x[slot * 3 + 0] = cand_x[(slot - 1) * 3 + 0];
+              cand_x[slot * 3 + 1] = cand_x[(slot - 1) * 3 + 1];
+              cand_x[slot * 3 + 2] = cand_x[(slot - 1) * 3 + 2];
+              slot -= 1;
+            }}
+            cand_d[slot] = dout[0];
+            cand_x[slot * 3 + 0] = xout[0];
+            cand_x[slot * 3 + 1] = xout[1];
+            cand_x[slot * 3 + 2] = xout[2];
+          }}
+        }}
+      }}
+      int nc = 0;
+      for (int ii = 0; ii < 6 && nc < 6; ++ii) {{
+        if (cand_d[ii] > 1e8f) break;
+        float3 xv = float3(cand_x[ii * 3 + 0], cand_x[ii * 3 + 1], cand_x[ii * 3 + 2]);
+        float3 xv1 = g_mv(relmat, xv) + relpos;
+        float3 gr1 = g_sdf_grad(t1sf, xv1, sz1, k1s, r1sf);
+        float3 g1t = g_normalize3(float3(
+          relmat[0] * gr1.x + relmat[3] * gr1.y + relmat[6] * gr1.z,
+          relmat[1] * gr1.x + relmat[4] * gr1.y + relmat[7] * gr1.z,
+          relmat[2] * gr1.x + relmat[5] * gr1.y + relmat[8] * gr1.z));
+        float3 g2n = g_normalize3(g_sdf_grad(8, xv, sz2, k2s, r2sf));
+        float3 nloc = g_normalize3(g1t - g2n);
+        float3 posw = g_mv(&gm[g2 * 9], xv) + xa2;
+        float3 nw = g_mv(&gm[g2 * 9], nloc);
+        ds[nc] = cand_d[ii];
+        psd[nc] = posw - nw * (0.5f * cand_d[ii]);
+        g_make_frame(nw, frms[nc]);
+        nc += 1;
+      }}
+      npts = nc;
+    }}"""
+
   body = f"""
   int w = (int)thread_position_in_grid.x;
   if (w >= nworld_buf[0]) return;
+
+  // mesh vertex read (macro: expands after packed-table name substitution, so
+  // it never depends on the buffer's Metal address space)
+
+  #define G_MESH_VERT(vadr, idx) float3( \
+    mesh_vert[((vadr) + (idx)) * 3 + 0], \
+    mesh_vert[((vadr) + (idx)) * 3 + 1], \
+    mesh_vert[((vadr) + (idx)) * 3 + 2])
 
   thread float qpos[{NQ}];
   for (int k = 0; k < {NQ}; ++k) qpos[k] = qpos_in[w * {NQ} + k];
@@ -789,11 +1091,11 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     float r2s = geom_size[g2 * 3 + 0];
     float hl1 = geom_size[g1 * 3 + 1];
     float hl2 = geom_size[g2 * 3 + 1];
-    float ds[4];
-    float3 psd[4];
-    float frms[4][9];
+    float ds[6];
+    float3 psd[6];
+    float frms[6][9];
     int npts = 1;
-    for (int i = 0; i < 4; ++i) ds[i] = 1e6f;
+    for (int i = 0; i < 6; ++i) ds[i] = 1e6f;
 
     if (op == 0) {{
       float3 nrm = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
@@ -967,7 +1269,6 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       const float huge = 1e6f;
       float3 pnrm = float3(gm[g1 * 9 + 2], gm[g1 * 9 + 5], gm[g1 * 9 + 8]);
       const thread float* mr = &gm[g2 * 9];
-      const device float* mv = &mesh_vert[0];
       float3 dv = xa1 - xa2;
       float3 pl = float3(
         mr[0] * dv.x + mr[3] * dv.y + mr[6] * dv.z,
@@ -981,53 +1282,19 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       int gadr = pair_gadr[p];
       // graph offsets stride by the hull's vertex count (mesh_graph[graphadr])
       int vnum = (pair_usegraph[p] != 0) ? mesh_graph[gadr] : pair_vertnum[p];
-      int idxs[4];
-      idxs[0] = -1; idxs[1] = -1; idxs[2] = -1; idxs[3] = -1;
+      // support point: deepest mesh vertex (graph climb, else exhaustive),
+      // then MuJoCo's mjc_PlaneConvex manifold: the max-area quad of the face
+      // incident to the deepest vertex whose normal is most anti-aligned with
+      // the plane normal, anchored at the deepest vertex
+
+      int lv = -1;
       float max_support = -huge;
 
       if (pair_usegraph[p] == 0) {{
-        int aidx = -1;
         for (int i = 0; i < vnum; ++i) {{
-          float3 vv = g_vertex(mv, vadr, i);
-          float sup = g_dot3(pl - vv, nn);
-          if (sup > max_support) {{ max_support = sup; aidx = i; }}
+          float sup = g_dot3(pl - G_MESH_VERT(vadr, i), nn);
+          if (sup > max_support) {{ max_support = sup; lv = i; }}
         }}
-        if (max_support <= -margin_c) continue;
-        float threshold = max_support - 1e-3f;
-        float3 av = g_vertex(mv, vadr, aidx);
-
-        int bidx = -1; float bdist = -huge;
-        for (int i = 0; i < vnum; ++i) {{
-          float3 vv = g_vertex(mv, vadr, i);
-          float sup = g_dot3(pl - vv, nn);
-          float msk = (sup > threshold) ? 0.0f : -huge;
-          float dd = g_dot3(av - vv, av - vv) + msk;
-          if (dd > bdist) {{ bdist = dd; bidx = i; }}
-        }}
-        float3 bv = g_vertex(mv, vadr, bidx);
-        float3 ab = g_cross(nn, av - bv);
-
-        int cidx = -1; float cdist = -huge;
-        for (int i = 0; i < vnum; ++i) {{
-          float3 vv = g_vertex(mv, vadr, i);
-          float sup = g_dot3(pl - vv, nn);
-          float msk = (sup > threshold) ? 0.0f : -huge;
-          float dd = metal::abs(g_dot3(av - vv, ab)) + msk;
-          if (dd > cdist) {{ cdist = dd; cidx = i; }}
-        }}
-        float3 cv = g_vertex(mv, vadr, cidx);
-        float3 ac = g_cross(nn, av - cv);
-        float3 bc = g_cross(nn, bv - cv);
-
-        int didx = -1; float ddist = -huge;
-        for (int i = 0; i < vnum; ++i) {{
-          float3 vv = g_vertex(mv, vadr, i);
-          float sup = g_dot3(pl - vv, nn);
-          float msk = (sup > threshold) ? 0.0f : -huge;
-          float dd = metal::abs(g_dot3(av - vv, ac)) + metal::abs(g_dot3(bv - vv, bc)) + msk;
-          if (dd > ddist) {{ ddist = dd; didx = i; }}
-        }}
-        idxs[0] = aidx; idxs[1] = bidx; idxs[2] = cidx; idxs[3] = didx;
       }} else {{
         int prev = -1; int imax = 0;
         while (true) {{
@@ -1035,121 +1302,87 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
           int ii = mesh_graph[gadr + 2 + imax];
           while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
             int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
-            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
-            float3 vv = g_vertex(mv, vadr, vidx);
-            float sup = g_dot3(pl - vv, nn);
+            float sup = g_dot3(pl - G_MESH_VERT(vadr, mesh_graph[gadr + 2 + vnum + subidx]), nn);
             if (sup > max_support) {{ max_support = sup; imax = subidx; }}
             ii += 1;
           }}
           if (imax == prev) break;
         }}
-        if (max_support <= -margin_c) continue;
-        float threshold = metal::max(-margin_c, max_support - 1e-3f);
-
-        float adist = -huge;
-        while (true) {{
-          prev = imax;
-          int ii = mesh_graph[gadr + 2 + imax];
-          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
-            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
-            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
-            float3 vv = g_vertex(mv, vadr, vidx);
-            float sup = g_dot3(pl - vv, nn);
-            float dd = (sup > threshold) ? sup : -huge;
-            if (dd > adist) {{ adist = dd; imax = subidx; }}
-            ii += 1;
-          }}
-          if (imax == prev) break;
-        }}
-        int ag = mesh_graph[gadr + 2 + vnum + imax];
-        float3 av = g_vertex(mv, vadr, ag);
-        idxs[0] = ag;
-
-        float bdist = -huge;
-        while (true) {{
-          prev = imax;
-          int ii = mesh_graph[gadr + 2 + imax];
-          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
-            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
-            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
-            float3 vv = g_vertex(mv, vadr, vidx);
-            float sup = g_dot3(pl - vv, nn);
-            float msk = (sup > threshold) ? 0.0f : -huge;
-            float dd = g_dot3(av - vv, av - vv) + msk;
-            if (dd > bdist) {{ bdist = dd; imax = subidx; }}
-            ii += 1;
-          }}
-          if (imax == prev) break;
-        }}
-        int bg = mesh_graph[gadr + 2 + vnum + imax];
-        float3 bv = g_vertex(mv, vadr, bg);
-        idxs[1] = bg;
-        float3 ab = g_cross(nn, av - bv);
-
-        float cdist = -huge;
-        while (true) {{
-          prev = imax;
-          int ii = mesh_graph[gadr + 2 + imax];
-          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
-            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
-            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
-            float3 vv = g_vertex(mv, vadr, vidx);
-            float sup = g_dot3(pl - vv, nn);
-            float msk = (sup > threshold) ? 0.0f : -huge;
-            float dd = metal::abs(g_dot3(av - vv, ab)) + msk;
-            if (dd > cdist) {{ cdist = dd; imax = subidx; }}
-            ii += 1;
-          }}
-          if (imax == prev) break;
-        }}
-        int cg = mesh_graph[gadr + 2 + vnum + imax];
-        float3 cv = g_vertex(mv, vadr, cg);
-        idxs[2] = cg;
-        float3 ac = g_cross(nn, av - cv);
-        float3 bc = g_cross(nn, bv - cv);
-
-        float ddist = -huge;
-        while (true) {{
-          prev = imax;
-          int ii = mesh_graph[gadr + 2 + imax];
-          while (mesh_graph[gadr + 2 + 2 * vnum + ii] >= 0) {{
-            int subidx = mesh_graph[gadr + 2 + 2 * vnum + ii];
-            int vidx = mesh_graph[gadr + 2 + vnum + subidx];
-            float3 vv = g_vertex(mv, vadr, vidx);
-            float sup = g_dot3(pl - vv, nn);
-            float msk = (sup > threshold) ? 0.0f : -huge;
-            float dd = metal::abs(g_dot3(av - vv, ac)) + metal::abs(g_dot3(bv - vv, bc)) + msk;
-            if (dd > ddist) {{ ddist = dd; imax = subidx; }}
-            ii += 1;
-          }}
-          if (imax == prev) break;
-        }}
-        int dg = mesh_graph[gadr + 2 + vnum + imax];
-        idxs[3] = dg;
+        lv = mesh_graph[gadr + 2 + vnum + imax];
       }}
 
-      // emit unique indices in slot order, transformed to the world frame
-      int slot = 0;
-      for (int ci = 3; ci >= 0; --ci) {{
-        int idx = idxs[ci];
-        int count = 0;
-        for (int cj = 0; cj <= ci; ++cj) if (idxs[cj] == idx) count += 1;
-        if (count != 1) continue;
-        float3 lv = g_vertex(mv, vadr, idx);
-        float3 wp = xa2 + float3(
-          mr[0] * lv.x + mr[1] * lv.y + mr[2] * lv.z,
-          mr[3] * lv.x + mr[4] * lv.y + mr[5] * lv.z,
-          mr[6] * lv.x + mr[7] * lv.y + mr[8] * lv.z);
-        float sup = g_dot3(pl - lv, nn);
-        float dist = -sup;
-        wp = wp - 0.5f * dist * pnrm;
-        ds[slot] = dist;
-        psd[slot] = wp;
-        g_make_frame(pnrm, frms[slot]);
-        slot += 1;
+      if (lv < 0 || max_support <= -margin_c) continue;
+
+      float d0 = -max_support;
+      g_make_frame(pnrm, frms[0]);
+      ds[0] = d0;
+      psd[0] = (xa2 + g_mv(mr, G_MESH_VERT(vadr, lv))) - 0.5f * d0 * pnrm;
+      int nc = 1;
+
+      if (pair_polyadr[p] >= 0) {{
+        int pmapadr = mesh_polymapadr[vadr + lv];
+        int pmapnum = mesh_polymapnum[vadr + lv];
+        int best_poly = -1;
+        float best_dot = 1.0f;
+
+        for (int i = 0; i < pmapnum; ++i) {{
+          int pidx = mesh_polymap[pmapadr + i];
+          int pn_adr = (pair_polyadr[p] + pidx) * 3;
+          float ndot = mesh_polynormal[pn_adr + 0] * nn.x + mesh_polynormal[pn_adr + 1] * nn.y + mesh_polynormal[pn_adr + 2] * nn.z;
+          if (ndot < best_dot) {{ best_dot = ndot; best_poly = pidx; }}
+        }}
+
+        if (best_poly >= 0) {{
+          int fvadr = mesh_polyvertadr[pair_polyadr[p] + best_poly];
+          int fvnum = mesh_polyvertnum[pair_polyadr[p] + best_poly];
+          int a = 0;
+
+          for (int i = 0; i < fvnum; ++i) {{
+            if (mesh_polyvert[fvadr + i] == lv) {{ a = i; break; }}
+          }}
+
+          int ia = a, ib = (a + 1) % fvnum, ic = (a + 2) % fvnum, idd = (a + 3) % fvnum;
+          int nf = fvnum <= 4 ? fvnum : 4;
+
+          if (fvnum > 4) {{
+            float m = g_area4(G_MESH_VERT(vadr, mesh_polyvert[fvadr + ia]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ib]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ic]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + idd]));
+            while (true) {{
+              int dn = (idd + 1) % fvnum;
+              float mn = g_area4(G_MESH_VERT(vadr, mesh_polyvert[fvadr + ia]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ib]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ic]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + dn]));
+              if (mn <= m) break;
+              idd = dn; m = mn;
+              while (true) {{
+                int cn = (ic + 1) % fvnum;
+                mn = g_area4(G_MESH_VERT(vadr, mesh_polyvert[fvadr + ia]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ib]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + cn]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + idd]));
+                if (mn <= m) break;
+                ic = cn; m = mn;
+              }}
+              while (true) {{
+                int bn = (ib + 1) % fvnum;
+                mn = g_area4(G_MESH_VERT(vadr, mesh_polyvert[fvadr + ia]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + bn]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + ic]), G_MESH_VERT(vadr, mesh_polyvert[fvadr + idd]));
+                if (mn <= m) break;
+                ib = bn; m = mn;
+              }}
+            }}
+          }}
+
+          for (int i = 1; i < nf && nc < 4; ++i) {{
+            int fj = (i == 1) ? ib : ((i == 2) ? ic : idd);
+            float3 wp = xa2 + g_mv(mr, G_MESH_VERT(vadr, mesh_polyvert[fvadr + fj]));
+            float vdist = g_dot3(pnrm, wp - xa1);
+            if (vdist > margin_c) continue;
+            if (g_dot3(pnrm, wp - xa2) > 0.0f) continue;
+            g_make_frame(pnrm, frms[nc]);
+            ds[nc] = vdist;
+            psd[nc] = wp - 0.5f * vdist * pnrm;
+            nc += 1;
+          }}
+        }}
       }}
-      npts = slot;
+
+      npts = nc;
     }}
+{sdf_branch}
 
     float fric[5];
     for (int k = 0; k < 5; ++k) fric[k] = pair_friction[p * 5 + k];
@@ -1227,11 +1460,13 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   ncon_out[w] = conct;
   overflow_out[w] = ovr;
 """
+  for name, off in sorted((adr_s or {}).items(), key=lambda x: -len(x[0])):
+    body = body.replace(f"{name}[", f"mbs[{off} + ")
   for name, off in sorted(adr_f.items(), key=lambda x: -len(x[0])):
-    body = body.replace(f"{name}[", f"mbf[{off} + ")
+    body = body.replace(f"{name}[", f"mbf[w * {MBS} + {off} + ")
   for name, off in sorted(adr_i.items(), key=lambda x: -len(x[0])):
     body = body.replace(f"{name}[", f"mif[{off} + ")
-  return body, _MSL_HELPERS
+  return body, _MSL_HELPERS + _MSL_SDF
 
 
 # --------------------------------------------------------------------- K2 solve+integrate

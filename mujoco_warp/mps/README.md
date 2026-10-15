@@ -8,7 +8,7 @@ Fused Metal kernels:
 2. **K2 (`solve`)**: In-thread or cooperative Cholesky factorization, mask-Newton solver with linesearch, and Euler integration.
 3. **Cooperative solve (`coop`)**: For small-to-medium batches ($\le 2048$ worlds), one threadgroup (32 threads) cooperates per world using on-chip threadgroup memory (SRAM), reducing per-step latency ~4-5x. For larger batches ($> 2048$ worlds), the one-thread-per-world kernel maximizes parallel GPU throughput.
 
-Supported scope: free, slide, and hinge joints; primitive collision geoms (plane, sphere, capsule); pyramidal contacts; Euler integrator; joint motor and position actuators.
+Supported scope: free, slide, and hinge joints; collision geoms (primitives, plane-convex meshes, and plugin SDFs incl. metric threaded nut/bolt); pyramidal contacts; Euler integrator; joint motor and position actuators.
 
 ---
 

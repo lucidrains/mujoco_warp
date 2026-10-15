@@ -44,7 +44,7 @@ _TOLERANCE = 5e-5
 
 @wp.kernel
 def plane_convex_test(convex_in: Geom, dist_out: wp.array[wp.vec4]):
-  dist, pos, normal = plane_convex(wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0), convex_in)
+  dist, pos, normal = plane_convex(wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0), convex_in, 0.0)
   dist_out[0] = dist
 
 

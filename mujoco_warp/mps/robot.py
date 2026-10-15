@@ -25,10 +25,10 @@ from .rig import Rig
 
 F = mx.float32
 
-_DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF")
+_DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF", "MBS", "SDFPTS", "SDFIT")
 _SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "ITER", "LSITER", "WARMSTART", "EULERDAMP", "TG")
 
-_DYN_INPUTS = ["qpos_in", "qvel_in", "ctrl_in", "nworld_buf", "mbf", "mif"]
+_DYN_INPUTS = ["qpos_in", "qvel_in", "ctrl_in", "nworld_buf", "mbf", "mif", "mbs"]
 _SOLVE_TAIL = ["nworld_buf", "dof_damping", "mif", "opt_buf"]
 _SOLVE_INPUTS = [
   "qpos_in",
@@ -111,7 +111,12 @@ _FLOAT_TABLES = [
   "dof_armature",
   "dof_damping",
   "opt_buf",
+]
+# large static float tables, shared across worlds (packed into `mbs`)
+_FLOAT_TABLES_STATIC = [
   "mesh_vert",
+  "mesh_polynormal",
+  "geom_sdf_attr",
 ]
 _INT_TABLES = [
   "body_parentid",
@@ -127,6 +132,8 @@ _INT_TABLES = [
   "dof_bodyid",
   "dof_pad",
   "geom_bodyid_i",
+  "geom_type_i",
+  "geom_sdf_kind",
   "act_trnid",
   "act_ctrllimited",
   "act_forcelimited",
@@ -141,10 +148,18 @@ _INT_TABLES = [
   "dof_anc",
   "flag_buf",
   "mesh_graph",
+  "mesh_polymapadr",
+  "mesh_polymapnum",
+  "mesh_polymap",
+  "mesh_polyadr",
+  "mesh_polyvertadr",
+  "mesh_polyvertnum",
+  "mesh_polyvert",
   "pair_vadr",
   "pair_gadr",
   "pair_vertnum",
   "pair_usegraph",
+  "pair_polyadr",
 ]
 
 
@@ -291,6 +306,8 @@ class BatchedEngine:
       NFR=len(fr_dofs),
       NLIM=rig.nlim,
       BF=rig.broadphase_filter,
+      SDFPTS=rig.sdf_initpoints,
+      SDFIT=rig.sdf_iterations,
     )
     self._t_solve = dict(
       NJNT=rig.njnt,
@@ -346,7 +363,11 @@ class BatchedEngine:
       "dof_armature": rig.dof_armature,
       "dof_damping": rig.dof_damping,
       "opt_buf": np.array([rig.timestep], np.float32),
+    }
+    self._f_sources_static = {
       "mesh_vert": rig.mesh_vert,
+      "mesh_polynormal": rig.mesh_polynormal,
+      "geom_sdf_attr": rig.geom_sdf_attr,
     }
     self._i_sources = {
       "body_parentid": rig.body_parentid,
@@ -362,6 +383,8 @@ class BatchedEngine:
       "dof_bodyid": rig.dof_bodyid,
       "dof_pad": self.dof_pad,
       "geom_bodyid_i": rig.geom_bodyid,
+      "geom_type_i": rig.geom_type,
+      "geom_sdf_kind": rig.geom_sdf_kind,
       "act_trnid": rig.actuator_trnid[:, 0],
       "act_ctrllimited": rig.actuator_ctrllimited,
       "act_forcelimited": rig.actuator_forcelimited,
@@ -376,19 +399,42 @@ class BatchedEngine:
       "dof_anc": rig.body_isdofancestor,
       "flag_buf": np.array([rig.broadphase_filter], np.int32),
       "mesh_graph": rig.mesh_graph,
+      "mesh_polymapadr": rig.mesh_polymapadr,
+      "mesh_polymapnum": rig.mesh_polymapnum,
+      "mesh_polymap": rig.mesh_polymap,
+      "mesh_polyadr": rig.mesh_polyadr,
+      "mesh_polyvertadr": rig.mesh_polyvertadr,
+      "mesh_polyvertnum": rig.mesh_polyvertnum,
+      "mesh_polyvert": rig.mesh_polyvert,
       "pair_vadr": rig.pair_vadr,
+      "pair_polyadr": rig.pair_polyadr,
       "pair_gadr": rig.pair_gadr,
       "pair_vertnum": rig.pair_vertnum,
       "pair_usegraph": rig.pair_usegraph,
     }
     mbf_np, self.adr_f = _pack_tables(self._f_sources, _FLOAT_TABLES, np.float32)
     mif_np, self.adr_i = _pack_tables(self._i_sources, _INT_TABLES, np.int32)
-    self.mbf = mx_f32_arr(mbf_np)
+    mbs_np, self.adr_s = _pack_tables(self._f_sources_static, _FLOAT_TABLES_STATIC, np.float32)
+    self.mbf_base = mbf_np
+
+    # per-world float tables - the fused dyn kernel reads `mbf[w * MBS + adr]`,
+    # so any table (gravity, geom_quat/pos, body_mass, gains, pair friction)
+    # can be set per world via `set_world_tables`
+
+    self._t_dyn["MBS"] = int(mbf_np.size)
+    self._mbf_np = np.broadcast_to(mbf_np[None], (nworld, mbf_np.size)).copy()
+    self._mbf_dirty = False
+    self.mbf = mx_f32_arr(self._mbf_np)
     self.mif = mx_int_arr(mif_np)
+
+    # large static tables stay shared across worlds (`mbs`, not replicated per
+    # world in `mbf`)
+
+    self.mbs = mx_f32_arr(mbs_np)
     self.dof_damping_mx = mx_f32_arr(rig.dof_damping)
     self._solve_opt = mx_f32_arr(np.array([rig.timestep, rig.tolerance, rig.meaninertia, rig.ls_tolerance]))
 
-    src, hdr = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=False)
+    src, hdr = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=False, adr_s=self.adr_s)
     self.dyn_fn = mx.fast.metal_kernel(
       name="mps_dyn",
       input_names=_DYN_INPUTS,
@@ -396,7 +442,7 @@ class BatchedEngine:
       source=src,
       header=hdr,
     )
-    src_ik, hdr_ik = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=True)
+    src_ik, hdr_ik = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=True, adr_s=self.adr_s)
     self.dyn_kin_fn = mx.fast.metal_kernel(
       name="mps_dyn_kin",
       input_names=_DYN_INPUTS,
@@ -450,6 +496,27 @@ class BatchedEngine:
     """NumPy or MLX in: (nworld, nu)."""
     self.ctrl = mx_f32_arr(ctrl)
 
+  def set_world_tables(self, rows, **fields):
+    """Set per-world slices of the packed float model tables.
+
+    `rows` is an int or index array of worlds; each field maps a packed table
+    name (e.g. `gravity`, `geom_quat`, `geom_pos`, `body_mass`) to values of
+    that table's trailing shape, laid out one row per world. The next `step`
+    uploads the tables once (see `flush_world_tables`).
+    """
+    idx = np.asarray(rows).reshape(-1)
+    for name, values in fields.items():
+      off = self.adr_f[name]
+      flat = np.asarray(values, np.float32).reshape(len(idx), -1)
+      self._mbf_np[idx, off : off + flat.shape[1]] = flat
+    self._mbf_dirty = True
+
+  def flush_world_tables(self):
+    """Upload the per-world tables after `set_world_tables` (no-op when clean)."""
+    if self._mbf_dirty:
+      self.mbf = mx_f32_arr(self._mbf_np)
+      self._mbf_dirty = False
+
   def reset_worlds(self, mask, qpos=None, qvel=None, ctrl=None):
     """Selectively resets masked worlds on GPU without host synchronization.
 
@@ -485,7 +552,7 @@ class BatchedEngine:
     nw = self.nworld
     fn = self.dyn_kin_fn if kin else self.dyn_fn
     dyn_out = fn(
-      inputs=[self.qpos, self.qvel, self.ctrl, self._nw_buf, self.mbf, self.mif],
+      inputs=[self.qpos, self.qvel, self.ctrl, self._nw_buf, self.mbf, self.mif, self.mbs],
       template=self._dyn_template,
       grid=(nw, 1, 1),
       threadgroup=(32, 1, 1),
@@ -542,6 +609,7 @@ class BatchedEngine:
     """One simulation step; `kin=True` records validation intermediates."""
     if ctrl is not None:
       self.set_ctrl(ctrl)
+    self.flush_world_tables()
     nw = self.nworld
     self._dyn_dispatch(kin)
     out = self.solve_fn(
