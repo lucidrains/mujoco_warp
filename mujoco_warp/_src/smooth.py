@@ -3439,6 +3439,28 @@ def _transmission_body_moment_scale(
     actuator_moment_out[worldid, rowadr + dofid] /= -float(ncon)
 
 
+_TRANSMISSION_CACHE: dict[int, tuple] = {}
+
+
+def _scalar_joint_transmission(m: Model) -> bool:
+  """Whether every actuator is a joint transmission driving a scalar (slide/hinge) joint."""
+  key = id(m)
+  cached = _TRANSMISSION_CACHE.get(key)
+  if cached is None or cached[0] is not m:
+    ok = True
+    if m.nactuator:
+      trntype = m.actuator_trntype.numpy()
+      trnid = m.actuator_trnid.numpy()
+      jnt_type = m.jnt_type.numpy()
+      ok = bool(
+        ((trntype == TrnType.JOINT) | (trntype == TrnType.JOINTINPARENT)).all()
+        and all(jnt_type[int(trnid[uid][0])] in (JointType.SLIDE, JointType.HINGE) for uid in range(m.nactuator))
+      )
+    cached = (m, ok)
+    _TRANSMISSION_CACHE[key] = cached
+  return cached[1]
+
+
 @event_scope
 def transmission(m: Model, d: Data):
   """Computes actuator/transmission lengths and moments.
@@ -3448,6 +3470,46 @@ def transmission(m: Model, d: Data):
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
   moment_nnz = wp.zeros((d.nworld,), dtype=int)
+
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("transmission_dense")
+    and m.nacttrnbody == 0
+    and _scalar_joint_transmission(m)
+    and d.actuator_moment.shape[1] == m.nactuator
+    and d.moment_colind.shape[1] == m.nactuator
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        m.actuator_gear,
+        d.qpos,
+        d.actuator_length,
+        d.actuator_moment,
+        d.moment_rownnz,
+        d.moment_rowadr,
+        d.moment_colind,
+      )
+    )
+  ):
+    nim_ops.transmission_dense(
+      d.nworld,
+      m.nactuator,
+      nim_cpu.layout(m.actuator_gear)[0],
+      nim_cpu.layout(m.actuator_gear)[1],
+      nim_cpu.layout(d.qpos)[1],
+      nim_cpu.ptr(m.actuator_trnid),
+      nim_cpu.ptr(m.jnt_dofadr),
+      nim_cpu.ptr(m.jnt_qposadr),
+      nim_cpu.ptr(m.actuator_gear),
+      nim_cpu.ptr(d.qpos),
+      nim_cpu.ptr(d.actuator_length),
+      nim_cpu.ptr(d.actuator_moment),
+      nim_cpu.ptr(d.moment_rownnz),
+      nim_cpu.ptr(d.moment_rowadr),
+      nim_cpu.ptr(d.moment_colind),
+    )
+    return
 
   wp.launch(
     _transmission,

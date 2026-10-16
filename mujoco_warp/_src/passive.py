@@ -1800,24 +1800,76 @@ def passive(m: Model, d: Data):
     d.qfrc_passive.zero_()
     return
 
-  wp.launch(
-    _spring_damper_dof_passive,
-    dim=(d.nworld, m.njnt),
-    inputs=[
-      m.opt.disableflags,
-      m.qpos_spring,
-      m.jnt_type,
-      m.jnt_qposadr,
-      m.jnt_dofadr,
-      m.jnt_stiffness,
-      m.jnt_stiffnesspoly,
-      m.dof_damping,
-      m.dof_dampingpoly,
-      d.qpos,
-      d.qvel,
-    ],
-    outputs=[d.qfrc_spring, d.qfrc_damper],
-  )
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("spring_damper_dense")
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        m.qpos_spring,
+        m.jnt_stiffness,
+        m.jnt_stiffnesspoly,
+        m.dof_damping,
+        m.dof_dampingpoly,
+        d.qpos,
+        d.qvel,
+        d.qfrc_spring,
+        d.qfrc_damper,
+      )
+    )
+  ):
+    nim_ops.spring_damper_dense(
+      d.nworld,
+      m.njnt,
+      int(m.opt.disableflags & DisableBit.SPRING),
+      int(m.opt.disableflags & DisableBit.DAMPER),
+      nim_cpu.layout(m.jnt_stiffness)[0],
+      nim_cpu.layout(m.jnt_stiffness)[1],
+      nim_cpu.layout(m.jnt_stiffnesspoly)[0],
+      nim_cpu.layout(m.jnt_stiffnesspoly)[1],
+      nim_cpu.layout(m.dof_damping)[0],
+      nim_cpu.layout(m.dof_damping)[1],
+      nim_cpu.layout(m.dof_dampingpoly)[0],
+      nim_cpu.layout(m.dof_dampingpoly)[1],
+      nim_cpu.layout(m.qpos_spring)[0],
+      nim_cpu.layout(m.qpos_spring)[1],
+      nim_cpu.layout(d.qpos)[1],
+      nim_cpu.layout(d.qvel)[1],
+      nim_cpu.layout(d.qfrc_spring)[1],
+      nim_cpu.layout(d.qfrc_damper)[1],
+      nim_cpu.ptr(m.jnt_type),
+      nim_cpu.ptr(m.jnt_qposadr),
+      nim_cpu.ptr(m.jnt_dofadr),
+      nim_cpu.ptr(m.jnt_stiffness),
+      nim_cpu.ptr(m.jnt_stiffnesspoly),
+      nim_cpu.ptr(m.dof_damping),
+      nim_cpu.ptr(m.dof_dampingpoly),
+      nim_cpu.ptr(m.qpos_spring),
+      nim_cpu.ptr(d.qpos),
+      nim_cpu.ptr(d.qvel),
+      nim_cpu.ptr(d.qfrc_spring),
+      nim_cpu.ptr(d.qfrc_damper),
+    )
+  else:
+    wp.launch(
+      _spring_damper_dof_passive,
+      dim=(d.nworld, m.njnt),
+      inputs=[
+        m.opt.disableflags,
+        m.qpos_spring,
+        m.jnt_type,
+        m.jnt_qposadr,
+        m.jnt_dofadr,
+        m.jnt_stiffness,
+        m.jnt_stiffnesspoly,
+        m.dof_damping,
+        m.dof_dampingpoly,
+        d.qpos,
+        d.qvel,
+      ],
+      outputs=[d.qfrc_spring, d.qfrc_damper],
+    )
 
   if m.ntendon:
     wp.launch(
@@ -2120,22 +2172,59 @@ def passive(m: Model, d: Data):
       ],
     )
 
-  wp.launch(
-    _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled),
-    dim=(d.nworld, m.nv),
-    inputs=[
-      m.jnt_actgravcomp,
-      m.dof_jntid,
-      d.qfrc_spring,
-      d.qfrc_damper,
-      d.qfrc_gravcomp,
-      d.qfrc_fluid,
-      d.qfrc_adhesion,
-    ],
-    outputs=[
-      d.qfrc_passive,
-    ],
-  )
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("qfrc_passive_dense")
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        d.qfrc_spring,
+        d.qfrc_damper,
+        d.qfrc_gravcomp,
+        d.qfrc_fluid,
+        d.qfrc_adhesion,
+        d.qfrc_passive,
+      )
+    )
+  ):
+    nim_ops.qfrc_passive_dense(
+      d.nworld,
+      m.nv,
+      1 if gravity_enabled else 0,
+      int(m.has_fluid),
+      int(m.flg_adhesion),
+      nim_cpu.layout(d.qfrc_spring)[1],
+      nim_cpu.layout(d.qfrc_damper)[1],
+      nim_cpu.layout(d.qfrc_gravcomp)[1],
+      nim_cpu.layout(d.qfrc_fluid)[1],
+      nim_cpu.layout(d.qfrc_adhesion)[1],
+      nim_cpu.layout(d.qfrc_passive)[1],
+      nim_cpu.ptr(m.jnt_actgravcomp),
+      nim_cpu.ptr(m.dof_jntid),
+      nim_cpu.ptr(d.qfrc_spring),
+      nim_cpu.ptr(d.qfrc_damper),
+      nim_cpu.ptr(d.qfrc_gravcomp),
+      nim_cpu.ptr(d.qfrc_fluid),
+      nim_cpu.ptr(d.qfrc_adhesion),
+      nim_cpu.ptr(d.qfrc_passive),
+    )
+  else:
+    wp.launch(
+      _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled),
+      dim=(d.nworld, m.nv),
+      inputs=[
+        m.jnt_actgravcomp,
+        m.dof_jntid,
+        d.qfrc_spring,
+        d.qfrc_damper,
+        d.qfrc_gravcomp,
+        d.qfrc_fluid,
+        d.qfrc_adhesion,
+      ],
+      outputs=[
+        d.qfrc_passive,
+      ],
+    )
 
   if m.callback.passive:
     m.callback.passive(m, d)

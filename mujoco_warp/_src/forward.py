@@ -23,6 +23,7 @@ from mujoco_warp._src import derivative
 from mujoco_warp._src import history
 from mujoco_warp._src import island
 from mujoco_warp._src import math
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src import passive
 from mujoco_warp._src import sensor
 from mujoco_warp._src import sleep
@@ -77,6 +78,23 @@ def check_discrete(m: Model):
       raise ValueError("Discrete integrator: sleep without islands not yet supported")
     if m.nefmK > 0 or m.has_flex_passive or not m.flex_interp_assemblable:
       raise ValueError("Discrete integrator: sleep with flex not yet supported")
+
+
+_ACTUATION_CACHE: dict[int, tuple] = {}
+
+
+def _integrated_actuators(m: Model) -> bool:
+  """Whether any actuator integrates its activation (dyntype != none).
+
+  `_next_activation` is a no-op when every dyntype is none, so skip the launch.
+  """
+  key = id(m)
+  cached = _ACTUATION_CACHE.get(key)
+  if cached is None or cached[0] is not m:
+    dytypes = m.actuator_dyntype.numpy() if m.nactuator else []
+    cached = (m, bool(len(dytypes) and (dytypes != 0).any()))
+    _ACTUATION_CACHE[key] = cached
+  return cached[1]
 
 
 @wp.kernel
@@ -323,44 +341,70 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # TODO(team): can we assume static timesteps?
 
   # advance activations
-  wp.launch(
-    _next_activation,
-    dim=(d.nworld, m.nactuator),
-    inputs=[
-      m.opt.timestep,
-      m.actuator_dyntype,
-      m.actuator_actadr,
-      m.actuator_actnum,
-      m.actuator_dynprm,
-      m.actuator_gainprm,
-      m.actuator_biasprm,
-      m.actuator_actlimited,
-      m.actuator_actrange,
-      d.act,
-      d.act_dot,
-      d.actuator_velocity,
-      1.0,
-      True,
-    ],
-    outputs=[d.act],
-  )
-
-  wp.launch(
-    _next_velocity,
-    dim=(d.nworld, m.nv),
-    inputs=[m.opt.timestep, d.qvel, qacc, 1.0],
-    outputs=[d.qvel],
-  )
+  if _integrated_actuators(m):
+    wp.launch(
+      _next_activation,
+      dim=(d.nworld, m.nactuator),
+      inputs=[
+        m.opt.timestep,
+        m.actuator_dyntype,
+        m.actuator_actadr,
+        m.actuator_actnum,
+        m.actuator_dynprm,
+        m.actuator_gainprm,
+        m.actuator_biasprm,
+        m.actuator_actlimited,
+        m.actuator_actrange,
+        d.act,
+        d.act_dot,
+        d.actuator_velocity,
+        1.0,
+        True,
+      ],
+      outputs=[d.act],
+    )
 
   # advance positions with qvel if given, d.qvel otherwise (semi-implicit)
   qvel_in = qvel or d.qvel
 
-  wp.launch(
-    _next_position,
-    dim=(d.nworld, m.njnt),
-    inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, qvel_in, 1.0],
-    outputs=[d.qpos],
-  )
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("advance_dense")
+    and all(nim_cpu.is_contiguous(a) for a in (m.opt.timestep, d.qpos, d.qvel, qvel_in, qacc))
+  ):
+    nim_ops.advance_dense(
+      d.nworld,
+      m.njnt,
+      m.nv,
+      int(m.opt.timestep.shape[0]),
+      nim_cpu.layout(d.qpos)[1],
+      nim_cpu.layout(d.qvel)[1],
+      nim_cpu.layout(qacc)[1],
+      nim_cpu.layout(qvel_in)[1],
+      nim_cpu.ptr(m.opt.timestep),
+      nim_cpu.ptr(m.jnt_type),
+      nim_cpu.ptr(m.jnt_qposadr),
+      nim_cpu.ptr(m.jnt_dofadr),
+      nim_cpu.ptr(d.qpos),
+      nim_cpu.ptr(d.qvel),
+      nim_cpu.ptr(qvel_in),
+      nim_cpu.ptr(qacc),
+    )
+  else:
+    wp.launch(
+      _next_velocity,
+      dim=(d.nworld, m.nv),
+      inputs=[m.opt.timestep, d.qvel, qacc, 1.0],
+      outputs=[d.qvel],
+    )
+
+    wp.launch(
+      _next_position,
+      dim=(d.nworld, m.njnt),
+      inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, qvel_in, 1.0],
+      outputs=[d.qpos],
+    )
 
   # advance history buffers before time advance
   history.insert_ctrl_history(m, d)
@@ -1416,13 +1460,37 @@ def _tendon_velocity(
 @event_scope
 def fwd_velocity(m: Model, d: Data):
   """Velocity-dependent computations."""
-  wp.launch(
-    _actuator_velocity,
-    dim=(d.nworld, m.nactuator),
-    inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
-    outputs=[d.actuator_velocity],
-    block_dim=m.block_dim.actuator_velocity,
-  )
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("actuator_velocity_dense")
+    and m.nactuator
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment, d.actuator_velocity)
+    )
+  ):
+    nim_ops.actuator_velocity_dense(
+      d.nworld,
+      m.nactuator,
+      m.nv,
+      nim_cpu.layout(d.qvel)[1],
+      nim_cpu.layout(d.actuator_velocity)[1],
+      nim_cpu.ptr(d.moment_rownnz),
+      nim_cpu.ptr(d.moment_rowadr),
+      nim_cpu.ptr(d.moment_colind),
+      nim_cpu.ptr(d.actuator_moment),
+      nim_cpu.ptr(d.qvel),
+      nim_cpu.ptr(d.actuator_velocity),
+    )
+  else:
+    wp.launch(
+      _actuator_velocity,
+      dim=(d.nworld, m.nactuator),
+      inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
+      outputs=[d.actuator_velocity],
+      block_dim=m.block_dim.actuator_velocity,
+    )
 
   wp.launch(
     _tendon_velocity,
@@ -1859,6 +1927,33 @@ def _qfrc_actuator_gravcomp_limits(
   qfrc_actuator_out[worldid, dofid] = qfrc
 
 
+_FIXED_ACTUATION_CACHE: dict[int, tuple] = {}
+
+
+def _fixed_actuation(m: Model) -> bool:
+  """Whether every actuator uses a fixed gain, no bias, and no activation dynamics.
+
+  The Nim actuation fast path implements exactly this subset (together with the
+  scalar joint transmissions checked by `smooth._scalar_joint_transmission`).
+  """
+  key = id(m)
+  cached = _FIXED_ACTUATION_CACHE.get(key)
+  if cached is None or cached[0] is not m:
+    ok = bool(
+      m.nactuator
+      and m.na == 0
+      and m.nhistory == 0
+      and (m.actuator_gaintype.numpy() == 0).all()
+      and (m.actuator_biastype.numpy() == 0).all()
+      and (m.actuator_dyntype.numpy() == 0).all()
+      and (m.actuator_actadr.numpy() < 0).all()
+      and not (m.callback.act_dyn or m.callback.act_gain or m.callback.act_bias)
+    )
+    cached = (m, ok)
+    _FIXED_ACTUATION_CACHE[key] = cached
+  return cached[1]
+
+
 @event_scope
 def fwd_actuation(m: Model, d: Data):
   """Actuation-dependent computations."""
@@ -1874,49 +1969,78 @@ def fwd_actuation(m: Model, d: Data):
     else:
       ctrl = d.ctrl
 
-    wp.launch(
-      _actuator_force,
-      dim=(d.nworld, m.nactuator),
-      inputs=[
-        m.na,
-        m.opt.timestep,
-        m.actuator_dyntype,
-        m.actuator_gaintype,
-        m.actuator_biastype,
-        m.actuator_ctrladr,
-        m.actuator_ctrlnum,
-        m.actuator_ctrlspec,
-        m.actuator_actadr,
-        m.actuator_actnum,
-        m.actuator_dynprm,
-        m.actuator_gainprm,
-        m.actuator_biasprm,
-        m.actuator_actlimited,
-        m.actuator_actrange,
-        m.actuator_actearly,
-        m.actuator_forcelimited,
-        m.actuator_forcerange,
-        m.actuator_ctrllimited,
-        m.actuator_ctrlrange,
-        m.actuator_acc0,
-        m.actuator_lengthrange,
-        d.act,
-        ctrl,
-        d.actuator_length,
-        d.actuator_velocity,
-        m.opt.disableflags & DisableBit.CLAMPCTRL,
-      ],
-      outputs=[d.act_dot, d.actuator_force],
+    nim_ops = nim_cpu.get_ops()
+    gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
+    use_nim = bool(
+      nim_ops is not None
+      and nim_cpu.enabled("actuator_force_dense")
+      and _fixed_actuation(m)
+      and d.actuator_moment.shape[1] == m.nactuator
+      and d.moment_colind.shape[1] == m.nactuator
+      and all(
+        nim_cpu.is_contiguous(a)
+        for a in (
+          ctrl,
+          m.actuator_ctrlrange,
+          m.actuator_gainprm,
+          m.actuator_forcerange,
+          d.actuator_moment,
+          d.moment_rownnz,
+          d.moment_rowadr,
+          d.moment_colind,
+          d.actuator_force,
+          d.qfrc_actuator,
+          d.qfrc_gravcomp,
+          m.jnt_actfrcrange,
+          d.qvel,
+        )
+      )
     )
 
-    if m.callback.act_dyn:
-      m.callback.act_dyn(m, d)
-    if m.callback.act_gain:
-      m.callback.act_gain(m, d)
-    if m.callback.act_bias:
-      m.callback.act_bias(m, d)
+    if not use_nim:
+      wp.launch(
+          _actuator_force,
+        dim=(d.nworld, m.nactuator),
+        inputs=[
+          m.na,
+          m.opt.timestep,
+          m.actuator_dyntype,
+          m.actuator_gaintype,
+          m.actuator_biastype,
+          m.actuator_ctrladr,
+          m.actuator_ctrlnum,
+          m.actuator_ctrlspec,
+          m.actuator_actadr,
+          m.actuator_actnum,
+          m.actuator_dynprm,
+          m.actuator_gainprm,
+          m.actuator_biasprm,
+          m.actuator_actlimited,
+          m.actuator_actrange,
+          m.actuator_actearly,
+          m.actuator_forcelimited,
+          m.actuator_forcerange,
+          m.actuator_ctrllimited,
+          m.actuator_ctrlrange,
+          m.actuator_acc0,
+          m.actuator_lengthrange,
+          d.act,
+          ctrl,
+          d.actuator_length,
+          d.actuator_velocity,
+          m.opt.disableflags & DisableBit.CLAMPCTRL,
+        ],
+        outputs=[d.act_dot, d.actuator_force],
+      )
 
-    if m.ntendon:
+      if m.callback.act_dyn:
+        m.callback.act_dyn(m, d)
+      if m.callback.act_gain:
+        m.callback.act_gain(m, d)
+      if m.callback.act_bias:
+        m.callback.act_bias(m, d)
+
+    if m.ntendon and not use_nim:
       # total actuator force at tendon
       ten_actfrc = wp.zeros((d.nworld, m.ntendon), dtype=float)
       wp.launch(
@@ -1935,33 +2059,75 @@ def fwd_actuation(m: Model, d: Data):
 
     # TODO(team): optimize performance
     d.qfrc_actuator.zero_()
-    wp.launch(
-      _qfrc_actuator,
-      dim=(d.nworld, m.nactuator),
-      inputs=[
-        d.moment_rownnz,
-        d.moment_rowadr,
-        d.moment_colind,
-        d.actuator_moment,
-        d.actuator_force,
-      ],
-      outputs=[d.qfrc_actuator],
-    )
-    gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-    wp.launch(
-      _qfrc_actuator_gravcomp_limits,
-      dim=(d.nworld, m.nv),
-      inputs=[
-        m.jnt_actfrclimited,
-        m.jnt_actgravcomp,
-        m.jnt_actfrcrange,
-        m.dof_jntid,
-        d.qfrc_gravcomp,
-        d.qfrc_actuator,
-        gravity_enabled,
-      ],
-      outputs=[d.qfrc_actuator],
-    )
+    if use_nim:
+      nim_ops.actuator_force_dense(
+        d.nworld,
+        m.nactuator,
+        m.nv,
+        int(m.opt.disableflags & DisableBit.CLAMPCTRL),
+        1 if gravity_enabled else 0,
+        int(ctrl.shape[0]),
+        int(m.actuator_ctrlrange.shape[0]),
+        int(m.actuator_gainprm.shape[0]),
+        nim_cpu.layout(m.actuator_gainprm)[1],
+        int(m.actuator_forcerange.shape[0]),
+        nim_cpu.layout(m.actuator_forcerange)[1],
+        int(m.jnt_actfrcrange.shape[0]),
+        nim_cpu.layout(m.jnt_actfrcrange)[1],
+        nim_cpu.layout(ctrl)[1],
+        int(m.actuator_ctrlrange.shape[1] * 2),
+        nim_cpu.layout(d.actuator_force)[1],
+        nim_cpu.layout(d.qfrc_actuator)[1],
+        nim_cpu.layout(d.qfrc_gravcomp)[1],
+        nim_cpu.layout(d.qvel)[1],
+        nim_cpu.ptr(m.actuator_ctrladr),
+        nim_cpu.ptr(m.actuator_trnid),
+        nim_cpu.ptr(m.actuator_ctrllimited),
+        nim_cpu.ptr(m.actuator_forcelimited),
+        nim_cpu.ptr(m.dof_jntid),
+        nim_cpu.ptr(m.jnt_actgravcomp),
+        nim_cpu.ptr(m.jnt_actfrclimited),
+        nim_cpu.ptr(ctrl),
+        nim_cpu.ptr(m.actuator_ctrlrange),
+        nim_cpu.ptr(m.actuator_gainprm),
+        nim_cpu.ptr(m.actuator_forcerange),
+        nim_cpu.ptr(m.jnt_actfrcrange),
+        nim_cpu.ptr(d.actuator_moment),
+        nim_cpu.ptr(d.actuator_velocity),
+        nim_cpu.ptr(d.actuator_force),
+        nim_cpu.ptr(d.qfrc_actuator),
+        nim_cpu.ptr(d.qfrc_gravcomp),
+        nim_cpu.ptr(d.moment_rownnz),
+        nim_cpu.ptr(d.moment_rowadr),
+        nim_cpu.ptr(d.moment_colind),
+      )
+    else:
+      wp.launch(
+        _qfrc_actuator,
+        dim=(d.nworld, m.nactuator),
+        inputs=[
+          d.moment_rownnz,
+          d.moment_rowadr,
+          d.moment_colind,
+          d.actuator_moment,
+          d.actuator_force,
+        ],
+        outputs=[d.qfrc_actuator],
+      )
+      wp.launch(
+        _qfrc_actuator_gravcomp_limits,
+        dim=(d.nworld, m.nv),
+        inputs=[
+          m.jnt_actfrclimited,
+          m.jnt_actgravcomp,
+          m.jnt_actfrcrange,
+          m.dof_jntid,
+          d.qfrc_gravcomp,
+          d.qfrc_actuator,
+          gravity_enabled,
+        ],
+        outputs=[d.qfrc_actuator],
+      )
   if m.opt.integrator == IntegratorType.DISCRETE:
     derivative.eff_actuation(m, d)
     constraint.regularize_constraint(m, d)

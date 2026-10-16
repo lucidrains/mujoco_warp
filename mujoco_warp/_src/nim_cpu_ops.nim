@@ -1339,10 +1339,10 @@ func axisAngleToQuat(axis: Vec3f, angle: float32): Quatf {.inline.} =
 
 func normQuat(q: Quatf): Quatf {.inline.} =
   let l = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
-  if l <= 1.1920929e-07'f32:
-    return q
-  let inv = 1.0'f32 / l
-  Quatf([q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv])
+  if l > 0.0'f32:
+    let inv = 1.0'f32 / l
+    return Quatf([q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv])
+  Quatf([0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32])
 
 func quatToMat(q: Quatf): array[9, float32] {.inline.} =
   let q00 = q[0] * q[0]
@@ -2562,3 +2562,599 @@ proc smoothComVelDense*(
     cdofDot: toPtr[float32](cdofDot),
   )
   runJob(comVelWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Position/velocity advance (mirror of forward._next_position / _next_velocity)
+# and applied-force mapping (support._apply_ft).
+
+type
+  AdvanceArgs = object
+    nworld, njnt, nv: int
+    timestepWorlds: int
+    qposStride, qvelStride, qaccStride, qvelInStride: int
+    timestep: ptr UncheckedArray[float32]
+    jntType, jntQposadr, jntDofadr: ptr UncheckedArray[int32]
+    qpos, qvel, qvelIn, qacc: ptr UncheckedArray[float32]
+
+func quatIntegrate(q: Quatf, v: Vec3f, dt: float32): Quatf {.inline.} =
+  let vlen = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+  var vn = Vec3f([0.0'f32, 0.0'f32, 0.0'f32])
+  if vlen > 0.0'f32:
+    vn = Vec3f([v[0] / vlen, v[1] / vlen, v[2] / vlen])
+  let angle = dt * vlen
+  let qRes = axisAngleToQuat(vn, angle)
+  normQuat(mulQuat(normQuat(q), qRes))
+
+proc advanceWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr AdvanceArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let dt = a.timestep[w mod a.timestepWorlds]
+      let qpOff = w * a.qposStride
+      let qvOff = w * a.qvelStride
+      let qviOff = w * a.qvelInStride
+      let qaOff = w * a.qaccStride
+
+      # velocity first: Euler integrates positions with the updated qvel
+      for dof in 0 ..< a.nv:
+        a.qvel[qvOff + dof] += a.qacc[qaOff + dof] * dt
+
+      for jnt in 0 ..< a.njnt:
+        let jnttype = a.jntType[jnt]
+        let qadr = int(a.jntQposadr[jnt])
+        let dadr = int(a.jntDofadr[jnt])
+
+        if jnttype == JointTypeFree:
+          let vx = a.qvelIn[qviOff + dadr] * dt
+          let vy = a.qvelIn[qviOff + dadr + 1] * dt
+          let vz = a.qvelIn[qviOff + dadr + 2] * dt
+          a.qpos[qpOff + qadr] += vx
+          a.qpos[qpOff + qadr + 1] += vy
+          a.qpos[qpOff + qadr + 2] += vz
+
+          let q = Quatf([
+            a.qpos[qpOff + qadr + 3], a.qpos[qpOff + qadr + 4],
+            a.qpos[qpOff + qadr + 5], a.qpos[qpOff + qadr + 6],
+          ])
+          let vang = Vec3f([
+            a.qvelIn[qviOff + dadr + 3], a.qvelIn[qviOff + dadr + 4], a.qvelIn[qviOff + dadr + 5],
+          ])
+          let qn = quatIntegrate(q, vang, dt)
+          a.qpos[qpOff + qadr + 3] = qn[0]
+          a.qpos[qpOff + qadr + 4] = qn[1]
+          a.qpos[qpOff + qadr + 5] = qn[2]
+          a.qpos[qpOff + qadr + 6] = qn[3]
+        elif jnttype == JointTypeBall:
+          let q = Quatf([
+            a.qpos[qpOff + qadr], a.qpos[qpOff + qadr + 1],
+            a.qpos[qpOff + qadr + 2], a.qpos[qpOff + qadr + 3],
+          ])
+          let vang = Vec3f([a.qvelIn[qviOff + dadr], a.qvelIn[qviOff + dadr + 1], a.qvelIn[qviOff + dadr + 2]])
+          let qn = quatIntegrate(q, vang, dt)
+          a.qpos[qpOff + qadr] = qn[0]
+          a.qpos[qpOff + qadr + 1] = qn[1]
+          a.qpos[qpOff + qadr + 2] = qn[2]
+          a.qpos[qpOff + qadr + 3] = qn[3]
+        else:
+          a.qpos[qpOff + qadr] += dt * a.qvelIn[qviOff + dadr]
+
+proc advanceDense*(
+  nworld, njnt, nv, timestepWorlds: int,
+  qposStride, qvelStride, qaccStride, qvelInStride: int,
+  timestep: uint64,
+  jntType, jntQposadr, jntDofadr: uint64,
+  qpos, qvel, qvelIn, qacc: uint64,
+): void {.exportpy: "advance_dense".} =
+  var args = AdvanceArgs(
+    nworld: nworld, njnt: njnt, nv: nv, timestepWorlds: timestepWorlds,
+    qposStride: qposStride, qvelStride: qvelStride, qaccStride: qaccStride, qvelInStride: qvelInStride,
+    timestep: toPtr[float32](timestep),
+    jntType: toPtr[int32](jntType), jntQposadr: toPtr[int32](jntQposadr), jntDofadr: toPtr[int32](jntDofadr),
+    qpos: toPtr[float32](qpos), qvel: toPtr[float32](qvel), qvelIn: toPtr[float32](qvelIn),
+    qacc: toPtr[float32](qacc),
+  )
+  runJob(advanceWorker, addr args, nworld)
+
+# Applied forces: map body forces to dof space via the dof's subtree.
+
+type
+  ApplyFtArgs = object
+    nworld, nbody, nv, nvPad: int
+    flgAdd: bool
+    xiposStride, comStride, cdofStride, ftStride, qfrcStride, isdofStride: int
+    xipos, subtreeCom, cdof, ft, qfrc: ptr UncheckedArray[float32]
+    bodyParentid, bodyRootid, dofBodyid, bodyIsdofancestor: ptr UncheckedArray[int32]
+
+proc applyFtWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr ApplyFtArgs](arg)
+  while true:
+    let w = claimTask()
+    if w >= a.nworld:
+      break
+    let ftOff = w * a.ftStride
+    var nz = 0
+    for b in 0 ..< a.nbody:
+      var any = false
+      for c in 0 ..< 6:
+        if a.ft[ftOff + b * 6 + c] != 0.0'f32:
+          any = true
+          break
+      if any:
+        nz += 1
+    if nz == 0:
+      if not a.flgAdd:
+        for dof in 0 ..< a.nv:
+          a.qfrc[w * a.qfrcStride + dof] = 0.0'f32
+      continue
+
+    let cdofOff = w * a.cdofStride
+    let xiOff = w * a.xiposStride
+    let comOff = w * a.comStride
+    let qfOff = w * a.qfrcStride
+    for dof in 0 ..< a.nv:
+      var accumul = 0.0'f32
+      let c0 = a.cdof[cdofOff + dof * 6]
+      let c1 = a.cdof[cdofOff + dof * 6 + 1]
+      let c2 = a.cdof[cdofOff + dof * 6 + 2]
+      let c3 = a.cdof[cdofOff + dof * 6 + 3]
+      let c4 = a.cdof[cdofOff + dof * 6 + 4]
+      let c5 = a.cdof[cdofOff + dof * 6 + 5]
+      let dofbodyid = int(a.dofBodyid[dof])
+      for b in 0 ..< a.nbody:
+        var zero = true
+        for c in 0 ..< 6:
+          if a.ft[ftOff + b * 6 + c] != 0.0'f32:
+            zero = false
+            break
+        if zero:
+          continue
+        # body b is in the subtree of dofbodyid iff dofbodyid is an ancestor-or-self of b
+        var p = b
+        while p != 0 and p != dofbodyid:
+          p = int(a.bodyParentid[p])
+        if p == 0:
+          continue
+        let root = int(a.bodyRootid[b])
+        let ox = a.xipos[xiOff + b * 3] - a.subtreeCom[comOff + root * 3]
+        let oy = a.xipos[xiOff + b * 3 + 1] - a.subtreeCom[comOff + root * 3 + 1]
+        let oz = a.xipos[xiOff + b * 3 + 2] - a.subtreeCom[comOff + root * 3 + 2]
+        # cross(rotational_cdof, offset)
+        let cx = c1 * oz - c2 * oy
+        let cy = c2 * ox - c0 * oz
+        let cz = c0 * oy - c1 * ox
+        # jac = (lin, ang) = (c3..c5, c0..c2)
+        accumul +=
+          c3 * a.ft[ftOff + b * 6] + c4 * a.ft[ftOff + b * 6 + 1] + c5 * a.ft[ftOff + b * 6 + 2] +
+          c0 * a.ft[ftOff + b * 6 + 3] + c1 * a.ft[ftOff + b * 6 + 4] + c2 * a.ft[ftOff + b * 6 + 5] +
+          cx * a.ft[ftOff + b * 6] + cy * a.ft[ftOff + b * 6 + 1] + cz * a.ft[ftOff + b * 6 + 2]
+      if a.flgAdd:
+        a.qfrc[qfOff + dof] += accumul
+      else:
+        a.qfrc[qfOff + dof] = accumul
+
+proc applyFtDense*(
+  nworld, nbody, nv, nvPad: int,
+  flgAdd: int,
+  xiposStride, comStride, cdofStride, ftStride, qfrcStride: int,
+  xipos, subtreeCom, cdof, ft, qfrc: uint64,
+  bodyParentid, bodyRootid, dofBodyid: uint64,
+): void {.exportpy: "apply_ft_dense".} =
+  var args = ApplyFtArgs(
+    nworld: nworld, nbody: nbody, nv: nv, nvPad: nvPad, flgAdd: flgAdd != 0,
+    xiposStride: xiposStride, comStride: comStride, cdofStride: cdofStride,
+    ftStride: ftStride, qfrcStride: qfrcStride,
+    xipos: toPtr[float32](xipos), subtreeCom: toPtr[float32](subtreeCom), cdof: toPtr[float32](cdof),
+    ft: toPtr[float32](ft), qfrc: toPtr[float32](qfrc),
+    bodyParentid: toPtr[int32](bodyParentid), bodyRootid: toPtr[int32](bodyRootid),
+    dofBodyid: toPtr[int32](dofBodyid), bodyIsdofancestor: nil,
+  )
+  runJob(applyFtWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Actuation fast paths (joint transmissions to scalar dofs, fixed gains, no bias
+# or activation dynamics).  Mirrors smooth._transmission, forward._actuator_velocity,
+# forward._actuator_force and forward._qfrc_actuator for that subset; the Python
+# side falls back to the Warp kernels otherwise.
+
+type
+  TransmissionArgs = object
+    nworld, nu: int
+    gearWorlds, gearStride: int
+    qposStride: int
+    trnid, jntDofadr, jntQposadr: ptr UncheckedArray[int32]
+    gear, qpos, actuatorLength, actuatorMoment: ptr UncheckedArray[float32]
+    momentRownnz, momentRowadr, momentColind: ptr UncheckedArray[int32]
+
+proc transmissionWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr TransmissionArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let qpOff = w * a.qposStride
+      let awOff = w * a.nu
+      let gwOff = (w mod a.gearWorlds) * a.gearStride
+      for actid in 0 ..< a.nu:
+        let jntid = int(a.trnid[actid * 2])
+        let vadr = int(a.jntDofadr[jntid])
+        let qadr = int(a.jntQposadr[jntid])
+        let gear0 = a.gear[gwOff + actid * 6]
+        a.actuatorLength[awOff + actid] = a.qpos[qpOff + qadr] * gear0
+        a.momentRownnz[awOff + actid] = 1'i32
+        a.momentRowadr[awOff + actid] = int32(actid)
+        a.momentColind[awOff + actid] = int32(vadr)
+        a.actuatorMoment[awOff + actid] = gear0
+
+proc transmissionDense*(
+  nworld, nu, gearWorlds, gearStride, qposStride: int,
+  trnid, jntDofadr, jntQposadr, gear, qpos: uint64,
+  actuatorLength, actuatorMoment, momentRownnz, momentRowadr, momentColind: uint64,
+): void {.exportpy: "transmission_dense".} =
+  var args = TransmissionArgs(
+    nworld: nworld, nu: nu, gearWorlds: gearWorlds, gearStride: gearStride, qposStride: qposStride,
+    trnid: toPtr[int32](trnid), jntDofadr: toPtr[int32](jntDofadr), jntQposadr: toPtr[int32](jntQposadr),
+    gear: toPtr[float32](gear), qpos: toPtr[float32](qpos),
+    actuatorLength: toPtr[float32](actuatorLength), actuatorMoment: toPtr[float32](actuatorMoment),
+    momentRownnz: toPtr[int32](momentRownnz), momentRowadr: toPtr[int32](momentRowadr),
+    momentColind: toPtr[int32](momentColind),
+  )
+  runJob(transmissionWorker, addr args, nworld)
+
+type
+  ActuatorVelocityArgs = object
+    nworld, nu, nv: int
+    qvelStride, actuatorVelocityStride: int
+    momentRownnz, momentRowadr, momentColind: ptr UncheckedArray[int32]
+    actuatorMoment, qvel, actuatorVelocity: ptr UncheckedArray[float32]
+
+proc actuatorVelocityWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr ActuatorVelocityArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let qvOff = w * a.qvelStride
+      let avOff = w * a.actuatorVelocityStride
+      for actid in 0 ..< a.nu:
+        let rownnz = int(a.momentRownnz[avOff + actid])
+        let rowadr = int(a.momentRowadr[avOff + actid])
+        var vel = 0.0'f32
+        for i in 0 ..< rownnz:
+          let sparseid = rowadr + i
+          let colind = int(a.momentColind[avOff + sparseid])
+          vel += a.actuatorMoment[avOff + sparseid] * a.qvel[qvOff + colind]
+        a.actuatorVelocity[avOff + actid] = vel
+
+proc actuatorVelocityDense*(
+  nworld, nu, nv, qvelStride, actuatorVelocityStride: int,
+  momentRownnz, momentRowadr, momentColind: uint64,
+  actuatorMoment, qvel, actuatorVelocity: uint64,
+): void {.exportpy: "actuator_velocity_dense".} =
+  var args = ActuatorVelocityArgs(
+    nworld: nworld, nu: nu, nv: nv,
+    qvelStride: qvelStride, actuatorVelocityStride: actuatorVelocityStride,
+    momentRownnz: toPtr[int32](momentRownnz), momentRowadr: toPtr[int32](momentRowadr),
+    momentColind: toPtr[int32](momentColind),
+    actuatorMoment: toPtr[float32](actuatorMoment), qvel: toPtr[float32](qvel),
+    actuatorVelocity: toPtr[float32](actuatorVelocity),
+  )
+  runJob(actuatorVelocityWorker, addr args, nworld)
+
+type
+  ActuatorForceArgs = object
+    nworld, nu, nv: int
+    clampCtrl: bool
+    gravityEnabled: bool
+    ctrlWorlds, ctrlRangeWorlds, gainWorlds, gainStride: int
+    forceRangeWorlds, forceRangeStride: int
+    actFrcEnabled: bool
+    actFrcRangeWorlds, actFrcRangeStride: int
+    ctrlStride, ctrlRangeStride, forceStride, qfrcStride, gravcompStride, qvelStride: int
+    ctrladr: ptr UncheckedArray[int32]
+    trnid: ptr UncheckedArray[int32]
+    dofJntid, jntActgravcomp: ptr UncheckedArray[int32]
+    ctrllimited, forcelimited, jntActfrclimited: ptr UncheckedArray[bool]
+    ctrl, ctrlRange, gainprm, forcerange, jntActfrcrange: ptr UncheckedArray[float32]
+    actuatorMoment, actuatorVelocity, actuatorForce, qfrcActuator, qfrcGravcomp: ptr UncheckedArray[float32]
+    momentRownnz, momentRowadr, momentColind: ptr UncheckedArray[int32]
+    qfrcActuatorStride: int
+
+proc actuatorForceWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr ActuatorForceArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let awOff = w * a.nu
+      let qfOff = a.qfrcActuatorStride
+      let crOff = (w mod a.ctrlRangeWorlds) * a.ctrlRangeStride
+      let grOff = (w mod a.gainWorlds) * a.gainStride
+      let frOff = (w mod a.forceRangeWorlds) * a.forceRangeStride
+      # forces first (accumulated into a zeroed qfrc_actuator)
+      for actid in 0 ..< a.nu:
+        let uadr = int(a.ctrladr[actid])
+        var ctrl = a.ctrl[(w mod a.ctrlWorlds) * a.ctrlStride + uadr]
+        if a.ctrllimited[uadr] and not a.clampCtrl:
+          let lo = a.ctrlRange[crOff + uadr * 2]
+          let hi = a.ctrlRange[crOff + uadr * 2 + 1]
+          if ctrl < lo: ctrl = lo
+          elif ctrl > hi: ctrl = hi
+        var force = a.gainprm[grOff + actid * 10] * ctrl
+        if a.forcelimited[actid]:
+          let lo = a.forcerange[frOff + actid * 2]
+          let hi = a.forcerange[frOff + actid * 2 + 1]
+          if force < lo: force = lo
+          elif force > hi: force = hi
+        a.actuatorForce[w * a.forceStride + actid] = force
+
+        let rownnz = int(a.momentRownnz[awOff + actid])
+        let rowadr = int(a.momentRowadr[awOff + actid])
+        for i in 0 ..< rownnz:
+          let sparseid = rowadr + i
+          let colind = int(a.momentColind[awOff + sparseid])
+          a.qfrcActuator[w * qfOff + colind] += a.actuatorMoment[awOff + sparseid] * force
+
+      # gravcomp + joint actuator force limits
+      let arOff = (w mod a.actFrcRangeWorlds) * a.actFrcRangeStride
+      for dof in 0 ..< a.nv:
+        let jntid = int(a.dofJntid[dof])
+        var qfrc = a.qfrcActuator[w * qfOff + dof]
+        if a.gravityEnabled and a.jntActgravcomp[jntid] != 0:
+          qfrc += a.qfrcGravcomp[w * a.gravcompStride + dof]
+        if a.jntActfrclimited[jntid]:
+          let lo = a.jntActfrcrange[arOff + jntid * 2]
+          let hi = a.jntActfrcrange[arOff + jntid * 2 + 1]
+          if qfrc < lo: qfrc = lo
+          elif qfrc > hi: qfrc = hi
+        a.qfrcActuator[w * qfOff + dof] = qfrc
+
+proc actuatorForceDense*(
+  nworld, nu, nv, clampCtrl, gravityEnabled: int,
+  ctrlWorlds, ctrlRangeWorlds, gainWorlds, gainStride, forceRangeWorlds, forceRangeStride: int,
+  actFrcRangeWorlds, actFrcRangeStride: int,
+  ctrlStride, ctrlRangeStride, forceStride, qfrcStride, gravcompStride, qvelStride: int,
+  ctrladr, trnid, ctrllimited, forcelimited, dofJntid, jntActgravcomp, jntActfrclimited: uint64,
+  ctrl, ctrlRange, gainprm, forcerange, jntActfrcrange: uint64,
+  actuatorMoment, actuatorVelocity, actuatorForce, qfrcActuator, qfrcGravcomp: uint64,
+  momentRownnz, momentRowadr, momentColind: uint64,
+): void {.exportpy: "actuator_force_dense".} =
+  var args = ActuatorForceArgs(
+    nworld: nworld, nu: nu, nv: nv, clampCtrl: clampCtrl != 0, gravityEnabled: gravityEnabled != 0,
+    ctrlWorlds: ctrlWorlds, ctrlRangeWorlds: ctrlRangeWorlds, gainWorlds: gainWorlds, gainStride: gainStride,
+    forceRangeWorlds: forceRangeWorlds, forceRangeStride: forceRangeStride,
+    actFrcEnabled: false, actFrcRangeWorlds: actFrcRangeWorlds, actFrcRangeStride: actFrcRangeStride,
+    ctrlStride: ctrlStride, ctrlRangeStride: ctrlRangeStride, forceStride: forceStride,
+    qfrcStride: qfrcStride, gravcompStride: gravcompStride, qvelStride: qvelStride,
+    ctrladr: toPtr[int32](ctrladr), trnid: toPtr[int32](trnid),
+    ctrllimited: toPtr[bool](ctrllimited), forcelimited: toPtr[bool](forcelimited),
+    dofJntid: toPtr[int32](dofJntid), jntActgravcomp: toPtr[int32](jntActgravcomp),
+    jntActfrclimited: toPtr[bool](jntActfrclimited),
+    ctrl: toPtr[float32](ctrl), ctrlRange: toPtr[float32](ctrlRange), gainprm: toPtr[float32](gainprm),
+    forcerange: toPtr[float32](forcerange), jntActfrcrange: toPtr[float32](jntActfrcrange),
+    actuatorMoment: toPtr[float32](actuatorMoment), actuatorVelocity: toPtr[float32](actuatorVelocity),
+    actuatorForce: toPtr[float32](actuatorForce), qfrcActuator: toPtr[float32](qfrcActuator),
+    qfrcGravcomp: toPtr[float32](qfrcGravcomp),
+    momentRownnz: toPtr[int32](momentRownnz), momentRowadr: toPtr[int32](momentRowadr),
+    momentColind: toPtr[int32](momentColind),
+    qfrcActuatorStride: qfrcStride,
+  )
+  runJob(actuatorForceWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Passive spring/damper dof forces and the qfrc_passive reduction
+# (mirror of passive._spring_damper_dof_passive / _qfrc_passive_kernel).
+
+func polyForce(linear: float32, p0, p1, x: float32, flgOdd: bool): float32 {.inline.} =
+  let xv = if flgOdd: abs(x) else: x
+  linear + p0 * xv + p1 * xv * xv
+
+func quatToVel(q: Quatf): Vec3f {.inline.} =
+  let ax = q[1]
+  let ay = q[2]
+  let az = q[3]
+  let sinA2 = sqrt(ax * ax + ay * ay + az * az)
+  if sinA2 == 0.0'f32:
+    return Vec3f([0.0'f32, 0.0'f32, 0.0'f32])
+  var speed = 2.0'f32 * arctan2(sinA2, q[0])
+  if speed > PI:
+    speed -= 2.0'f32 * PI
+  Vec3f([ax * speed / sinA2, ay * speed / sinA2, az * speed / sinA2])
+
+func quatSub(qa, qb: Quatf): Vec3f {.inline.} =
+  let qneg = Quatf([qb[0], -qb[1], -qb[2], -qb[3]])
+  quatToVel(mulQuat(qneg, qa))
+
+type
+  SpringDamperArgs = object
+    nworld, njnt: int
+    dsblSpring, dsblDamper: bool
+    stiffnessWorlds, stiffnessStride, stiffpolyWorlds, stiffpolyStride: int
+    dampingWorlds, dampingStride, dampingpolyWorlds, dampingpolyStride: int
+    qposspringWorlds, qposspringStride, qposStride, qvelStride: int
+    springStride, damperStride: int
+    jntType, jntQposadr, jntDofadr: ptr UncheckedArray[int32]
+    jntStiffness, jntStiffnessPoly, dofDamping, dofDampingPoly, qposSpring: ptr UncheckedArray[float32]
+    qpos, qvel, qfrcSpring, qfrcDamper: ptr UncheckedArray[float32]
+
+proc springDamperWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr SpringDamperArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let qpOff = w * a.qposStride
+      let qvOff = w * a.qvelStride
+      let spOff = w * a.springStride
+      let dmOff = w * a.damperStride
+      let jw = w mod a.stiffnessWorlds
+      let djw = w mod a.dampingWorlds
+      let pw = w mod a.stiffpolyWorlds
+      let pdw = w mod a.dampingpolyWorlds
+      let qsw = w mod a.qposspringWorlds
+
+      for jntid in 0 ..< a.njnt:
+        let dofid = int(a.jntDofadr[jntid])
+        let jnttype = a.jntType[jntid]
+        let stiffness = a.jntStiffness[jw * a.stiffnessStride + jntid]
+        let sp0 = a.jntStiffnessPoly[pw * a.stiffpolyStride + jntid * 2]
+        let sp1 = a.jntStiffnessPoly[pw * a.stiffpolyStride + jntid * 2 + 1]
+        let hasStiffness = (stiffness != 0.0'f32 or sp0 != 0.0'f32 or sp1 != 0.0'f32) and not a.dsblSpring
+
+        var ndof = 1
+        if jnttype == JointTypeFree:
+          ndof = 6
+        elif jnttype == JointTypeBall:
+          ndof = 3
+
+        if a.dsblDamper:
+          for i in 0 ..< ndof:
+            a.qfrcDamper[dmOff + dofid + i] = 0.0'f32
+        else:
+          for i in 0 ..< ndof:
+            let dof = dofid + i
+            let damping = a.dofDamping[djw * a.dampingStride + dof]
+            let dp0 = a.dofDampingPoly[pdw * a.dampingpolyStride + dof * 2]
+            let dp1 = a.dofDampingPoly[pdw * a.dampingpolyStride + dof * 2 + 1]
+            if damping != 0.0'f32 or dp0 != 0.0'f32 or dp1 != 0.0'f32:
+              let v = a.qvel[qvOff + dof]
+              a.qfrcDamper[dmOff + dof] = -v * polyForce(damping, dp0, dp1, v, true)
+            else:
+              a.qfrcDamper[dmOff + dof] = 0.0'f32
+
+        if not hasStiffness:
+          for i in 0 ..< ndof:
+            a.qfrcSpring[spOff + dofid + i] = 0.0'f32
+          continue
+
+        let qadr = int(a.jntQposadr[jntid])
+        let qsOff = qsw * a.qposspringStride
+        if jnttype == JointTypeFree:
+          let d0 = a.qpos[qpOff + qadr] - a.qposSpring[qsOff + qadr]
+          let d1 = a.qpos[qpOff + qadr + 1] - a.qposSpring[qsOff + qadr + 1]
+          let d2 = a.qpos[qpOff + qadr + 2] - a.qposSpring[qsOff + qadr + 2]
+          let r = sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+          let k = polyForce(stiffness, sp0, sp1, r, false)
+          a.qfrcSpring[spOff + dofid] = -k * d0
+          a.qfrcSpring[spOff + dofid + 1] = -k * d1
+          a.qfrcSpring[spOff + dofid + 2] = -k * d2
+
+          let rot = normQuat(Quatf([
+            a.qpos[qpOff + qadr + 3], a.qpos[qpOff + qadr + 4],
+            a.qpos[qpOff + qadr + 5], a.qpos[qpOff + qadr + 6],
+          ]))
+          let qref = Quatf([
+            a.qposSpring[qsOff + qadr + 3], a.qposSpring[qsOff + qadr + 4],
+            a.qposSpring[qsOff + qadr + 5], a.qposSpring[qsOff + qadr + 6],
+          ])
+          let dif = quatSub(rot, qref)
+          let rRot = sqrt(dif[0] * dif[0] + dif[1] * dif[1] + dif[2] * dif[2])
+          let kRot = polyForce(stiffness, sp0, sp1, rRot, false)
+          a.qfrcSpring[spOff + dofid + 3] = -kRot * dif[0]
+          a.qfrcSpring[spOff + dofid + 4] = -kRot * dif[1]
+          a.qfrcSpring[spOff + dofid + 5] = -kRot * dif[2]
+        elif jnttype == JointTypeBall:
+          let rot = normQuat(Quatf([
+            a.qpos[qpOff + qadr], a.qpos[qpOff + qadr + 1],
+            a.qpos[qpOff + qadr + 2], a.qpos[qpOff + qadr + 3],
+          ]))
+          let qref = Quatf([
+            a.qposSpring[qsOff + qadr], a.qposSpring[qsOff + qadr + 1],
+            a.qposSpring[qsOff + qadr + 2], a.qposSpring[qsOff + qadr + 3],
+          ])
+          let dif = quatSub(rot, qref)
+          let r = sqrt(dif[0] * dif[0] + dif[1] * dif[1] + dif[2] * dif[2])
+          let k = polyForce(stiffness, sp0, sp1, r, false)
+          a.qfrcSpring[spOff + dofid] = -k * dif[0]
+          a.qfrcSpring[spOff + dofid + 1] = -k * dif[1]
+          a.qfrcSpring[spOff + dofid + 2] = -k * dif[2]
+        else:
+          let fdif = a.qpos[qpOff + qadr] - a.qposSpring[qsOff + qadr]
+          a.qfrcSpring[spOff + dofid] = -fdif * polyForce(stiffness, sp0, sp1, fdif, false)
+
+proc springDamperDense*(
+  nworld, njnt, dsblSpring, dsblDamper: int,
+  stiffnessWorlds, stiffnessStride, stiffpolyWorlds, stiffpolyStride: int,
+  dampingWorlds, dampingStride, dampingpolyWorlds, dampingpolyStride: int,
+  qposspringWorlds, qposspringStride, qposStride, qvelStride, springStride, damperStride: int,
+  jntType, jntQposadr, jntDofadr: uint64,
+  jntStiffness, jntStiffnessPoly, dofDamping, dofDampingPoly, qposSpring: uint64,
+  qpos, qvel, qfrcSpring, qfrcDamper: uint64,
+): void {.exportpy: "spring_damper_dense".} =
+  var args = SpringDamperArgs(
+    nworld: nworld, njnt: njnt, dsblSpring: dsblSpring != 0, dsblDamper: dsblDamper != 0,
+    stiffnessWorlds: stiffnessWorlds, stiffnessStride: stiffnessStride,
+    stiffpolyWorlds: stiffpolyWorlds, stiffpolyStride: stiffpolyStride,
+    dampingWorlds: dampingWorlds, dampingStride: dampingStride,
+    dampingpolyWorlds: dampingpolyWorlds, dampingpolyStride: dampingpolyStride,
+    qposspringWorlds: qposspringWorlds, qposspringStride: qposspringStride,
+    qposStride: qposStride, qvelStride: qvelStride, springStride: springStride, damperStride: damperStride,
+    jntType: toPtr[int32](jntType), jntQposadr: toPtr[int32](jntQposadr), jntDofadr: toPtr[int32](jntDofadr),
+    jntStiffness: toPtr[float32](jntStiffness), jntStiffnessPoly: toPtr[float32](jntStiffnessPoly),
+    dofDamping: toPtr[float32](dofDamping), dofDampingPoly: toPtr[float32](dofDampingPoly),
+    qposSpring: toPtr[float32](qposSpring),
+    qpos: toPtr[float32](qpos), qvel: toPtr[float32](qvel),
+    qfrcSpring: toPtr[float32](qfrcSpring), qfrcDamper: toPtr[float32](qfrcDamper),
+  )
+  runJob(springDamperWorker, addr args, nworld)
+
+type
+  QfrcPassiveArgs = object
+    nworld, nv: int
+    gravityEnabled, hasFluid, flgAdhesion: bool
+    springStride, damperStride, gravcompStride, fluidStride, adhesionStride, passiveStride: int
+    jntActgravcomp, dofJntid: ptr UncheckedArray[int32]
+    qfrcSpring, qfrcDamper, qfrcGravcomp, qfrcFluid, qfrcAdhesion, qfrcPassive: ptr UncheckedArray[float32]
+
+proc qfrcPassiveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr QfrcPassiveArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      for dof in 0 ..< a.nv:
+        var p = a.qfrcSpring[w * a.springStride + dof] + a.qfrcDamper[w * a.damperStride + dof]
+        if a.gravityEnabled and a.jntActgravcomp[int(a.dofJntid[dof])] == 0:
+          p += a.qfrcGravcomp[w * a.gravcompStride + dof]
+        if a.hasFluid:
+          p += a.qfrcFluid[w * a.fluidStride + dof]
+        if a.flgAdhesion:
+          p += a.qfrcAdhesion[w * a.adhesionStride + dof]
+        a.qfrcPassive[w * a.passiveStride + dof] = p
+
+proc qfrcPassiveDense*(
+  nworld, nv, gravityEnabled, hasFluid, flgAdhesion: int,
+  springStride, damperStride, gravcompStride, fluidStride, adhesionStride, passiveStride: int,
+  jntActgravcomp, dofJntid: uint64,
+  qfrcSpring, qfrcDamper, qfrcGravcomp, qfrcFluid, qfrcAdhesion, qfrcPassive: uint64,
+): void {.exportpy: "qfrc_passive_dense".} =
+  var args = QfrcPassiveArgs(
+    nworld: nworld, nv: nv, gravityEnabled: gravityEnabled != 0, hasFluid: hasFluid != 0,
+    flgAdhesion: flgAdhesion != 0,
+    springStride: springStride, damperStride: damperStride, gravcompStride: gravcompStride,
+    fluidStride: fluidStride, adhesionStride: adhesionStride, passiveStride: passiveStride,
+    jntActgravcomp: toPtr[int32](jntActgravcomp), dofJntid: toPtr[int32](dofJntid),
+    qfrcSpring: toPtr[float32](qfrcSpring), qfrcDamper: toPtr[float32](qfrcDamper),
+    qfrcGravcomp: toPtr[float32](qfrcGravcomp), qfrcFluid: toPtr[float32](qfrcFluid),
+    qfrcAdhesion: toPtr[float32](qfrcAdhesion), qfrcPassive: toPtr[float32](qfrcPassive),
+  )
+  runJob(qfrcPassiveWorker, addr args, nworld)

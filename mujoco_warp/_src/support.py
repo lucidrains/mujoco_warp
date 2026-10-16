@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import warp as wp
 
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src.math import motion_cross
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import ConeType
@@ -302,6 +303,34 @@ def _apply_ft(
 
 
 def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("apply_ft_dense")
+    and all(nim_cpu.is_contiguous(a) for a in (d.xipos, d.subtree_com, d.cdof, ft, qfrc))
+  ):
+    nim_ops.apply_ft_dense(
+      d.nworld,
+      m.nbody,
+      m.nv,
+      m.nv_pad,
+      1 if flg_add else 0,
+      nim_cpu.layout(d.xipos)[1],
+      nim_cpu.layout(d.subtree_com)[1],
+      nim_cpu.layout(d.cdof)[1],
+      nim_cpu.layout(ft)[1],
+      nim_cpu.layout(qfrc)[1],
+      nim_cpu.ptr(d.xipos),
+      nim_cpu.ptr(d.subtree_com),
+      nim_cpu.ptr(d.cdof),
+      nim_cpu.ptr(ft),
+      nim_cpu.ptr(qfrc),
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(m.body_rootid),
+      nim_cpu.ptr(m.dof_bodyid),
+    )
+    return
+
   wp.launch(
     kernel=_apply_ft,
     dim=(d.nworld, m.nv),
