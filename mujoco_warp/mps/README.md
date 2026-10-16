@@ -83,7 +83,7 @@ uv run python -m mujoco_warp.mps.validate
 ```
 
 Checks on the humanoid model across 100 simulation steps with random controls:
-- Trajectory drift remains at float32 noise level ($\sim 2.5 \times 10^{-6}$ max abs error in `qpos`, $\sim 2.5 \times 10^{-4}$ in `qvel`).
+- Trajectory drift remains at float32 noise level (up to $\sim 5 \times 10^{-6}$ max abs error in `qpos`, $\sim 3 \times 10^{-4}$ in `qvel`).
 - Active constraint count (`nefc`) and contact detections match bit-for-bit.
 
 ---
