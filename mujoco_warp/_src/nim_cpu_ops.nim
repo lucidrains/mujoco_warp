@@ -20,9 +20,11 @@
 # Python as uint64.
 
 import std/atomics
+import std/os
 import std/cpuinfo
 import std/locks
 import std/math
+import std/strutils
 import std/typedthreads
 
 import nimpy
@@ -109,6 +111,15 @@ proc initPool() =
   initCond(pool.done)
   pool.nextTask.store(0, moRelaxed)
   numThreads = max(1, min(MaxPoolThreads, countProcessors()))
+  # MUJOCO_WARP_NIM_THREADS caps the pool (debugging/testing); default = all cores
+  let envThreads = getEnv("MUJOCO_WARP_NIM_THREADS")
+  if envThreads.len > 0:
+    try:
+      let n = parseInt(envThreads)
+      if n >= 1:
+        numThreads = min(MaxPoolThreads, n)
+    except ValueError:
+      discard
   workers.setLen(numThreads)
   threads.setLen(numThreads)  # POSIX createThread passes `addr`, so the handles must outlive the workers
   for tid in 0 ..< numThreads:
@@ -1306,6 +1317,8 @@ func rotVecQuat(vec: Vec3f, quat: Quatf): Vec3f {.inline.} =
     2.0'f32 * (du * u[2]) + k0 * vec[2] + twoS * cz,
   ])
 
+proc fma32(a, b, c: float32): float32 {.importc: "fmaf", header: "<math.h>".}
+
 func vadd(a, b: Vec3f): Vec3f {.inline.} =
   Vec3f([a[0] + b[0], a[1] + b[1], a[2] + b[2]])
 
@@ -2315,14 +2328,24 @@ proc comPosWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
         let dif1 = a.xipos[xiOff + b * 3 + 1] - a.subtreeCom[comOff + root * 3 + 1]
         let dif2 = a.xipos[xiOff + b * 3 + 2] - a.subtreeCom[comOff + root * 3 + 2]
 
-        # tmp = mat * diag(inert) * mat^T, mat row-major: M[i][k] = mem[i * 3 + k]
+        # tmp = mat * diag(inert) * mat^T.  Warp's matrix product uses `muladd`, i.e.
+        # fmaf, so the products fuse; mirror that for bit-exact results.  M[i][k] = mem[i * 3 + k]
+        let a00 = fma32(m0, d0, 0.0'f32)
+        let a01 = fma32(m1, d1, 0.0'f32)
+        let a02 = fma32(m2, d2, 0.0'f32)
+        let a10 = fma32(m3, d0, 0.0'f32)
+        let a11 = fma32(m4, d1, 0.0'f32)
+        let a12 = fma32(m5, d2, 0.0'f32)
+        let a20 = fma32(m6, d0, 0.0'f32)
+        let a21 = fma32(m7, d1, 0.0'f32)
+        let a22 = fma32(m8, d2, 0.0'f32)
         var res: array[10, float32]
-        res[0] = m0 * d0 * m0 + m1 * d1 * m1 + m2 * d2 * m2
-        res[1] = m3 * d0 * m3 + m4 * d1 * m4 + m5 * d2 * m5
-        res[2] = m6 * d0 * m6 + m7 * d1 * m7 + m8 * d2 * m8
-        res[3] = m0 * d0 * m3 + m1 * d1 * m4 + m2 * d2 * m5
-        res[4] = m0 * d0 * m6 + m1 * d1 * m7 + m2 * d2 * m8
-        res[5] = m3 * d0 * m6 + m4 * d1 * m7 + m5 * d2 * m8
+        res[0] = fma32(a02, m2, fma32(a01, m1, fma32(a00, m0, 0.0'f32)))
+        res[1] = fma32(a12, m5, fma32(a11, m4, fma32(a10, m3, 0.0'f32)))
+        res[2] = fma32(a22, m8, fma32(a21, m7, fma32(a20, m6, 0.0'f32)))
+        res[3] = fma32(a02, m5, fma32(a01, m4, fma32(a00, m3, 0.0'f32)))
+        res[4] = fma32(a02, m8, fma32(a01, m7, fma32(a00, m6, 0.0'f32)))
+        res[5] = fma32(a12, m8, fma32(a11, m7, fma32(a10, m6, 0.0'f32)))
         res[0] += mass * (dif1 * dif1 + dif2 * dif2)
         res[1] += mass * (dif0 * dif0 + dif2 * dif2)
         res[2] += mass * (dif0 * dif0 + dif1 * dif1)

@@ -6074,7 +6074,7 @@ def make_constraint(m: types.Model, d: types.Data):
           imp_w = int(m.opt.impratio_invsqrt.shape[0])
           iw_w, iw_s = nim_cpu.layout(m.body_invweight0)
           nim_ops.efc_contact_update_dense(
-            int(d.nacon.numpy()[0]),
+            min(int(d.nacon.numpy()[0]), d.naconmax),  # overflow contacts are not stored
             d.njmax,
             nmaxdim,
             ts_w,
