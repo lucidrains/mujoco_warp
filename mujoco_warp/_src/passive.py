@@ -16,6 +16,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MINVAL
@@ -1967,23 +1968,69 @@ def passive(m: Model, d: Data):
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
   d.qfrc_gravcomp.zero_()
   if gravity_enabled:
-    wp.launch(
-      _gravity_force,
-      dim=(d.nworld, m.nbody - 1, m.nv),
-      inputs=[
-        m.opt.gravity,
-        m.body_parentid,
-        m.body_rootid,
-        m.body_mass,
-        m.body_gravcomp,
-        m.dof_bodyid,
-        m.body_isdofancestor,
-        d.xipos,
-        d.subtree_com,
-        d.cdof,
-      ],
-      outputs=[d.qfrc_gravcomp],
-    )
+    nim_ops = nim_cpu.get_ops()
+    if (
+      nim_ops is not None
+      and nim_cpu.enabled("gravity_force_dense")
+      and nim_cpu.is_contiguous(m.opt.gravity)
+      and nim_cpu.is_contiguous(m.body_rootid)
+      and nim_cpu.is_contiguous(m.body_mass)
+      and nim_cpu.is_contiguous(m.body_gravcomp)
+      and nim_cpu.is_contiguous(m.body_isdofancestor)
+      and nim_cpu.is_contiguous(d.xipos)
+      and nim_cpu.is_contiguous(d.subtree_com)
+      and nim_cpu.is_contiguous(d.cdof)
+      and nim_cpu.is_contiguous(d.qfrc_gravcomp)
+    ):
+      gravity_w, gravity_s = nim_cpu.layout(m.opt.gravity)
+      mass_w, mass_s = nim_cpu.layout(m.body_mass)
+      gravcomp_w, gravcomp_s = nim_cpu.layout(m.body_gravcomp)
+      xipos_stride = nim_cpu.layout(d.xipos)[1]
+      com_stride = nim_cpu.layout(d.subtree_com)[1]
+      cdof_stride = nim_cpu.layout(d.cdof)[1]
+      qfrc_stride = nim_cpu.layout(d.qfrc_gravcomp)[1]
+      nim_ops.gravity_force_dense(
+        d.nworld,
+        m.nbody,
+        m.nv,
+        qfrc_stride,
+        gravity_w,
+        gravcomp_w,
+        gravcomp_s,
+        mass_w,
+        mass_s,
+        xipos_stride,
+        com_stride,
+        cdof_stride,
+        int(m.body_isdofancestor.shape[1]),
+        nim_cpu.ptr(m.opt.gravity),
+        nim_cpu.ptr(m.body_mass),
+        nim_cpu.ptr(m.body_gravcomp),
+        nim_cpu.ptr(d.xipos),
+        nim_cpu.ptr(d.subtree_com),
+        nim_cpu.ptr(d.cdof),
+        nim_cpu.ptr(d.qfrc_gravcomp),
+        nim_cpu.ptr(m.body_rootid),
+        nim_cpu.ptr(m.body_isdofancestor),
+      )
+    else:
+      wp.launch(
+        _gravity_force,
+        dim=(d.nworld, m.nbody - 1, m.nv),
+        inputs=[
+          m.opt.gravity,
+          m.body_parentid,
+          m.body_rootid,
+          m.body_mass,
+          m.body_gravcomp,
+          m.dof_bodyid,
+          m.body_isdofancestor,
+          d.xipos,
+          d.subtree_com,
+          d.cdof,
+        ],
+        outputs=[d.qfrc_gravcomp],
+      )
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:

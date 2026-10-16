@@ -26,6 +26,7 @@ from mujoco_warp._src.collision_flex import flex_collision
 from mujoco_warp._src.collision_primitive import primitive_narrowphase
 from mujoco_warp._src.collision_sdf import sdf_narrowphase
 from mujoco_warp._src.math import upper_tri_index
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import BroadphaseFilter
 from mujoco_warp._src.types import BroadphaseType
@@ -853,6 +854,73 @@ def nxn_broadphase(
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
+
+  nim_ops = nim_cpu.get_ops()
+  if (
+    not incremental
+    and nim_ops is not None
+    and nim_cpu.enabled("nxn_broadphase_dense")
+    and m.nxn_geom_pair_filtered.shape[0] > 0
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        m.geom_type,
+        m.geom_bodyid,
+        m.geom_dataid,
+        m.geom_aabb,
+        m.geom_rbound,
+        m.geom_margin,
+        m.geom_gap,
+        m.nxn_geom_pair_filtered,
+        m.nxn_pairid_filtered,
+        d.geom_xpos,
+        d.geom_xmat,
+        d.body_awake,
+        ctx.collision_pair,
+        ctx.collision_pairid,
+        ctx.collision_worldid,
+      )
+    )
+  ):
+    rbound_w, _ = nim_cpu.layout(m.geom_rbound)
+    margin_w, _ = nim_cpu.layout(m.geom_margin)
+    gap_w, _ = nim_cpu.layout(m.geom_gap)
+    dataid_w, _ = nim_cpu.layout(m.geom_dataid)
+    aabb_w, _ = nim_cpu.layout(m.geom_aabb)
+    nim_ops.nxn_broadphase_dense(
+      d.nworld,
+      m.nxn_geom_pair_filtered.shape[0],
+      d.naconmax,
+      int(m.opt.broadphase_filter),
+      m.ngeom,
+      rbound_w,
+      margin_w,
+      gap_w,
+      dataid_w,
+      aabb_w,
+      m.nbody,
+      int(m.geom_dataid.shape[0] > 1),
+      1 if enable_sleep else 0,
+      0,
+      nim_cpu.ptr(m.geom_type),
+      nim_cpu.ptr(m.geom_bodyid),
+      nim_cpu.ptr(m.geom_dataid),
+      nim_cpu.ptr(m.geom_aabb),
+      nim_cpu.ptr(m.geom_rbound),
+      nim_cpu.ptr(m.geom_margin),
+      nim_cpu.ptr(m.geom_gap),
+      nim_cpu.ptr(m.nxn_geom_pair_filtered),
+      nim_cpu.ptr(m.nxn_pairid_filtered),
+      nim_cpu.ptr(d.geom_xpos),
+      nim_cpu.ptr(d.geom_xmat),
+      nim_cpu.ptr(d.body_awake),
+      nim_cpu.ptr(d.body_awake),
+      nim_cpu.ptr(d.ncollision),
+      nim_cpu.ptr(ctx.collision_pair),
+      nim_cpu.ptr(ctx.collision_pairid),
+      nim_cpu.ptr(ctx.collision_worldid),
+    )
+    return
 
   # On the incremental pass, skip the broadphase wholesale via a graph conditional when nothing woke
   # since pass 1. A wake is exactly a body whose state changed between awake_prev and body_awake

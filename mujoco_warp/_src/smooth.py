@@ -14,6 +14,7 @@
 # ==============================================================================
 
 
+import numpy as np
 import warp as wp
 
 from mujoco_warp._src import math
@@ -423,6 +424,119 @@ def kinematics(m: Model, d: Data):
   derived positions and orientations of geoms, sites, and flexible elements, based on the
   current joint positions and any attached mocap bodies.
   """
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("kinematics_dense")
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        m.qpos0,
+        m.body_pos,
+        m.body_quat,
+        m.jnt_pos,
+        m.jnt_axis,
+        m.body_ipos,
+        m.body_iquat,
+        m.geom_pos,
+        m.geom_quat,
+        d.qpos,
+        d.mocap_pos,
+        d.mocap_quat,
+        d.xpos,
+        d.xquat,
+        d.xanchor,
+        d.xaxis,
+        d.xmat,
+        d.xipos,
+        d.ximat,
+        d.geom_xpos,
+        d.geom_xmat,
+      )
+    )
+    and (m.nsite == 0 or all(nim_cpu.is_contiguous(a) for a in (m.site_pos, m.site_quat, d.site_xpos, d.site_xmat)))
+  ):
+    qpos0_w, qpos0_s = nim_cpu.layout(m.qpos0)
+    body_pos_w, body_pos_s = nim_cpu.layout(m.body_pos)
+    body_quat_w, body_quat_s = nim_cpu.layout(m.body_quat)
+    jnt_pos_w, jnt_pos_s = nim_cpu.layout(m.jnt_pos)
+    jnt_axis_w, jnt_axis_s = nim_cpu.layout(m.jnt_axis)
+    body_ipos_w, body_ipos_s = nim_cpu.layout(m.body_ipos)
+    body_iquat_w, body_iquat_s = nim_cpu.layout(m.body_iquat)
+    geom_pos_w, geom_pos_s = nim_cpu.layout(m.geom_pos)
+    geom_quat_w, geom_quat_s = nim_cpu.layout(m.geom_quat)
+    site_pos_w, site_pos_s = nim_cpu.layout(m.site_pos) if m.nsite else (1, 0)
+    site_quat_w, site_quat_s = nim_cpu.layout(m.site_quat) if m.nsite else (1, 0)
+    nim_ops.kinematics_dense(
+      d.nworld,
+      m.nbody,
+      m.ngeom,
+      m.nsite,
+      m.nbranch,
+      m.njnt,
+      m.nmocap,
+      qpos0_w,
+      qpos0_s,
+      body_pos_w,
+      body_pos_s,
+      body_quat_w,
+      body_quat_s,
+      jnt_pos_w,
+      jnt_pos_s,
+      jnt_axis_w,
+      jnt_axis_s,
+      body_ipos_w,
+      body_ipos_s,
+      body_iquat_w,
+      body_iquat_s,
+      geom_pos_w,
+      geom_pos_s,
+      geom_quat_w,
+      geom_quat_s,
+      site_pos_w,
+      site_pos_s,
+      site_quat_w,
+      site_quat_s,
+      nim_cpu.ptr(m.qpos0),
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(m.body_mocapid),
+      nim_cpu.ptr(m.body_jntnum),
+      nim_cpu.ptr(m.body_jntadr),
+      nim_cpu.ptr(m.jnt_type),
+      nim_cpu.ptr(m.jnt_qposadr),
+      nim_cpu.ptr(m.body_branches),
+      nim_cpu.ptr(m.body_branch_start),
+      nim_cpu.ptr(m.body_rootid),
+      nim_cpu.ptr(m.body_weldid),
+      nim_cpu.ptr(m.geom_bodyid),
+      nim_cpu.ptr(m.site_bodyid),
+      nim_cpu.ptr(m.body_pos),
+      nim_cpu.ptr(m.body_quat),
+      nim_cpu.ptr(m.jnt_pos),
+      nim_cpu.ptr(m.jnt_axis),
+      nim_cpu.ptr(m.body_ipos),
+      nim_cpu.ptr(m.body_iquat),
+      nim_cpu.ptr(m.geom_pos),
+      nim_cpu.ptr(m.geom_quat),
+      nim_cpu.ptr(m.site_pos),
+      nim_cpu.ptr(m.site_quat),
+      nim_cpu.ptr(d.qpos),
+      nim_cpu.ptr(d.mocap_pos),
+      nim_cpu.ptr(d.mocap_quat),
+      nim_cpu.ptr(d.xpos),
+      nim_cpu.ptr(d.xquat),
+      nim_cpu.ptr(d.xanchor),
+      nim_cpu.ptr(d.xaxis),
+      nim_cpu.ptr(d.xmat),
+      nim_cpu.ptr(d.xipos),
+      nim_cpu.ptr(d.ximat),
+      nim_cpu.ptr(d.geom_xpos),
+      nim_cpu.ptr(d.geom_xmat),
+      nim_cpu.ptr(d.site_xpos),
+      nim_cpu.ptr(d.site_xmat),
+    )
+    return
+
   wp.launch(
     _kinematics_branch,
     dim=(d.nworld, m.nbranch),
@@ -790,6 +904,24 @@ def _cdof(
     res[dofid] = wp.spatial_vector(xaxis, wp.cross(xaxis, offset))
 
 
+_BODY_TREE_CACHE: dict[int, tuple] = {}
+
+
+def _body_tree_flat(m):
+  """Flat (body ids, level offsets) view of m.body_tree, cached per model."""
+  key = id(m)
+  cached = _BODY_TREE_CACHE.get(key)
+  if cached is None or cached[0] is not m:
+    levels = [np.asarray(t.numpy(), np.int32) for t in m.body_tree]
+    flat = np.concatenate(levels) if levels else np.zeros(0, np.int32)
+    offsets = np.zeros(len(levels) + 1, np.int32)
+    for i, level in enumerate(levels):
+      offsets[i + 1] = offsets[i] + len(level)
+    cached = (m, wp.array(flat, dtype=int), wp.array(offsets, dtype=int))
+    _BODY_TREE_CACHE[key] = cached
+  return cached[1], cached[2]
+
+
 @event_scope
 def com_pos(m: Model, d: Data):
   """Computes subtree center of mass positions.
@@ -798,6 +930,71 @@ def com_pos(m: Model, d: Data):
   mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("smooth_com_pos_dense")
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        m.body_mass,
+        m.body_inertia,
+        m.body_subtreemass,
+        d.xipos,
+        d.ximat,
+        d.subtree_com,
+        d.xmat,
+        d.xanchor,
+        d.xaxis,
+        d.cinert,
+        d.cdof,
+      )
+    )
+  ):
+    body_tree, tree_offsets = _body_tree_flat(m)
+    mass_w, mass_s = nim_cpu.layout(m.body_mass)
+    inertia_w, inertia_s = nim_cpu.layout(m.body_inertia)
+    subtreemass_w, subtreemass_s = nim_cpu.layout(m.body_subtreemass)
+    nim_ops.smooth_com_pos_dense(
+      d.nworld,
+      m.nbody,
+      m.njnt,
+      len(m.body_tree),
+      mass_w,
+      mass_s,
+      inertia_w,
+      inertia_s,
+      subtreemass_w,
+      subtreemass_s,
+      nim_cpu.layout(d.xipos)[1],
+      nim_cpu.layout(d.ximat)[1],
+      nim_cpu.layout(d.subtree_com)[1],
+      nim_cpu.layout(d.xmat)[1],
+      nim_cpu.layout(d.xanchor)[1],
+      nim_cpu.layout(d.xaxis)[1],
+      nim_cpu.layout(d.cinert)[1],
+      nim_cpu.layout(d.cdof)[1],
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(m.body_rootid),
+      nim_cpu.ptr(m.jnt_type),
+      nim_cpu.ptr(m.jnt_dofadr),
+      nim_cpu.ptr(m.jnt_bodyid),
+      nim_cpu.ptr(body_tree),
+      nim_cpu.ptr(tree_offsets),
+      nim_cpu.ptr(m.body_mass),
+      nim_cpu.ptr(m.body_inertia),
+      nim_cpu.ptr(m.body_subtreemass),
+      nim_cpu.ptr(d.xipos),
+      nim_cpu.ptr(d.ximat),
+      nim_cpu.ptr(d.subtree_com),
+      nim_cpu.ptr(d.xmat),
+      nim_cpu.ptr(d.xanchor),
+      nim_cpu.ptr(d.xaxis),
+      nim_cpu.ptr(d.cinert),
+      nim_cpu.ptr(d.cdof),
+    )
+    return
+
   wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
 
   for i in reversed(range(len(m.body_tree))):
@@ -2593,6 +2790,33 @@ def com_vel(m: Model, d: Data):
   Propagates velocities down the kinematic tree, updating the spatial velocity and
   derivative for each body.
   """
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("smooth_com_vel_dense")
+    and all(nim_cpu.is_contiguous(a) for a in (d.qvel, d.cdof, d.cvel, d.cdof_dot))
+  ):
+    nim_ops.smooth_com_vel_dense(
+      d.nworld,
+      m.nbranch,
+      nim_cpu.layout(d.qvel)[1],
+      nim_cpu.layout(d.cdof)[1],
+      nim_cpu.layout(d.cvel)[1],
+      nim_cpu.layout(d.cdof_dot)[1],
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(m.body_jntnum),
+      nim_cpu.ptr(m.body_jntadr),
+      nim_cpu.ptr(m.body_dofadr),
+      nim_cpu.ptr(m.jnt_type),
+      nim_cpu.ptr(m.body_branches),
+      nim_cpu.ptr(m.body_branch_start),
+      nim_cpu.ptr(d.qvel),
+      nim_cpu.ptr(d.cdof),
+      nim_cpu.ptr(d.cvel),
+      nim_cpu.ptr(d.cdof_dot),
+    )
+    return
+
   wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
 
   wp.launch(

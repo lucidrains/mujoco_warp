@@ -5669,38 +5669,80 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
         )
       else:
-        wp.launch(
-          _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
-          dim=d.naconmax,
-          inputs=[
-            m.body_weldid,
-            m.body_dofnum,
-            m.body_dofadr,
-            m.dof_parentid,
-            m.geom_bodyid,
-            d.njmax,
-            d.njmax_nnz,
-            d.nacon,
-            d.contact.dist,
-            d.contact.dim,
-            d.contact.includemargin,
-            d.contact.adhesion,
-            d.contact.worldid,
-            d.contact.geom,
-            d.contact.type,
-          ],
-          outputs=[
-            d.nefc,
-            d.contact.efc_address,
-            d.efc.id,
-            d.efc.jtdaj_adr,
-            d.efc.jtdaj_nrow,
-            d.efc.jtdaj_nblock,
-            d.efc.J_rownnz,
-            d.efc.J_rowadr,
-            efc_nnz,
-          ],
+        nim_ops = nim_cpu.get_ops()
+        use_nim = (
+          not m.is_sparse
+          and nim_ops is not None
+          and nim_cpu.enabled("efc_contact_init_dense")
+          and all(
+            nim_cpu.is_contiguous(a)
+            for a in (
+              d.contact.dist,
+              d.contact.dim,
+              d.contact.includemargin,
+              d.contact.adhesion,
+              d.contact.worldid,
+              d.contact.geom,
+              d.contact.type,
+              d.contact.efc_address,
+              d.nefc,
+            )
+          )
         )
+        if use_nim:
+          use_nim = (
+            nim_ops.efc_contact_init_dense(
+              d.nworld,
+              int(d.nacon.numpy()[0]),
+              d.njmax,
+              d.contact.efc_address.shape[1],
+              int(m.flg_adhesion),
+              nim_cpu.ptr(d.contact.type),
+              nim_cpu.ptr(d.contact.dim),
+              nim_cpu.ptr(d.contact.worldid),
+              nim_cpu.ptr(d.contact.geom),
+              nim_cpu.ptr(d.contact.dist),
+              nim_cpu.ptr(d.contact.includemargin),
+              nim_cpu.ptr(d.contact.adhesion),
+              nim_cpu.ptr(d.nefc),
+              nim_cpu.ptr(d.contact.efc_address),
+              nim_cpu.ptr(d.efc.id),
+            )
+            == 0
+          )
+        if not use_nim:
+          wp.launch(
+            _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
+            dim=d.naconmax,
+            inputs=[
+              m.body_weldid,
+              m.body_dofnum,
+              m.body_dofadr,
+              m.dof_parentid,
+              m.geom_bodyid,
+              d.njmax,
+              d.njmax_nnz,
+              d.nacon,
+              d.contact.dist,
+              d.contact.dim,
+              d.contact.includemargin,
+              d.contact.adhesion,
+              d.contact.worldid,
+              d.contact.geom,
+              d.contact.type,
+            ],
+            outputs=[
+              d.nefc,
+              d.contact.efc_address,
+              d.efc.id,
+              d.efc.jtdaj_adr,
+              d.efc.jtdaj_nrow,
+              d.efc.jtdaj_nblock,
+              d.efc.J_rownnz,
+              d.efc.J_rowadr,
+              efc_nnz,
+            ],
+          )
 
       if m.is_sparse:
         if has_flex:
@@ -5990,41 +6032,115 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
         )
       else:
-        wp.launch(
-          _efc_contact_update(m.opt.cone, m.flg_adhesion, is_discrete),
-          dim=(d.naconmax, nmaxdim),
-          inputs=[
-            m.opt.timestep,
-            m.opt.disableflags,
-            m.opt.impratio_invsqrt,
-            m.body_invweight0,
-            m.geom_bodyid,
-            d.contact.efc_address,
-            d.efc.Jqvel,
-            d.nacon,
-            d.contact.dist,
-            d.contact.dim,
-            d.contact.includemargin,
-            d.contact.worldid,
-            d.contact.geom,
-            d.contact.friction,
-            d.contact.solref,
-            d.contact.solreffriction,
-            d.contact.solimp,
-            d.contact.adhesion,
-            d.contact.type,
-          ],
-          outputs=[
-            d.efc.type,
-            d.efc.id,
-            d.efc.pos,
-            d.efc.margin,
-            d.efc.D,
-            d.efc.vel,
-            d.efc.aref,
-            d.efc.frictionloss,
-          ],
+        nim_ops = nim_cpu.get_ops()
+        use_nim = (
+          nim_ops is not None
+          and nim_cpu.enabled("efc_contact_update_dense")
+          and not is_discrete
+          and not m.flg_adhesion
+          and m.opt.cone != types.ConeType.ELLIPTIC
+          and all(
+            nim_cpu.is_contiguous(a)
+            for a in (
+              m.opt.timestep,
+              m.opt.impratio_invsqrt,
+              m.body_invweight0,
+              m.geom_bodyid,
+              d.contact.efc_address,
+              d.efc.Jqvel,
+              d.contact.dist,
+              d.contact.dim,
+              d.contact.includemargin,
+              d.contact.worldid,
+              d.contact.geom,
+              d.contact.friction,
+              d.contact.solref,
+              d.contact.solimp,
+              d.contact.type,
+              d.efc.type,
+              d.efc.id,
+              d.efc.pos,
+              d.efc.margin,
+              d.efc.D,
+              d.efc.vel,
+              d.efc.aref,
+              d.efc.frictionloss,
+            )
+          )
         )
+        if use_nim:
+          ts_w = int(m.opt.timestep.shape[0])
+          imp_w = int(m.opt.impratio_invsqrt.shape[0])
+          iw_w, iw_s = nim_cpu.layout(m.body_invweight0)
+          nim_ops.efc_contact_update_dense(
+            int(d.nacon.numpy()[0]),
+            d.njmax,
+            nmaxdim,
+            ts_w,
+            imp_w,
+            iw_w,
+            iw_s,
+            int(m.opt.disableflags),
+            nim_cpu.ptr(m.opt.timestep),
+            nim_cpu.ptr(m.opt.impratio_invsqrt),
+            nim_cpu.ptr(m.body_invweight0),
+            nim_cpu.ptr(m.geom_bodyid),
+            nim_cpu.ptr(d.contact.dim),
+            nim_cpu.ptr(d.contact.worldid),
+            nim_cpu.ptr(d.contact.geom),
+            nim_cpu.ptr(d.contact.type),
+            nim_cpu.ptr(d.contact.efc_address),
+            nim_cpu.ptr(d.efc.Jqvel),
+            nim_cpu.ptr(d.contact.dist),
+            nim_cpu.ptr(d.contact.includemargin),
+            nim_cpu.ptr(d.contact.friction),
+            nim_cpu.ptr(d.contact.solref),
+            nim_cpu.ptr(d.contact.solimp),
+            nim_cpu.ptr(d.efc.type),
+            nim_cpu.ptr(d.efc.id),
+            nim_cpu.ptr(d.efc.D),
+            nim_cpu.ptr(d.efc.aref),
+            nim_cpu.ptr(d.efc.vel),
+            nim_cpu.ptr(d.efc.pos),
+            nim_cpu.ptr(d.efc.margin),
+            nim_cpu.ptr(d.efc.frictionloss),
+          )
+        else:
+          wp.launch(
+            _efc_contact_update(m.opt.cone, m.flg_adhesion, is_discrete),
+            dim=(d.naconmax, nmaxdim),
+            inputs=[
+              m.opt.timestep,
+              m.opt.disableflags,
+              m.opt.impratio_invsqrt,
+              m.body_invweight0,
+              m.geom_bodyid,
+              d.contact.efc_address,
+              d.efc.Jqvel,
+              d.nacon,
+              d.contact.dist,
+              d.contact.dim,
+              d.contact.includemargin,
+              d.contact.worldid,
+              d.contact.geom,
+              d.contact.friction,
+              d.contact.solref,
+              d.contact.solreffriction,
+              d.contact.solimp,
+              d.contact.adhesion,
+              d.contact.type,
+            ],
+            outputs=[
+              d.efc.type,
+              d.efc.id,
+              d.efc.pos,
+              d.efc.margin,
+              d.efc.D,
+              d.efc.vel,
+              d.efc.aref,
+              d.efc.frictionloss,
+            ],
+          )
 
 
 @cache_kernel

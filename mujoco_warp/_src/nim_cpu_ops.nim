@@ -49,6 +49,8 @@ type
     nthreads, generation, remaining: int
     nextTask: Atomic[int]
     stop: bool
+    teamActive: bool
+    barrierCount, barrierPhase: Atomic[int]
 
   Worker = object
     pool: ptr Pool
@@ -65,6 +67,21 @@ func toPtr[T](address: uint64): ptr UncheckedArray[T] {.inline.} =
 
 proc claimTask(): int {.inline, gcsafe.} =
   pool.nextTask.fetchAdd(1, moRelaxed)
+
+proc teamBarrier() {.inline, gcsafe.} =
+  ## Join point for all pool workers inside one job.  No-op when the job owns the
+  ## calling thread (inline execution) or the pool has a single worker.
+  if not pool.teamActive or pool.nthreads <= 1:
+    return
+  let target = pool.nthreads
+  let phase = pool.barrierPhase.load(moRelaxed)
+  if pool.barrierCount.fetchAdd(1, moAcquireRelease) == target - 1:
+    pool.barrierCount.store(0, moRelaxed)
+    pool.nextTask.store(0, moRelaxed)  # each phase restarts task numbering at 0
+    pool.barrierPhase.store(phase + 1, moRelease)
+  else:
+    while pool.barrierPhase.load(moAcquire) == phase:
+      cpuRelax()
 
 proc scratch(buf: var seq[float32], n: int): ptr UncheckedArray[float32] {.inline.} =
   if buf.len < n:
@@ -108,6 +125,9 @@ proc initPool() =
   initCond(pool.work)
   initCond(pool.done)
   pool.nextTask.store(0, moRelaxed)
+  pool.teamActive = false
+  pool.barrierCount.store(0, moRelaxed)
+  pool.barrierPhase.store(0, moRelaxed)
   numThreads = max(1, min(MaxPoolThreads, countProcessors()))
   workers.setLen(numThreads)
   threads.setLen(numThreads)  # POSIX createThread passes `addr`, so the handles must outlive the workers
@@ -130,10 +150,12 @@ proc runJob(job: Job, arg: pointer, nTasks = MaxPoolThreads) =
   pool.nthreads = numThreads
   pool.remaining = numThreads
   pool.nextTask.store(0, moRelaxed)
+  pool.teamActive = true
   inc pool.generation
   broadcast(pool.work)
   while pool.remaining > 0:
     wait(pool.done, pool.lock)
+  pool.teamActive = false
   release(pool.lock)
 
 func choleskyFactorize(a: ptr UncheckedArray[float32], n, stride: int) {.inline.} =
@@ -1251,3 +1273,1292 @@ proc newtonSolveDense*(
     lsExhausted: toPtr[bool](lsExhausted),
   )
   runJob(newtonSolveWorker, addr args, if nworld * nv >= 256: nworld else: 1)
+
+# ==============================================================================
+# Step pipeline fast paths: gravity, broadphase, contact rows, kinematics.
+#
+# Warp's CPU backend runs each kernel on a single lane, so these scalar loops
+# spread over the worker pool are a large win.  Quaternions are w-first
+# (index 0 = real part, matching `_src/math.py`), matrices are column-major
+# with memory order `m[c * 3 + r]`.
+
+const
+  BpFlagsCap = 1 shl 24  # store one pass flag per (world, pair); above this, re-filter
+  EfcUpdateChunk = 32
+  MjMinVal = 1.0e-15'f32
+  MjMinImp = 0.0001'f32
+  MjMaxImp = 0.9999'f32
+  DisableRefsafe = 4096'i32
+  ContactConstraint = 1'i32  # types.ContactType.CONSTRAINT
+  ConstraintContactFrictionless = 5'i32
+  ConstraintContactPyramidal = 6'i32
+  GeomTypeMesh = 7'i32
+  JointTypeFree = 0'i32
+  JointTypeBall = 1'i32
+  JointTypeSlide = 2'i32
+  JointTypeHinge = 3'i32
+  SleepStatic = -1'i32
+  SleepAsleep = 0'i32
+
+type
+  Quatf = array[4, float32]
+
+func mulQuat(u, v: Quatf): Quatf {.inline.} =
+  Quatf([
+    u[0] * v[0] - u[1] * v[1] - u[2] * v[2] - u[3] * v[3],
+    u[0] * v[1] + u[1] * v[0] + u[2] * v[3] - u[3] * v[2],
+    u[0] * v[2] - u[1] * v[3] + u[2] * v[0] + u[3] * v[1],
+    u[0] * v[3] + u[1] * v[2] - u[2] * v[1] + u[3] * v[0],
+  ])
+
+func rotVecQuat(vec: Vec3f, quat: Quatf): Vec3f {.inline.} =
+  let s = quat[0]
+  let u = [quat[1], quat[2], quat[3]]
+  let du = u[0] * vec[0] + u[1] * vec[1] + u[2] * vec[2]
+  let uu = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
+  let k0 = s * s - uu
+  let cx = u[1] * vec[2] - u[2] * vec[1]
+  let cy = u[2] * vec[0] - u[0] * vec[2]
+  let cz = u[0] * vec[1] - u[1] * vec[0]
+  Vec3f([
+    2.0'f32 * du * u[0] + k0 * vec[0] + 2.0'f32 * s * cx,
+    2.0'f32 * du * u[1] + k0 * vec[1] + 2.0'f32 * s * cy,
+    2.0'f32 * du * u[2] + k0 * vec[2] + 2.0'f32 * s * cz,
+  ])
+
+func vadd(a, b: Vec3f): Vec3f {.inline.} =
+  Vec3f([a[0] + b[0], a[1] + b[1], a[2] + b[2]])
+
+func vsub(a, b: Vec3f): Vec3f {.inline.} =
+  Vec3f([a[0] - b[0], a[1] - b[1], a[2] - b[2]])
+
+func axisAngleToQuat(axis: Vec3f, angle: float32): Quatf {.inline.} =
+  let s = sin(angle * 0.5'f32)
+  let c = cos(angle * 0.5'f32)
+  Quatf([c, axis[0] * s, axis[1] * s, axis[2] * s])
+
+func normQuat(q: Quatf): Quatf {.inline.} =
+  let l = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+  if l <= 1.1920929e-07'f32:
+    return q
+  let inv = 1.0'f32 / l
+  Quatf([q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv])
+
+func quatToMat(q: Quatf): array[9, float32] {.inline.} =
+  let q00 = q[0] * q[0]
+  let q01 = q[0] * q[1]
+  let q02 = q[0] * q[2]
+  let q03 = q[0] * q[3]
+  let q11 = q[1] * q[1]
+  let q12 = q[1] * q[2]
+  let q13 = q[1] * q[3]
+  let q22 = q[2] * q[2]
+  let q23 = q[2] * q[3]
+  let q33 = q[3] * q[3]
+  [
+    q00 + q11 - q22 - q33,
+    2.0'f32 * (q12 - q03),
+    2.0'f32 * (q13 + q02),
+    2.0'f32 * (q12 + q03),
+    q00 - q11 + q22 - q33,
+    2.0'f32 * (q23 - q01),
+    2.0'f32 * (q13 - q02),
+    2.0'f32 * (q23 + q01),
+    q00 - q11 - q22 + q33,
+  ]
+
+# ------------------------------------------------------------------------------
+# Gravity / gravcomp forces (mirror of passive._gravity_force).
+
+type
+  GravityForceArgs = object
+    nworld, nbody, nv, qfrcStride: int
+    gravityWorlds: int
+    gravcompWorlds, gravcompStride: int
+    massWorlds, massStride: int
+    xiposStride, comStride, cdofStride, isdofStride: int
+    gravity, mass, gravcomp: ptr UncheckedArray[float32]
+    xipos, subtreeCom, cdof, qfrcGravcomp: ptr UncheckedArray[float32]
+    bodyRootid, bodyIsdofancestor: ptr UncheckedArray[int32]
+
+proc gravityForceWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr GravityForceArgs](arg)
+  while true:
+    let w = claimTask()
+    if w >= a.nworld:
+      break
+    let gOff = (w mod a.gravityWorlds) * 3
+    let gx = a.gravity[gOff]
+    let gy = a.gravity[gOff + 1]
+    let gz = a.gravity[gOff + 2]
+    let gcOff = (w mod a.gravcompWorlds) * a.gravcompStride
+    let mOff = (w mod a.massWorlds) * a.massStride
+    let xiOff = w * a.xiposStride
+    let comOff = w * a.comStride
+    let cdofOff = w * a.cdofStride
+    let qOff = w * a.qfrcStride
+
+    for b in 1 ..< a.nbody:
+      let gravcomp = a.gravcomp[gcOff + b]
+      if gravcomp == 0.0'f32:
+        continue
+      let mass = a.mass[mOff + b] * gravcomp
+      let fx = -gx * mass
+      let fy = -gy * mass
+      let fz = -gz * mass
+      let root = int(a.bodyRootid[b])
+      let ox = a.xipos[xiOff + b * 3] - a.subtreeCom[comOff + root * 3]
+      let oy = a.xipos[xiOff + b * 3 + 1] - a.subtreeCom[comOff + root * 3 + 1]
+      let oz = a.xipos[xiOff + b * 3 + 2] - a.subtreeCom[comOff + root * 3 + 2]
+      let isdofOff = b * a.isdofStride
+      for d in 0 ..< a.nv:
+        if a.bodyIsdofancestor[isdofOff + d] == 0:
+          continue
+        let c = cdofOff + d * 6
+        let ax = a.cdof[c]
+        let ay = a.cdof[c + 1]
+        let az = a.cdof[c + 2]
+        let jx = a.cdof[c + 3] + (ay * oz - az * oy)
+        let jy = a.cdof[c + 4] + (az * ox - ax * oz)
+        let jz = a.cdof[c + 5] + (ax * oy - ay * ox)
+        a.qfrcGravcomp[qOff + d] += jx * fx + jy * fy + jz * fz
+
+proc gravityForceDense*(
+  nworld, nbody, nv, qfrcStride: int,
+  gravityWorlds, gravcompWorlds, gravcompStride, massWorlds, massStride: int,
+  xiposStride, comStride, cdofStride, isdofStride: int,
+  gravity, mass, gravcomp: uint64,
+  xipos, subtreeCom, cdof, qfrcGravcomp: uint64,
+  bodyRootid, bodyIsdofancestor: uint64,
+): void {.exportpy: "gravity_force_dense".} =
+  var args = GravityForceArgs(
+    nworld: nworld, nbody: nbody, nv: nv, qfrcStride: qfrcStride,
+    gravityWorlds: gravityWorlds,
+    gravcompWorlds: gravcompWorlds, gravcompStride: gravcompStride,
+    massWorlds: massWorlds, massStride: massStride,
+    xiposStride: xiposStride, comStride: comStride, cdofStride: cdofStride, isdofStride: isdofStride,
+    gravity: toPtr[float32](gravity), mass: toPtr[float32](mass), gravcomp: toPtr[float32](gravcomp),
+    xipos: toPtr[float32](xipos), subtreeCom: toPtr[float32](subtreeCom), cdof: toPtr[float32](cdof),
+    qfrcGravcomp: toPtr[float32](qfrcGravcomp),
+    bodyRootid: toPtr[int32](bodyRootid), bodyIsdofancestor: toPtr[int32](bodyIsdofancestor),
+  )
+  runJob(gravityForceWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# NxN broadphase (mirror of collision_driver._nxn_broadphase).
+#
+# Two passes: a parallel count per world, then a parallel fill emitting pairs in
+# world-major order, which reproduces the serial Warp CPU ordering exactly.
+
+type
+  BroadphaseArgs = object
+    nworld, npairs, naconmax, filter: int
+    ngeom: int
+    rboundWorlds, marginWorlds, gapWorlds, dataidWorlds, aabbWorlds: int
+    awakeStride: int
+    geomType, geomBodyid: ptr UncheckedArray[int32]
+    geomDataid: ptr UncheckedArray[int32]
+    geomAabb, geomRbound, geomMargin, geomGap: ptr UncheckedArray[float32]
+    nxnPair, nxnPairid: ptr UncheckedArray[int32]
+    geomXpos, geomXmat: ptr UncheckedArray[float32]
+    bodyAwake, bodyAwakePrev: ptr UncheckedArray[int32]
+    ncollision: ptr UncheckedArray[int32]
+    counts: ptr UncheckedArray[int32]
+    flags: ptr UncheckedArray[uint8]
+    collisionPair, collisionPairid, collisionWorldid: ptr UncheckedArray[int32]
+    checkMesh, enableSleep, incremental: bool
+
+func matVec(m: array[9, float32], v: Vec3f): Vec3f {.inline.} =
+  Vec3f([
+    m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+    m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+    m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+  ])
+
+
+func bpRbound(a: ptr BroadphaseArgs, w, geom: int): float32 {.inline.} =
+  a.geomRbound[(w mod a.rboundWorlds) * a.ngeom + geom]
+
+func bpMargin(a: ptr BroadphaseArgs, w, geom: int): float32 {.inline.} =
+  a.geomMargin[(w mod a.marginWorlds) * a.ngeom + geom]
+
+func bpGap(a: ptr BroadphaseArgs, w, geom: int): float32 {.inline.} =
+  a.geomGap[(w mod a.gapWorlds) * a.ngeom + geom]
+
+func bpXpos(a: ptr BroadphaseArgs, w, geom: int): Vec3f {.inline.} =
+  let off = (w * a.ngeom + geom) * 3
+  Vec3f([a.geomXpos[off], a.geomXpos[off + 1], a.geomXpos[off + 2]])
+
+func bpXmat(a: ptr BroadphaseArgs, w, geom: int): array[9, float32] {.inline.} =
+  let off = (w * a.ngeom + geom) * 9
+  [
+    a.geomXmat[off], a.geomXmat[off + 1], a.geomXmat[off + 2],
+    a.geomXmat[off + 3], a.geomXmat[off + 4], a.geomXmat[off + 5],
+    a.geomXmat[off + 6], a.geomXmat[off + 7], a.geomXmat[off + 8],
+  ]
+
+func bpSphereFilter(rbound1, rbound2, margin1, margin2: float32, xpos1, xpos2: Vec3f): bool {.inline.} =
+  let bound = rbound1 + rbound2 + margin1 + margin2
+  let dx = xpos2[0] - xpos1[0]
+  let dy = xpos2[1] - xpos1[1]
+  let dz = xpos2[2] - xpos1[2]
+  dx * dx + dy * dy + dz * dz <= bound * bound
+
+func bpAabbFilter(center1, center2, size1, size2: Vec3f, margin1, margin2: float32, xpos1, xpos2: Vec3f, xmat1, xmat2: array[9, float32]): bool {.inline.} =
+  var c1 = matVec(xmat1, center1)
+  c1[0] += xpos1[0]
+  c1[1] += xpos1[1]
+  c1[2] += xpos1[2]
+  var c2 = matVec(xmat2, center2)
+  c2[0] += xpos2[0]
+  c2[1] += xpos2[1]
+  c2[2] += xpos2[2]
+  let margin = margin1 + margin2
+
+  let signs = [-1.0'f32, 1.0'f32]
+  var min1 = [MjMaxVal, MjMaxVal, MjMaxVal]
+  var max1 = [-MjMaxVal, -MjMaxVal, -MjMaxVal]
+  var min2 = [MjMaxVal, MjMaxVal, MjMaxVal]
+  var max2 = [-MjMaxVal, -MjMaxVal, -MjMaxVal]
+  for i in 0 ..< 2:
+    for j in 0 ..< 2:
+      for k in 0 ..< 2:
+        let corner1 = Vec3f([signs[i] * size1[0], signs[j] * size1[1], signs[k] * size1[2]])
+        let pos1 = matVec(xmat1, corner1)
+        let corner2 = Vec3f([signs[i] * size2[0], signs[j] * size2[1], signs[k] * size2[2]])
+        let pos2 = matVec(xmat2, corner2)
+        for c in 0 ..< 3:
+          if pos1[c] > max1[c]: max1[c] = pos1[c]
+          if pos1[c] < min1[c]: min1[c] = pos1[c]
+          if pos2[c] > max2[c]: max2[c] = pos2[c]
+          if pos2[c] < min2[c]: min2[c] = pos2[c]
+
+  for c in 0 ..< 3:
+    if c1[c] + max1[c] + margin < c2[c] + min2[c]:
+      return false
+    if c2[c] + max2[c] + margin < c1[c] + min1[c]:
+      return false
+  true
+
+func bpObbFilter(center1, center2, size1, size2: Vec3f, margin1, margin2: float32, xpos1, xpos2: Vec3f, xmat1, xmat2: array[9, float32]): bool {.inline.} =
+  let margin = margin1 + margin2
+
+  var xcenter = [Vec3f([0.0'f32, 0.0'f32, 0.0'f32]), Vec3f([0.0'f32, 0.0'f32, 0.0'f32])]
+  xcenter[0] = matVec(xmat1, center1)
+  xcenter[0][0] += xpos1[0]
+  xcenter[0][1] += xpos1[1]
+  xcenter[0][2] += xpos1[2]
+  xcenter[1] = matVec(xmat2, center2)
+  xcenter[1][0] += xpos2[0]
+  xcenter[1][1] += xpos2[1]
+  xcenter[1][2] += xpos2[2]
+
+  # columns of each rotation matrix are the box axes
+  var normal = [Vec3f([0.0'f32, 0.0'f32, 0.0'f32]), Vec3f([0.0'f32, 0.0'f32, 0.0'f32]),
+                Vec3f([0.0'f32, 0.0'f32, 0.0'f32]), Vec3f([0.0'f32, 0.0'f32, 0.0'f32]),
+                Vec3f([0.0'f32, 0.0'f32, 0.0'f32]), Vec3f([0.0'f32, 0.0'f32, 0.0'f32])]
+  for k in 0 ..< 3:
+    normal[k] = Vec3f([xmat1[k], xmat1[3 + k], xmat1[6 + k]])
+    normal[3 + k] = Vec3f([xmat2[k], xmat2[3 + k], xmat2[6 + k]])
+
+  var proj: array[2, float32]
+  var radius: array[2, float32]
+  for j in 0 ..< 2:
+    for k in 0 ..< 3:
+      let n = normal[3 * j + k]
+      for i in 0 ..< 2:
+        proj[i] = xcenter[i][0] * n[0] + xcenter[i][1] * n[1] + xcenter[i][2] * n[2]
+        let size = if i == 0: size1 else: size2
+        let na = normal[3 * i]
+        let nb = normal[3 * i + 1]
+        let nc = normal[3 * i + 2]
+        radius[i] = abs(size[0] * (na[0] * n[0] + na[1] * n[1] + na[2] * n[2])) +
+                    abs(size[1] * (nb[0] * n[0] + nb[1] * n[1] + nb[2] * n[2])) +
+                    abs(size[2] * (nc[0] * n[0] + nc[1] * n[1] + nc[2] * n[2]))
+      if radius[0] + radius[1] + margin < abs(proj[1] - proj[0]):
+        return false
+  true
+
+func bpFilterPasses(a: ptr BroadphaseArgs, w, geom1, geom2: int): bool {.inline.} =
+  let rbound1 = bpRbound(a, w, geom1)
+  let rbound2 = bpRbound(a, w, geom2)
+  let emargin1 = bpMargin(a, w, geom1) + bpGap(a, w, geom1)
+  let emargin2 = bpMargin(a, w, geom2) + bpGap(a, w, geom2)
+  let xpos1 = bpXpos(a, w, geom1)
+  let xpos2 = bpXpos(a, w, geom2)
+
+  if rbound1 == 0.0'f32 or rbound2 == 0.0'f32:
+    if (a.filter and 1) != 0:  # BroadphaseFilter.PLANE
+      if rbound1 == 0.0'f32:
+        # plane normal = column 2 of xmat1, row-major memory: (mem[2], mem[5], mem[8])
+        let xmat1 = bpXmat(a, w, geom1)
+        let dist = (xpos2[0] - xpos1[0]) * xmat1[2] + (xpos2[1] - xpos1[1]) * xmat1[5] + (xpos2[2] - xpos1[2]) * xmat1[8]
+        return dist <= rbound2 + emargin1 + emargin2
+      else:
+        let xmat2 = bpXmat(a, w, geom2)
+        let dist = (xpos1[0] - xpos2[0]) * xmat2[2] + (xpos1[1] - xpos2[1]) * xmat2[5] + (xpos1[2] - xpos2[2]) * xmat2[8]
+        return dist <= rbound1 + emargin1 + emargin2
+  else:
+    if (a.filter and 2) != 0:  # SPHERE
+      if not bpSphereFilter(rbound1, rbound2, emargin1, emargin2, xpos1, xpos2):
+        return false
+    if (a.filter and 4) != 0 or (a.filter and 8) != 0:  # AABB / OBB
+      let aabbId = w mod a.aabbWorlds
+      let base1 = (aabbId * a.ngeom + geom1) * 6
+      let base2 = (aabbId * a.ngeom + geom2) * 6
+      let center1 = Vec3f([a.geomAabb[base1], a.geomAabb[base1 + 1], a.geomAabb[base1 + 2]])
+      let size1 = Vec3f([a.geomAabb[base1 + 3], a.geomAabb[base1 + 4], a.geomAabb[base1 + 5]])
+      let center2 = Vec3f([a.geomAabb[base2], a.geomAabb[base2 + 1], a.geomAabb[base2 + 2]])
+      let size2 = Vec3f([a.geomAabb[base2 + 3], a.geomAabb[base2 + 4], a.geomAabb[base2 + 5]])
+      if (a.filter and 4) != 0:
+        let xmat1 = bpXmat(a, w, geom1)
+        let xmat2 = bpXmat(a, w, geom2)
+        if not bpAabbFilter(center1, center2, size1, size2, emargin1, emargin2, xpos1, xpos2, xmat1, xmat2):
+          return false
+      if (a.filter and 8) != 0:
+        let xmat1 = bpXmat(a, w, geom1)
+        let xmat2 = bpXmat(a, w, geom2)
+        if not bpObbFilter(center1, center2, size1, size2, emargin1, emargin2, xpos1, xpos2, xmat1, xmat2):
+          return false
+  true
+
+func bpPairPasses(a: ptr BroadphaseArgs, w, geom1, geom2, e: int): bool {.inline.} =
+  if a.checkMesh:
+    let type1 = a.geomType[geom1]
+    let type2 = a.geomType[geom2]
+    let dataidId = w mod a.dataidWorlds
+    if (type1 == GeomTypeMesh and a.geomDataid[dataidId * a.ngeom + geom1] < 0) or
+        (type2 == GeomTypeMesh and a.geomDataid[dataidId * a.ngeom + geom2] < 0):
+      return false
+
+  if a.enableSleep:
+    let b1 = int(a.geomBodyid[geom1])
+    let b2 = int(a.geomBodyid[geom2])
+    let s1 = a.bodyAwake[w * a.awakeStride + b1]
+    let s2 = a.bodyAwake[w * a.awakeStride + b2]
+    if s1 == SleepAsleep and s2 == SleepAsleep:
+      return false
+    if (s1 == SleepAsleep and s2 == SleepStatic) or (s2 == SleepAsleep and s1 == SleepStatic):
+      return false
+    if a.incremental:
+      let p1 = a.bodyAwakePrev[w * a.awakeStride + b1]
+      let p2 = a.bodyAwakePrev[w * a.awakeStride + b2]
+      let skippedPass1 =
+        (p1 == SleepAsleep and p2 == SleepAsleep) or
+        (p1 == SleepAsleep and p2 == SleepStatic) or
+        (p2 == SleepAsleep and p1 == SleepStatic)
+      if not skippedPass1:
+        return false
+
+  if bpFilterPasses(a, w, geom1, geom2):
+    return true
+  a.nxnPairid[e * 2 + 1] >= 0
+
+proc bpCountWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr BroadphaseArgs](arg)
+  while true:
+    let w = claimTask()
+    if w >= a.nworld:
+      break
+    var cnt = 0'i32
+    if a.flags != nil:
+      let fBase = w * a.npairs
+      for e in 0 ..< a.npairs:
+        let geom1 = int(a.nxnPair[e * 2])
+        let geom2 = int(a.nxnPair[e * 2 + 1])
+        if bpPairPasses(a, w, geom1, geom2, e):
+          a.flags[fBase + e] = 1'u8
+          inc cnt
+        else:
+          a.flags[fBase + e] = 0'u8
+    else:
+      for e in 0 ..< a.npairs:
+        let geom1 = int(a.nxnPair[e * 2])
+        let geom2 = int(a.nxnPair[e * 2 + 1])
+        if bpPairPasses(a, w, geom1, geom2, e):
+          inc cnt
+    a.counts[w] = cnt
+
+proc bpFillWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr BroadphaseArgs](arg)
+  while true:
+    let w = claimTask()
+    if w >= a.nworld:
+      break
+    var cid = int(a.counts[w])
+    let fBase = w * a.npairs
+    for e in 0 ..< a.npairs:
+      let geom1 = int(a.nxnPair[e * 2])
+      let geom2 = int(a.nxnPair[e * 2 + 1])
+      if a.flags != nil:
+        if a.flags[fBase + e] == 0'u8:
+          continue
+      elif not bpPairPasses(a, w, geom1, geom2, e):
+        continue
+      if cid < a.naconmax:
+        let type1 = a.geomType[geom1]
+        let type2 = a.geomType[geom2]
+        let p = cid * 2
+        if type1 > type2:
+          a.collisionPair[p] = int32(geom2)
+          a.collisionPair[p + 1] = int32(geom1)
+        else:
+          a.collisionPair[p] = int32(geom1)
+          a.collisionPair[p + 1] = int32(geom2)
+        a.collisionPairid[p] = a.nxnPairid[e * 2]
+        a.collisionPairid[p + 1] = a.nxnPairid[e * 2 + 1]
+        a.collisionWorldid[cid] = int32(w)
+      inc cid
+
+proc nxnBroadphaseDense*(
+  nworld, npairs, naconmax, filter, ngeom: int,
+  rboundWorlds, marginWorlds, gapWorlds, dataidWorlds, aabbWorlds, awakeStride: int,
+  checkMesh, enableSleep, incremental: int,
+  geomType, geomBodyid, geomDataid: uint64,
+  geomAabb, geomRbound, geomMargin, geomGap, nxnPair, nxnPairid: uint64,
+  geomXpos, geomXmat, bodyAwake, bodyAwakePrev, ncollision: uint64,
+  collisionPair, collisionPairid, collisionWorldid: uint64,
+): void {.exportpy: "nxn_broadphase_dense".} =
+  if nworld <= 0:
+    return
+  var args = BroadphaseArgs(
+    nworld: nworld, npairs: npairs, naconmax: naconmax, filter: filter, ngeom: ngeom,
+    rboundWorlds: rboundWorlds, marginWorlds: marginWorlds, gapWorlds: gapWorlds,
+    dataidWorlds: dataidWorlds, aabbWorlds: aabbWorlds, awakeStride: awakeStride,
+    checkMesh: checkMesh != 0, enableSleep: enableSleep != 0, incremental: incremental != 0,
+    geomType: toPtr[int32](geomType), geomBodyid: toPtr[int32](geomBodyid), geomDataid: toPtr[int32](geomDataid),
+    geomAabb: toPtr[float32](geomAabb), geomRbound: toPtr[float32](geomRbound),
+    geomMargin: toPtr[float32](geomMargin), geomGap: toPtr[float32](geomGap),
+    nxnPair: toPtr[int32](nxnPair), nxnPairid: toPtr[int32](nxnPairid),
+    geomXpos: toPtr[float32](geomXpos), geomXmat: toPtr[float32](geomXmat),
+    bodyAwake: toPtr[int32](bodyAwake), bodyAwakePrev: toPtr[int32](bodyAwakePrev),
+    ncollision: toPtr[int32](ncollision), counts: nil, flags: nil,
+    collisionPair: toPtr[int32](collisionPair), collisionPairid: toPtr[int32](collisionPairid),
+    collisionWorldid: toPtr[int32](collisionWorldid),
+  )
+  var counts = newSeq[int32](nworld)
+  args.counts = cast[ptr UncheckedArray[int32]](addr counts[0])
+  var flags = newSeq[uint8]()
+  if nworld * npairs <= BpFlagsCap:
+    flags.setLen(nworld * npairs)
+    args.flags = cast[ptr UncheckedArray[uint8]](addr flags[0])
+  runJob(bpCountWorker, addr args, nworld)
+
+  # exclusive prefix over worlds, continuing from the caller's running count
+  let base = int(args.ncollision[0])
+  var running = base
+  for w in 0 ..< nworld:
+    let c = int(args.counts[w])
+    args.counts[w] = int32(running)
+    running += c
+  args.ncollision[0] = int32(running)
+
+  runJob(bpFillWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Contact-row setup (mirror of constraint._efc_contact_init / _efc_contact_update,
+# dense pyramidal path).  Contacts are emitted world-major, so the per-world
+# ranges come from one serial scan; the efcid allocation then stays sequential
+# within each world, matching the serial Warp ordering.
+
+func kbimp(disableflags: int32, timestep: float32,
+           solref: ptr UncheckedArray[float32], solrefOff: int,
+           solimp: ptr UncheckedArray[float32], solimpOff: int,
+           posImp: float32): (float32, float32, float32) {.inline.} =
+  var timeconst = solref[solrefOff]
+  let dampratio = solref[solrefOff + 1]
+  var dmin = solimp[solimpOff]
+  let dmax0 = solimp[solimpOff + 1]
+  let widthRaw = solimp[solimpOff + 2]
+  var mid = solimp[solimpOff + 3]
+  var power = solimp[solimpOff + 4]
+
+  if (disableflags and DisableRefsafe) == 0:
+    timeconst = max(timeconst, 2.0'f32 * timestep)
+
+  dmin = clamp(dmin, MjMinImp, MjMaxImp)
+  let dmax = clamp(dmax0, MjMinImp, MjMaxImp)
+  let width = max(MjMinVal, widthRaw)
+  mid = clamp(mid, MjMinImp, MjMaxImp)
+  power = max(1.0'f32, power)
+
+  let dmaxSq = dmax * dmax
+  var k: float32
+  if solref[solrefOff] <= 0.0'f32:
+    k = -solref[solrefOff] / max(MjMinVal, dmaxSq)
+  else:
+    k = 1.0'f32 / max(MjMinVal, dmaxSq * timeconst * timeconst * dampratio * dampratio)
+  var b: float32
+  if solref[solrefOff + 1] <= 0.0'f32:
+    b = -solref[solrefOff + 1] / max(MjMinVal, dmax)
+  else:
+    b = 2.0'f32 / max(MjMinVal, dmax * timeconst)
+
+  let impX = abs(posImp) / width
+  var imp: float32
+  if dmin == dmax or widthRaw <= MjMinVal:
+    imp = 0.5'f32 * (dmin + dmax)
+  elif impX <= 0.0'f32:
+    imp = dmin
+  elif impX >= 1.0'f32:
+    imp = dmax
+  elif power == 1.0'f32:
+    imp = dmin + impX * (dmax - dmin)
+  elif impX <= mid:
+    let impY = (1.0'f32 / pow(mid, power - 1.0'f32)) * pow(impX, power)
+    imp = clamp(dmin + impY * (dmax - dmin), dmin, dmax)
+  else:
+    let impY = 1.0'f32 - (1.0'f32 / pow(1.0'f32 - mid, power - 1.0'f32)) * pow(1.0'f32 - impX, power)
+    imp = clamp(dmin + impY * (dmax - dmin), dmin, dmax)
+  (k, b, imp)
+
+type
+  EfcContactInitArgs = object
+    nworld, nacon, njmax, nmaxdim: int
+    flgAdhesion: bool
+    contactType, contactDim, contactWorldid, contactGeom: ptr UncheckedArray[int32]
+    contactDist, contactIncludemargin, contactAdhesion: ptr UncheckedArray[float32]
+    nefc: ptr UncheckedArray[int32]
+    efcAddress: ptr UncheckedArray[int32]
+    efcId: ptr UncheckedArray[int32]
+    starts: ptr UncheckedArray[int32]
+
+proc efcContactInitWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr EfcContactInitArgs](arg)
+  while true:
+    let w = claimTask()
+    if w >= a.nworld:
+      break
+    let start = int(a.starts[w])
+    let stop = int(a.starts[w + 1])
+    if start >= stop:
+      continue
+    var base = int(a.nefc[w])
+    for conid in start ..< stop:
+      if (a.contactType[conid] and ContactConstraint) == 0:
+        continue
+      let condim = int(a.contactDim[conid])
+      let pos = a.contactDist[conid] - a.contactIncludemargin[conid]
+      let active =
+        if a.flgAdhesion: (pos < 0.0'f32) or (a.contactAdhesion[conid] != 0.0'f32)
+        else: pos < 0.0'f32
+      if not active:
+        continue
+      let ndim = if condim == 1: 1 else: 2 * (condim - 1)
+      let baseEfc = base
+      base += ndim
+      for dim in 0 ..< ndim:
+        let efcid = baseEfc + dim
+        if efcid >= a.njmax:
+          a.efcAddress[conid * a.nmaxdim + dim] = -1'i32
+        else:
+          a.efcAddress[conid * a.nmaxdim + dim] = int32(efcid)
+          a.efcId[w * a.njmax + efcid] = int32(conid)
+    a.nefc[w] = int32(base)
+
+proc efcContactInitDense*(
+  nworld, nacon, njmax, nmaxdim: int,
+  flgAdhesion: int,
+  contactType, contactDim, contactWorldid, contactGeom: uint64,
+  contactDist, contactIncludemargin, contactAdhesion: uint64,
+  nefc, efcAddress, efcId: uint64,
+): int {.exportpy: "efc_contact_init_dense".} =
+  ## Returns 0 on success, 1 when the contact list is not world-major ordered
+  ## (caller falls back to the Warp kernel).
+  if nworld <= 0:
+    return 1
+  var args = EfcContactInitArgs(
+    nworld: nworld, nacon: nacon, njmax: njmax, nmaxdim: nmaxdim,
+    flgAdhesion: flgAdhesion != 0,
+    contactType: toPtr[int32](contactType), contactDim: toPtr[int32](contactDim),
+    contactWorldid: toPtr[int32](contactWorldid), contactGeom: toPtr[int32](contactGeom),
+    contactDist: toPtr[float32](contactDist), contactIncludemargin: toPtr[float32](contactIncludemargin),
+    contactAdhesion: toPtr[float32](contactAdhesion),
+    nefc: toPtr[int32](nefc), efcAddress: toPtr[int32](efcAddress), efcId: toPtr[int32](efcId),
+    starts: nil,
+  )
+
+  var starts = newSeq[int32](nworld + 1)
+  var prev = -1'i32
+  for c in 0 ..< nacon:
+    let cw = args.contactWorldid[c]
+    if cw < prev or cw >= int32(nworld):
+      return 1
+    if cw != prev:
+      for w in (int(prev) + 1) .. int(cw):
+        starts[w] = int32(c)
+      prev = cw
+  for w in (int(prev) + 1) .. nworld:
+    starts[w] = int32(nacon)
+  args.starts = cast[ptr UncheckedArray[int32]](addr starts[0])
+
+  runJob(efcContactInitWorker, addr args, nworld)
+  0
+
+type
+  EfcContactUpdateArgs = object
+    nacon, njmax, nmaxdim: int
+    timestepWorlds, impratioWorlds, invweightWorlds, invweightStride: int
+    disableflags: int32
+    timestep, impratioInvsqrt: ptr UncheckedArray[float32]
+    bodyInvweight0: ptr UncheckedArray[float32]
+    geomBodyid: ptr UncheckedArray[int32]
+    contactDim, contactWorldid, contactGeom, contactType: ptr UncheckedArray[int32]
+    contactEfcAddress: ptr UncheckedArray[int32]
+    efcJqvel: ptr UncheckedArray[float32]
+    contactDist, contactIncludemargin, contactFriction: ptr UncheckedArray[float32]
+    contactSolref, contactSolimp: ptr UncheckedArray[float32]
+    efcType, efcId: ptr UncheckedArray[int32]
+    efcD, efcAref, efcVel, efcPos, efcMargin, efcFrictionloss: ptr UncheckedArray[float32]
+
+proc efcContactUpdateWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr EfcContactUpdateArgs](arg)
+  while true:
+    let chunk = claimTask()
+    let chunkStart = chunk * EfcUpdateChunk
+    if chunkStart >= a.nacon:
+      break
+    let chunkEnd = min(a.nacon, chunkStart + EfcUpdateChunk)
+    for conid in chunkStart ..< chunkEnd:
+      if (a.contactType[conid] and ContactConstraint) == 0:
+        continue
+
+      let condim = int(a.contactDim[conid])
+      let worldid = int(a.contactWorldid[conid])
+      let geom1 = int(a.contactGeom[conid * 2])
+      let geom2 = int(a.contactGeom[conid * 2 + 1])
+      let body1 = int(a.geomBodyid[geom1])
+      let body2 = int(a.geomBodyid[geom2])
+
+      let includemargin = a.contactIncludemargin[conid]
+      let pos = a.contactDist[conid] - includemargin
+
+      var invweight =
+        a.bodyInvweight0[(worldid mod a.invweightWorlds) * a.invweightStride + body1 * 2] +
+        a.bodyInvweight0[(worldid mod a.invweightWorlds) * a.invweightStride + body2 * 2]
+
+      if condim > 1:
+        let fri0 = a.contactFriction[conid * 5]
+        invweight = invweight + fri0 * fri0 * invweight
+        let impInv = a.impratioInvsqrt[worldid mod a.impratioWorlds]
+        invweight = invweight * 2.0'f32 * fri0 * fri0 * impInv * impInv
+
+      let efcType = if condim == 1: ConstraintContactFrictionless else: ConstraintContactPyramidal
+
+      let timestep = a.timestep[worldid mod a.timestepWorlds]
+      let (k, b, imp) = kbimp(
+        a.disableflags, timestep,
+        a.contactSolref, conid * 2, a.contactSolimp, conid * 5, pos)
+
+      let ndim = if condim == 1: 1 else: 2 * (condim - 1)
+      let efcOff = worldid * a.njmax
+      for dimid in 0 ..< min(ndim, a.nmaxdim):
+        let efcid = int(a.contactEfcAddress[conid * a.nmaxdim + dimid])
+        if efcid < 0:
+          continue
+        let Jqvel = a.efcJqvel[efcOff + efcid]
+
+        let D = 1.0'f32 / max(invweight * (1.0'f32 - imp) / imp, MjMinVal)
+        let aref = -k * imp * pos - b * Jqvel
+
+        a.efcD[efcOff + efcid] = D
+        a.efcAref[efcOff + efcid] = aref
+        a.efcVel[efcOff + efcid] = Jqvel
+        a.efcPos[efcOff + efcid] = pos + includemargin
+        a.efcMargin[efcOff + efcid] = includemargin
+        a.efcFrictionloss[efcOff + efcid] = 0.0'f32
+        a.efcType[efcOff + efcid] = efcType
+        a.efcId[efcOff + efcid] = int32(conid)
+
+proc efcContactUpdateDense*(
+  nacon, njmax, nmaxdim: int,
+  timestepWorlds, impratioWorlds, invweightWorlds, invweightStride: int,
+  disableflags: int,
+  timestep, impratioInvsqrt, bodyInvweight0, geomBodyid: uint64,
+  contactDim, contactWorldid, contactGeom, contactType: uint64,
+  contactEfcAddress, efcJqvel: uint64,
+  contactDist, contactIncludemargin, contactFriction, contactSolref, contactSolimp: uint64,
+  efcType, efcId: uint64,
+  efcD, efcAref, efcVel, efcPos, efcMargin, efcFrictionloss: uint64,
+): void {.exportpy: "efc_contact_update_dense".} =
+  var args = EfcContactUpdateArgs(
+    nacon: nacon, njmax: njmax, nmaxdim: nmaxdim,
+    timestepWorlds: timestepWorlds, impratioWorlds: impratioWorlds,
+    invweightWorlds: invweightWorlds, invweightStride: invweightStride,
+    disableflags: int32(disableflags),
+    timestep: toPtr[float32](timestep), impratioInvsqrt: toPtr[float32](impratioInvsqrt),
+    bodyInvweight0: toPtr[float32](bodyInvweight0), geomBodyid: toPtr[int32](geomBodyid),
+    contactDim: toPtr[int32](contactDim), contactWorldid: toPtr[int32](contactWorldid),
+    contactGeom: toPtr[int32](contactGeom), contactType: toPtr[int32](contactType),
+    contactEfcAddress: toPtr[int32](contactEfcAddress), efcJqvel: toPtr[float32](efcJqvel),
+    contactDist: toPtr[float32](contactDist), contactIncludemargin: toPtr[float32](contactIncludemargin),
+    contactFriction: toPtr[float32](contactFriction),
+    contactSolref: toPtr[float32](contactSolref), contactSolimp: toPtr[float32](contactSolimp),
+    efcType: toPtr[int32](efcType), efcId: toPtr[int32](efcId),
+    efcD: toPtr[float32](efcD), efcAref: toPtr[float32](efcAref), efcVel: toPtr[float32](efcVel),
+    efcPos: toPtr[float32](efcPos), efcMargin: toPtr[float32](efcMargin),
+    efcFrictionloss: toPtr[float32](efcFrictionloss),
+  )
+  runJob(efcContactUpdateWorker, addr args, nacon)
+
+# ------------------------------------------------------------------------------
+# Forward kinematics (mirror of smooth.kinematics): branch walk, body matrices,
+# inertial frames, geom and site local->global.  One job, four claim/barrier
+# phases, so the dependent stages stay fused without extra wakeups.
+
+type
+  KinematicsArgs = object
+    nworld, nbody, ngeom, nsite, nbranch, njnt: int
+    qpos0Worlds, qpos0Stride: int
+    bodyPosWorlds, bodyPosStride: int
+    bodyQuatWorlds, bodyQuatStride: int
+    jntPosWorlds, jntPosStride: int
+    jntAxisWorlds, jntAxisStride: int
+    bodyIposWorlds, bodyIposStride: int
+    bodyIquatWorlds, bodyIquatStride: int
+    geomPosWorlds, geomPosStride: int
+    geomQuatWorlds, geomQuatStride: int
+    sitePosWorlds, sitePosStride: int
+    siteQuatWorlds, siteQuatStride: int
+    nmocap: int
+    qpos0: ptr UncheckedArray[float32]
+    bodyParentid, bodyMocapid, bodyJntnum, bodyJntadr: ptr UncheckedArray[int32]
+    jntType, jntQposadr: ptr UncheckedArray[int32]
+    bodyBranches, bodyBranchStart: ptr UncheckedArray[int32]
+    bodyRootid, bodyWeldid: ptr UncheckedArray[int32]
+    geomBodyid, siteBodyid: ptr UncheckedArray[int32]
+    bodyPos, bodyQuat, jntPos, jntAxis, bodyIpos, bodyIquat: ptr UncheckedArray[float32]
+    geomPos, geomQuat, sitePos, siteQuat: ptr UncheckedArray[float32]
+    qpos, mocapPos, mocapQuat: ptr UncheckedArray[float32]
+    xpos, xquat, xanchor, xaxis, xmat, xipos, ximat: ptr UncheckedArray[float32]
+    geomXpos, geomXmat, siteXpos, siteXmat: ptr UncheckedArray[float32]
+
+func kgVec3(p: ptr UncheckedArray[float32], off: int): Vec3f {.inline.} =
+  Vec3f([p[off], p[off + 1], p[off + 2]])
+
+func kgQuat(p: ptr UncheckedArray[float32], off: int): Quatf {.inline.} =
+  Quatf([p[off], p[off + 1], p[off + 2], p[off + 3]])
+
+proc kinematicsWorldBranches(a: ptr KinematicsArgs, w: int) {.nimcall, gcsafe.} =
+  let qposOff = w * a.qpos0Stride
+
+  for branch in 0 ..< a.nbranch:
+    let start = int(a.bodyBranchStart[branch])
+    let stop = int(a.bodyBranchStart[branch + 1])
+
+    for i in start ..< stop:
+      let bodyid = int(a.bodyBranches[i])
+      let jntadr0 = int(a.bodyJntadr[bodyid])
+      let jntnum = int(a.bodyJntnum[bodyid])
+
+      if jntnum == 1 and a.jntType[jntadr0] == JointTypeFree:
+        let qadr = int(a.jntQposadr[jntadr0])
+        let xp = kgVec3(a.qpos, qposOff + qadr)
+        let xq = normQuat(kgQuat(a.qpos, qposOff + qadr + 3))
+        let xo = (w * a.nbody + bodyid) * 3
+        a.xpos[xo] = xp[0]
+        a.xpos[xo + 1] = xp[1]
+        a.xpos[xo + 2] = xp[2]
+        let qo = (w * a.nbody + bodyid) * 4
+        a.xquat[qo] = xq[0]
+        a.xquat[qo + 1] = xq[1]
+        a.xquat[qo + 2] = xq[2]
+        a.xquat[qo + 3] = xq[3]
+        let jo = (w * a.njnt + jntadr0) * 3
+        a.xanchor[jo] = xp[0]
+        a.xanchor[jo + 1] = xp[1]
+        a.xanchor[jo + 2] = xp[2]
+        let jnOff = (w mod a.jntAxisWorlds) * a.jntAxisStride + jntadr0 * 3
+        a.xaxis[jo] = a.jntAxis[jnOff]
+        a.xaxis[jo + 1] = a.jntAxis[jnOff + 1]
+        a.xaxis[jo + 2] = a.jntAxis[jnOff + 2]
+        continue
+
+      let pid = int(a.bodyParentid[bodyid])
+      let mocapid = int(a.bodyMocapid[bodyid])
+      var xp: Vec3f
+      var xq: Quatf
+      if mocapid >= 0:
+        xp = kgVec3(a.mocapPos, (w * a.nmocap + mocapid) * 3)
+        xq = kgQuat(a.mocapQuat, (w * a.nmocap + mocapid) * 4)
+      else:
+        xp = kgVec3(a.bodyPos, (w mod a.bodyPosWorlds) * a.bodyPosStride + bodyid * 3)
+        xq = kgQuat(a.bodyQuat, (w mod a.bodyQuatWorlds) * a.bodyQuatStride + bodyid * 4)
+
+      if pid >= 0:
+        let pOff = w * a.nbody + pid
+        let parentQ = kgQuat(a.xquat, pOff * 4)
+        let parentP = kgVec3(a.xpos, pOff * 3)
+        let rot = rotVecQuat(xp, parentQ)
+        xp = Vec3f([rot[0] + parentP[0], rot[1] + parentP[1], rot[2] + parentP[2]])
+        xq = mulQuat(parentQ, xq)
+
+      var jntadr = jntadr0
+      for _ in 0 ..< jntnum:
+        let qadr = int(a.jntQposadr[jntadr])
+        let jntType = a.jntType[jntadr]
+        let jnOff = (w mod a.jntAxisWorlds) * a.jntAxisStride + jntadr * 3
+        let jpOff = (w mod a.jntPosWorlds) * a.jntPosStride + jntadr * 3
+        let jntAxis = kgVec3(a.jntAxis, jnOff)
+        let jntPos = kgVec3(a.jntPos, jpOff)
+        let xanchor = vadd(rotVecQuat(jntPos, xq), xp)
+        let xaxis = rotVecQuat(jntAxis, xq)
+
+        if jntType == JointTypeBall:
+          let qloc = normQuat(kgQuat(a.qpos, qposOff + qadr))
+          xq = mulQuat(xq, qloc)
+          xp = vsub(xanchor, rotVecQuat(jntPos, xq))
+        elif jntType == JointTypeSlide:
+          let disp = a.qpos[qposOff + qadr] - a.qpos0[(w mod a.qpos0Worlds) * a.qpos0Stride + qadr]
+          xp = Vec3f([xp[0] + xaxis[0] * disp, xp[1] + xaxis[1] * disp, xp[2] + xaxis[2] * disp])
+        elif jntType == JointTypeHinge:
+          let q0 = a.qpos0[(w mod a.qpos0Worlds) * a.qpos0Stride + qadr]
+          let qloc = axisAngleToQuat(jntAxis, a.qpos[qposOff + qadr] - q0)
+          xq = mulQuat(xq, qloc)
+          xp = vsub(xanchor, rotVecQuat(jntPos, xq))
+
+        let jxOff = (w * a.njnt + jntadr) * 3
+        a.xanchor[jxOff] = xanchor[0]
+        a.xanchor[jxOff + 1] = xanchor[1]
+        a.xanchor[jxOff + 2] = xanchor[2]
+        a.xaxis[jxOff] = xaxis[0]
+        a.xaxis[jxOff + 1] = xaxis[1]
+        a.xaxis[jxOff + 2] = xaxis[2]
+        inc jntadr
+
+      xq = normQuat(xq)
+      let xo = (w * a.nbody + bodyid) * 3
+      a.xpos[xo] = xp[0]
+      a.xpos[xo + 1] = xp[1]
+      a.xpos[xo + 2] = xp[2]
+      let qo = (w * a.nbody + bodyid) * 4
+      a.xquat[qo] = xq[0]
+      a.xquat[qo + 1] = xq[1]
+      a.xquat[qo + 2] = xq[2]
+      a.xquat[qo + 3] = xq[3]
+
+proc kinematicsWorldBodies(a: ptr KinematicsArgs, w: int) {.nimcall, gcsafe.} =
+  for bodyid in 0 ..< a.nbody:
+    let q = kgQuat(a.xquat, (w * a.nbody + bodyid) * 4)
+    let p = kgVec3(a.xpos, (w * a.nbody + bodyid) * 3)
+    let m = quatToMat(q)
+    let mo = (w * a.nbody + bodyid) * 9
+    for i in 0 ..< 9:
+      a.xmat[mo + i] = m[i]
+    let ipos = kgVec3(a.bodyIpos, (w mod a.bodyIposWorlds) * a.bodyIposStride + bodyid * 3)
+    let iquat = kgQuat(a.bodyIquat, (w mod a.bodyIquatWorlds) * a.bodyIquatStride + bodyid * 4)
+    let xi = vadd(rotVecQuat(ipos, q), p)
+    let xio = (w * a.nbody + bodyid) * 3
+    a.xipos[xio] = xi[0]
+    a.xipos[xio + 1] = xi[1]
+    a.xipos[xio + 2] = xi[2]
+    let im = quatToMat(mulQuat(q, iquat))
+    let imo = (w * a.nbody + bodyid) * 9
+    for i in 0 ..< 9:
+      a.ximat[imo + i] = im[i]
+
+proc kinematicsWorldGeoms(a: ptr KinematicsArgs, w: int) {.nimcall, gcsafe.} =
+  for geomid in 0 ..< a.ngeom:
+    let bodyid = int(a.geomBodyid[geomid])
+    if a.bodyWeldid[bodyid] == 0 and a.bodyMocapid[int(a.bodyRootid[bodyid])] == -1:
+      continue
+    let xq = kgQuat(a.xquat, (w * a.nbody + bodyid) * 4)
+    let xp = kgVec3(a.xpos, (w * a.nbody + bodyid) * 3)
+    let gpos = kgVec3(a.geomPos, (w mod a.geomPosWorlds) * a.geomPosStride + geomid * 3)
+    let gquat = kgQuat(a.geomQuat, (w mod a.geomQuatWorlds) * a.geomQuatStride + geomid * 4)
+    let gp = vadd(rotVecQuat(gpos, xq), xp)
+    let go = (w * a.ngeom + geomid) * 3
+    a.geomXpos[go] = gp[0]
+    a.geomXpos[go + 1] = gp[1]
+    a.geomXpos[go + 2] = gp[2]
+    let gm = quatToMat(mulQuat(xq, gquat))
+    let gmo = (w * a.ngeom + geomid) * 9
+    for i in 0 ..< 9:
+      a.geomXmat[gmo + i] = gm[i]
+
+proc kinematicsWorldSites(a: ptr KinematicsArgs, w: int) {.nimcall, gcsafe.} =
+  for siteid in 0 ..< a.nsite:
+    let bodyid = int(a.siteBodyid[siteid])
+    let xq = kgQuat(a.xquat, (w * a.nbody + bodyid) * 4)
+    let xp = kgVec3(a.xpos, (w * a.nbody + bodyid) * 3)
+    let spos = kgVec3(a.sitePos, (w mod a.sitePosWorlds) * a.sitePosStride + siteid * 3)
+    let squat = kgQuat(a.siteQuat, (w mod a.siteQuatWorlds) * a.siteQuatStride + siteid * 4)
+    let sp = vadd(rotVecQuat(spos, xq), xp)
+    let so = (w * a.nsite + siteid) * 3
+    a.siteXpos[so] = sp[0]
+    a.siteXpos[so + 1] = sp[1]
+    a.siteXpos[so + 2] = sp[2]
+    let sm = quatToMat(mulQuat(xq, squat))
+    let smo = (w * a.nsite + siteid) * 9
+    for i in 0 ..< 9:
+      a.siteXmat[smo + i] = sm[i]
+
+proc kinematicsWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr KinematicsArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      kinematicsWorldBranches(a, w)
+      kinematicsWorldBodies(a, w)
+      kinematicsWorldGeoms(a, w)
+      kinematicsWorldSites(a, w)
+
+proc kinematicsDense*(
+  nworld, nbody, ngeom, nsite, nbranch, njnt, nmocap: int,
+  qpos0Worlds, qpos0Stride: int,
+  bodyPosWorlds, bodyPosStride, bodyQuatWorlds, bodyQuatStride: int,
+  jntPosWorlds, jntPosStride, jntAxisWorlds, jntAxisStride: int,
+  bodyIposWorlds, bodyIposStride, bodyIquatWorlds, bodyIquatStride: int,
+  geomPosWorlds, geomPosStride, geomQuatWorlds, geomQuatStride: int,
+  sitePosWorlds, sitePosStride, siteQuatWorlds, siteQuatStride: int,
+  qpos0: uint64,
+  bodyParentid, bodyMocapid, bodyJntnum, bodyJntadr, jntType, jntQposadr: uint64,
+  bodyBranches, bodyBranchStart, bodyRootid, bodyWeldid, geomBodyid, siteBodyid: uint64,
+  bodyPos, bodyQuat, jntPos, jntAxis, bodyIpos, bodyIquat: uint64,
+  geomPos, geomQuat, sitePos, siteQuat: uint64,
+  qpos, mocapPos, mocapQuat: uint64,
+  xpos, xquat, xanchor, xaxis, xmat, xipos, ximat: uint64,
+  geomXpos, geomXmat, siteXpos, siteXmat: uint64,
+): void {.exportpy: "kinematics_dense".} =
+  var args = KinematicsArgs(
+    nworld: nworld, nbody: nbody, ngeom: ngeom, nsite: nsite, nbranch: nbranch, njnt: njnt,
+    qpos0Worlds: qpos0Worlds, qpos0Stride: qpos0Stride,
+    bodyPosWorlds: bodyPosWorlds, bodyPosStride: bodyPosStride,
+    bodyQuatWorlds: bodyQuatWorlds, bodyQuatStride: bodyQuatStride,
+    jntPosWorlds: jntPosWorlds, jntPosStride: jntPosStride,
+    jntAxisWorlds: jntAxisWorlds, jntAxisStride: jntAxisStride,
+    bodyIposWorlds: bodyIposWorlds, bodyIposStride: bodyIposStride,
+    bodyIquatWorlds: bodyIquatWorlds, bodyIquatStride: bodyIquatStride,
+    geomPosWorlds: geomPosWorlds, geomPosStride: geomPosStride,
+    geomQuatWorlds: geomQuatWorlds, geomQuatStride: geomQuatStride,
+    sitePosWorlds: sitePosWorlds, sitePosStride: sitePosStride,
+    siteQuatWorlds: siteQuatWorlds, siteQuatStride: siteQuatStride,
+    nmocap: nmocap,
+    qpos0: toPtr[float32](qpos0),
+    bodyParentid: toPtr[int32](bodyParentid), bodyMocapid: toPtr[int32](bodyMocapid),
+    bodyJntnum: toPtr[int32](bodyJntnum), bodyJntadr: toPtr[int32](bodyJntadr),
+    jntType: toPtr[int32](jntType), jntQposadr: toPtr[int32](jntQposadr),
+    bodyBranches: toPtr[int32](bodyBranches), bodyBranchStart: toPtr[int32](bodyBranchStart),
+    bodyRootid: toPtr[int32](bodyRootid), bodyWeldid: toPtr[int32](bodyWeldid),
+    geomBodyid: toPtr[int32](geomBodyid), siteBodyid: toPtr[int32](siteBodyid),
+    bodyPos: toPtr[float32](bodyPos), bodyQuat: toPtr[float32](bodyQuat),
+    jntPos: toPtr[float32](jntPos), jntAxis: toPtr[float32](jntAxis),
+    bodyIpos: toPtr[float32](bodyIpos), bodyIquat: toPtr[float32](bodyIquat),
+    geomPos: toPtr[float32](geomPos), geomQuat: toPtr[float32](geomQuat),
+    sitePos: toPtr[float32](sitePos), siteQuat: toPtr[float32](siteQuat),
+    qpos: toPtr[float32](qpos), mocapPos: toPtr[float32](mocapPos), mocapQuat: toPtr[float32](mocapQuat),
+    xpos: toPtr[float32](xpos), xquat: toPtr[float32](xquat), xanchor: toPtr[float32](xanchor),
+    xaxis: toPtr[float32](xaxis), xmat: toPtr[float32](xmat), xipos: toPtr[float32](xipos),
+    ximat: toPtr[float32](ximat), geomXpos: toPtr[float32](geomXpos), geomXmat: toPtr[float32](geomXmat),
+    siteXpos: toPtr[float32](siteXpos), siteXmat: toPtr[float32](siteXmat),
+  )
+  runJob(kinematicsWorker, addr args, nworld * (nbranch + nbody + ngeom + nsite))
+
+# ------------------------------------------------------------------------------
+# Subtree CoM, composite inertia, dof axes and body velocities (mirror of
+# smooth.com_pos / _cinert / _cdof / com_vel).  Body ids are topologically
+# ordered, so the tree accumulation runs per world with no cross-thread writes.
+
+type
+  ComPosArgs = object
+    nworld, nbody, njnt, nlevels: int
+    massWorlds, massStride: int
+    inertiaWorlds, inertiaStride: int
+    subtreemassWorlds, subtreemassStride: int
+    xiposStride, ximatStride, comStride, xmatStride, xanchorStride, xaxisStride: int
+    cinertStride, cdofStride: int
+    bodyParentid, bodyRootid, jntType, jntDofadr, jntBodyid: ptr UncheckedArray[int32]
+    bodyTree: ptr UncheckedArray[int32]
+    treeOffsets: ptr UncheckedArray[int32]
+    bodyMass, bodyInertia, bodySubtreemass: ptr UncheckedArray[float32]
+    xipos, ximat, subtreeCom, xmat, xanchor, xaxis: ptr UncheckedArray[float32]
+    cinert, cdof: ptr UncheckedArray[float32]
+
+proc comPosWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr ComPosArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let comOff = w * a.comStride
+      let xiOff = w * a.xiposStride
+      let mOff = (w mod a.massWorlds) * a.massStride
+      let smOff = (w mod a.subtreemassWorlds) * a.subtreemassStride
+
+      # subtree_com: mass-weighted xipos, accumulated up the tree, then normalized
+      for b in 0 ..< a.nbody:
+        let mass = a.bodyMass[mOff + b]
+        for c in 0 ..< 3:
+          a.subtreeCom[comOff + b * 3 + c] = a.xipos[xiOff + b * 3 + c] * mass
+
+      for level in countdown(a.nlevels - 1, 0):
+        for idx in int(a.treeOffsets[level]) ..< int(a.treeOffsets[level + 1]):
+          let b = int(a.bodyTree[idx])
+          if b == 0:
+            continue
+          let p = int(a.bodyParentid[b])
+          for c in 0 ..< 3:
+            a.subtreeCom[comOff + p * 3 + c] += a.subtreeCom[comOff + b * 3 + c]
+
+      for b in 0 ..< a.nbody:
+        let mass = a.bodySubtreemass[smOff + b]
+        if mass != 0.0'f32:
+          for c in 0 ..< 3:
+            a.subtreeCom[comOff + b * 3 + c] /= mass
+
+      # composite inertia in the subtree CoM frame
+      for b in 0 ..< a.nbody:
+        let iOff = (w mod a.inertiaWorlds) * a.inertiaStride + b * 3
+        let memOff = w * a.ximatStride + b * 9
+        let m0 = a.ximat[memOff]
+        let m1 = a.ximat[memOff + 1]
+        let m2 = a.ximat[memOff + 2]
+        let m3 = a.ximat[memOff + 3]
+        let m4 = a.ximat[memOff + 4]
+        let m5 = a.ximat[memOff + 5]
+        let m6 = a.ximat[memOff + 6]
+        let m7 = a.ximat[memOff + 7]
+        let m8 = a.ximat[memOff + 8]
+        let d0 = a.bodyInertia[iOff]
+        let d1 = a.bodyInertia[iOff + 1]
+        let d2 = a.bodyInertia[iOff + 2]
+        let mass = a.bodyMass[mOff + b]
+        let root = int(a.bodyRootid[b])
+        let dif0 = a.xipos[xiOff + b * 3] - a.subtreeCom[comOff + root * 3]
+        let dif1 = a.xipos[xiOff + b * 3 + 1] - a.subtreeCom[comOff + root * 3 + 1]
+        let dif2 = a.xipos[xiOff + b * 3 + 2] - a.subtreeCom[comOff + root * 3 + 2]
+
+        # tmp = mat * diag(inert) * mat^T, mat row-major: M[i][k] = mem[i * 3 + k]
+        var res: array[10, float32]
+        res[0] = m0 * d0 * m0 + m1 * d1 * m1 + m2 * d2 * m2
+        res[1] = m3 * d0 * m3 + m4 * d1 * m4 + m5 * d2 * m5
+        res[2] = m6 * d0 * m6 + m7 * d1 * m7 + m8 * d2 * m8
+        res[3] = m0 * d0 * m3 + m1 * d1 * m4 + m2 * d2 * m5
+        res[4] = m0 * d0 * m6 + m1 * d1 * m7 + m2 * d2 * m8
+        res[5] = m3 * d0 * m6 + m4 * d1 * m7 + m5 * d2 * m8
+        res[0] += mass * (dif1 * dif1 + dif2 * dif2)
+        res[1] += mass * (dif0 * dif0 + dif2 * dif2)
+        res[2] += mass * (dif0 * dif0 + dif1 * dif1)
+        res[3] -= mass * dif0 * dif1
+        res[4] -= mass * dif0 * dif2
+        res[5] -= mass * dif1 * dif2
+        res[6] = mass * dif0
+        res[7] = mass * dif1
+        res[8] = mass * dif2
+        res[9] = mass
+        let ciOff = w * a.cinertStride + b * 10
+        for c in 0 ..< 10:
+          a.cinert[ciOff + c] = res[c]
+
+      # dof axes in the subtree CoM frame
+      for j in 0 ..< a.njnt:
+        let bodyid = int(a.jntBodyid[j])
+        let dofid = int(a.jntDofadr[j])
+        let axisOff = w * a.xaxisStride + j * 3
+        let xax0 = a.xaxis[axisOff]
+        let xax1 = a.xaxis[axisOff + 1]
+        let xax2 = a.xaxis[axisOff + 2]
+        let memOff = w * a.xmatStride + bodyid * 9
+        # xmat = transpose(xmat_in): row i of the body rotation lives at mem[i], mem[i+3], mem[i+6]
+        let row0 = [a.xmat[memOff], a.xmat[memOff + 3], a.xmat[memOff + 6]]
+        let row1 = [a.xmat[memOff + 1], a.xmat[memOff + 4], a.xmat[memOff + 7]]
+        let row2 = [a.xmat[memOff + 2], a.xmat[memOff + 5], a.xmat[memOff + 8]]
+        let root = int(a.bodyRootid[bodyid])
+        let ancOff = w * a.xanchorStride + j * 3
+        let off0 = a.subtreeCom[comOff + root * 3] - a.xanchor[ancOff]
+        let off1 = a.subtreeCom[comOff + root * 3 + 1] - a.xanchor[ancOff + 1]
+        let off2 = a.subtreeCom[comOff + root * 3 + 2] - a.xanchor[ancOff + 2]
+        let cdo = w * a.cdofStride + dofid * 6
+        let jntType = a.jntType[j]
+        if jntType == JointTypeFree:
+          for i in 0 ..< 3:
+            let base = cdo + i * 6
+            for c in 0 ..< 6:
+              a.cdof[base + c] = 0.0'f32
+            a.cdof[base + 3 + i] = 1.0'f32
+          for i in 0 ..< 3:
+            let row = if i == 0: row0 elif i == 1: row1 else: row2
+            let base = cdo + (3 + i) * 6
+            a.cdof[base] = row[0]
+            a.cdof[base + 1] = row[1]
+            a.cdof[base + 2] = row[2]
+            a.cdof[base + 3] = row[1] * off2 - row[2] * off1
+            a.cdof[base + 4] = row[2] * off0 - row[0] * off2
+            a.cdof[base + 5] = row[0] * off1 - row[1] * off0
+        elif jntType == JointTypeBall:
+          for i in 0 ..< 3:
+            let row = if i == 0: row0 elif i == 1: row1 else: row2
+            let base = cdo + i * 6
+            a.cdof[base] = row[0]
+            a.cdof[base + 1] = row[1]
+            a.cdof[base + 2] = row[2]
+            a.cdof[base + 3] = row[1] * off2 - row[2] * off1
+            a.cdof[base + 4] = row[2] * off0 - row[0] * off2
+            a.cdof[base + 5] = row[0] * off1 - row[1] * off0
+        elif jntType == JointTypeSlide:
+          a.cdof[cdo] = 0.0'f32
+          a.cdof[cdo + 1] = 0.0'f32
+          a.cdof[cdo + 2] = 0.0'f32
+          a.cdof[cdo + 3] = xax0
+          a.cdof[cdo + 4] = xax1
+          a.cdof[cdo + 5] = xax2
+        else:  # hinge
+          a.cdof[cdo] = xax0
+          a.cdof[cdo + 1] = xax1
+          a.cdof[cdo + 2] = xax2
+          a.cdof[cdo + 3] = xax1 * off2 - xax2 * off1
+          a.cdof[cdo + 4] = xax2 * off0 - xax0 * off2
+          a.cdof[cdo + 5] = xax0 * off1 - xax1 * off0
+
+proc smoothComPosDense*(
+  nworld, nbody, njnt, nlevels: int,
+  massWorlds, massStride, inertiaWorlds, inertiaStride, subtreemassWorlds, subtreemassStride: int,
+  xiposStride, ximatStride, comStride, xmatStride, xanchorStride, xaxisStride, cinertStride, cdofStride: int,
+  bodyParentid, bodyRootid, jntType, jntDofadr, jntBodyid, bodyTree, treeOffsets: uint64,
+  bodyMass, bodyInertia, bodySubtreemass: uint64,
+  xipos, ximat, subtreeCom, xmat, xanchor, xaxis, cinert, cdof: uint64,
+): void {.exportpy: "smooth_com_pos_dense".} =
+  var args = ComPosArgs(
+    nworld: nworld, nbody: nbody, njnt: njnt, nlevels: nlevels,
+    massWorlds: massWorlds, massStride: massStride,
+    inertiaWorlds: inertiaWorlds, inertiaStride: inertiaStride,
+    subtreemassWorlds: subtreemassWorlds, subtreemassStride: subtreemassStride,
+    xiposStride: xiposStride, ximatStride: ximatStride, comStride: comStride,
+    xmatStride: xmatStride, xanchorStride: xanchorStride, xaxisStride: xaxisStride,
+    cinertStride: cinertStride, cdofStride: cdofStride,
+    bodyParentid: toPtr[int32](bodyParentid), bodyRootid: toPtr[int32](bodyRootid),
+    jntType: toPtr[int32](jntType), jntDofadr: toPtr[int32](jntDofadr), jntBodyid: toPtr[int32](jntBodyid),
+    bodyTree: toPtr[int32](bodyTree), treeOffsets: toPtr[int32](treeOffsets),
+    bodyMass: toPtr[float32](bodyMass), bodyInertia: toPtr[float32](bodyInertia),
+    bodySubtreemass: toPtr[float32](bodySubtreemass),
+    xipos: toPtr[float32](xipos), ximat: toPtr[float32](ximat), subtreeCom: toPtr[float32](subtreeCom),
+    xmat: toPtr[float32](xmat), xanchor: toPtr[float32](xanchor), xaxis: toPtr[float32](xaxis),
+    cinert: toPtr[float32](cinert), cdof: toPtr[float32](cdof),
+  )
+  runJob(comPosWorker, addr args, nworld)
+
+# Body spatial velocities and cdof time derivatives.
+
+type
+  ComVelArgs = object
+    nworld, nbranch: int
+    qvelStride, cdofStride, cvelStride, cdofDotStride: int
+    bodyParentid, bodyJntnum, bodyJntadr, bodyDofadr, jntType: ptr UncheckedArray[int32]
+    bodyBranches, bodyBranchStart: ptr UncheckedArray[int32]
+    qvel, cdof, cvel, cdofDot: ptr UncheckedArray[float32]
+
+func mcross(u: array[6, float32], v: array[6, float32]): array[6, float32] {.inline.} =
+  array[6, float32]([
+    u[1] * v[2] - u[2] * v[1],
+    u[2] * v[0] - u[0] * v[2],
+    u[0] * v[1] - u[1] * v[0],
+    u[4] * v[2] - u[5] * v[1] + (u[1] * v[5] - u[2] * v[4]),
+    u[5] * v[0] - u[3] * v[2] + (u[2] * v[3] - u[0] * v[5]),
+    u[3] * v[1] - u[4] * v[0] + (u[0] * v[4] - u[1] * v[3]),
+  ])
+
+proc comVelWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr ComVelArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let cvOff = w * a.cvelStride
+      let cdOff = w * a.cdofStride
+      let cddOff = w * a.cdofDotStride
+      let qvOff = w * a.qvelStride
+      for c in 0 ..< 6:
+        a.cvel[cvOff + c] = 0.0'f32
+
+      for branch in 0 ..< a.nbranch:
+        for i in int(a.bodyBranchStart[branch]) ..< int(a.bodyBranchStart[branch + 1]):
+          let bodyid = int(a.bodyBranches[i])
+          let pid = int(a.bodyParentid[bodyid])
+          var cv: array[6, float32]
+          for c in 0 ..< 6:
+            cv[c] = a.cvel[cvOff + pid * 6 + c]
+          var dofid = int(a.bodyDofadr[bodyid])
+          let jntid = int(a.bodyJntadr[bodyid])
+          let jntnum = int(a.bodyJntnum[bodyid])
+          if jntnum == 0:
+            for c in 0 ..< 6:
+              a.cvel[cvOff + bodyid * 6 + c] = cv[c]
+            continue
+
+          for j in jntid ..< jntid + jntnum:
+            let jntType = a.jntType[j]
+            if jntType == JointTypeFree:
+              for k in 0 ..< 3:
+                let q = a.qvel[qvOff + dofid + k]
+                for c in 0 ..< 6:
+                  cv[c] += a.cdof[cdOff + (dofid + k) * 6 + c] * q
+              for c in 0 ..< 6:
+                a.cdofDot[cddOff + dofid * 6 + c] = 0.0'f32
+                a.cdofDot[cddOff + (dofid + 1) * 6 + c] = 0.0'f32
+                a.cdofDot[cddOff + (dofid + 2) * 6 + c] = 0.0'f32
+              for k in 3 ..< 6:
+                var cdo: array[6, float32]
+                for c in 0 ..< 6:
+                  cdo[c] = a.cdof[cdOff + (dofid + k) * 6 + c]
+                let res = mcross(cv, cdo)
+                for c in 0 ..< 6:
+                  a.cdofDot[cddOff + (dofid + k) * 6 + c] = res[c]
+              for k in 3 ..< 6:
+                let q = a.qvel[qvOff + dofid + k]
+                for c in 0 ..< 6:
+                  cv[c] += a.cdof[cdOff + (dofid + k) * 6 + c] * q
+              dofid += 6
+            elif jntType == JointTypeBall:
+              for k in 0 ..< 3:
+                var cdo: array[6, float32]
+                for c in 0 ..< 6:
+                  cdo[c] = a.cdof[cdOff + (dofid + k) * 6 + c]
+                let res = mcross(cv, cdo)
+                for c in 0 ..< 6:
+                  a.cdofDot[cddOff + (dofid + k) * 6 + c] = res[c]
+              for k in 0 ..< 3:
+                let q = a.qvel[qvOff + dofid + k]
+                for c in 0 ..< 6:
+                  cv[c] += a.cdof[cdOff + (dofid + k) * 6 + c] * q
+              dofid += 3
+            else:
+              var cdo: array[6, float32]
+              for c in 0 ..< 6:
+                cdo[c] = a.cdof[cdOff + dofid * 6 + c]
+              let res = mcross(cv, cdo)
+              for c in 0 ..< 6:
+                a.cdofDot[cddOff + dofid * 6 + c] = res[c]
+              let q = a.qvel[qvOff + dofid]
+              for c in 0 ..< 6:
+                cv[c] += cdo[c] * q
+              dofid += 1
+
+          for c in 0 ..< 6:
+            a.cvel[cvOff + bodyid * 6 + c] = cv[c]
+
+proc smoothComVelDense*(
+  nworld, nbranch: int,
+  qvelStride, cdofStride, cvelStride, cdofDotStride: int,
+  bodyParentid, bodyJntnum, bodyJntadr, bodyDofadr, jntType, bodyBranches, bodyBranchStart: uint64,
+  qvel, cdof, cvel, cdofDot: uint64,
+): void {.exportpy: "smooth_com_vel_dense".} =
+  var args = ComVelArgs(
+    nworld: nworld, nbranch: nbranch,
+    qvelStride: qvelStride, cdofStride: cdofStride, cvelStride: cvelStride, cdofDotStride: cdofDotStride,
+    bodyParentid: toPtr[int32](bodyParentid), bodyJntnum: toPtr[int32](bodyJntnum),
+    bodyJntadr: toPtr[int32](bodyJntadr), bodyDofadr: toPtr[int32](bodyDofadr), jntType: toPtr[int32](jntType),
+    bodyBranches: toPtr[int32](bodyBranches), bodyBranchStart: toPtr[int32](bodyBranchStart),
+    qvel: toPtr[float32](qvel), cdof: toPtr[float32](cdof), cvel: toPtr[float32](cvel),
+    cdofDot: toPtr[float32](cdofDot),
+  )
+  runJob(comVelWorker, addr args, nworld)

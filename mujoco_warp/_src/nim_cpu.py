@@ -64,6 +64,17 @@ def is_contiguous(a) -> bool:
   return True
 
 
+def layout(a) -> tuple[int, int]:
+  """(leading-dim count, row stride in 4-byte scalars) for a contiguous warp table.
+
+  Vector and matrix types are counted per component, so a row of vec3 entries is three
+  scalars wide.  Scalars and 1D tables report (1, len).
+  """
+  if a.ndim < 2:
+    return (1, int(a.shape[0]))
+  return (int(a.shape[0]), int(a.strides[0]) // 4)
+
+
 def get_ops():
   """Return the compiled Nim ops module, or None when unavailable."""
   global _OPS, _TRIED
