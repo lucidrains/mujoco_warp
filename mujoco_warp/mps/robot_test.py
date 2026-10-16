@@ -685,3 +685,104 @@ def test_unconstrained_fast_path(coop: bool):
   np.testing.assert_allclose(qm, d.qpos.numpy(), rtol=1e-5, atol=1e-6)
   np.testing.assert_allclose(vm, d.qvel.numpy(), rtol=1e-5, atol=1e-6)
 
+
+
+@pytest.mark.parametrize("eulerdamp", [False, True])
+def test_packed_m_parity(eulerdamp: bool):
+  """Dense and packed mass-matrix routes agree bitwise on M and keep trajectories in step.
+
+  The packed route stores one ancestor chain per dof (`dof_pad`) and applies it
+  through the chain plus its transpose, so the matvec accumulation order - and
+  only that - differs from the dense block.  `eulerdamp` flips the scene's
+  integrator flag so both factor-solve sites (Newton and implicit damping) run.
+  """
+  scene = "mujoco_warp/test_data/humanoid/humanoid.xml"
+  with open(scene) as f:
+    mjm = mujoco.MjModel.from_xml_string(f.read())
+  if eulerdamp:
+    mjm.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+  else:
+    mjm.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+
+  nworld = 4
+  rng = np.random.default_rng(7)
+  qpos = np.tile(np.array(mjm.qpos0, np.float32), (nworld, 1))
+  qpos[:, :3] += rng.normal(0, 0.005, (nworld, 3)).astype(np.float32)
+  qvel = rng.normal(0, 0.02, (nworld, mjm.nv)).astype(np.float32)
+  ctrl = rng.uniform(-0.3, 0.3, (nworld, mjm.nu)).astype(np.float32)
+
+  dense = BatchedEngine(mjm, nworld=nworld, coop=False, m_layout="dense")
+  packed = BatchedEngine(mjm, nworld=nworld, coop=False, m_layout="packed")
+  assert dense.packed_m is False and packed.packed_m is True
+  for eng in (dense, packed):
+    eng.set_state(qpos, qvel, ctrl)
+
+  dense.step()
+  packed.step()
+  np.testing.assert_array_equal(dense.dense_M(), packed.dense_M())
+
+  for _ in range(50):
+    dense.step()
+    packed.step()
+  qd, vd = dense.get_state()
+  qp, vp = packed.get_state()
+  assert np.isfinite(qp).all() and np.isfinite(vp).all()
+  np.testing.assert_allclose(qp, qd, rtol=0, atol=1e-5)
+  np.testing.assert_allclose(vp, vd, rtol=0, atol=2e-4)
+
+
+def test_packed_m_env_switch(monkeypatch):
+  """`MUJOCO_WARP_MPS_M=packed` selects the packed layout; the constructor argument wins."""
+  mjm = mujoco.MjModel.from_xml_path("mujoco_warp/test_data/humanoid/humanoid.xml")
+  monkeypatch.setenv("MUJOCO_WARP_MPS_M", "packed")
+  eng = BatchedEngine(mjm, nworld=4, coop=False)
+  assert eng.m_layout == "packed"
+  eng_dense = BatchedEngine(mjm, nworld=4, coop=False, m_layout="dense")
+  assert eng_dense.m_layout == "dense"
+  # cooperative solves keep the dense block (per-lane M path, chains save little)
+  coop = BatchedEngine(mjm, nworld=4, coop=True)
+  assert coop.m_layout == "dense"
+
+
+def test_coop_v2_parity():
+  """The balanced (v2) cooperative solve is bit-exact with the row-owned v1 solve.
+
+  v2 replaces the factor's divergent row-owned updates with a flat trailing
+  triangle and the rebuild's full-width row scan with a support-pair walk; both
+  keep each element's accumulation order, so trajectories must match bitwise.
+  """
+  mjm = mujoco.MjModel.from_xml_path("mujoco_warp/test_data/humanoid/humanoid.xml")
+  nworld = 4
+  rng = np.random.default_rng(3)
+  qpos = np.tile(np.array(mjm.qpos0, np.float32), (nworld, 1))
+  qpos[:, :3] += rng.normal(0, 0.005, (nworld, 3)).astype(np.float32)
+  qvel = rng.normal(0, 0.02, (nworld, mjm.nv)).astype(np.float32)
+  ctrl = rng.uniform(-0.3, 0.3, (nworld, mjm.nu)).astype(np.float32)
+
+  v1 = BatchedEngine(mjm, nworld=nworld, coop_solver="v1")
+  v2 = BatchedEngine(mjm, nworld=nworld, coop_solver="v2")
+  assert v1.coop and v2.coop
+  assert v1.coop_solver == "v1" and v2.coop_solver == "v2"
+  # v2 keeps dense rows but needs the per-row meta table
+  assert v2.packed is False and v2.want_jmeta is True
+  for eng in (v1, v2):
+    eng.set_state(qpos, qvel, ctrl)
+
+  for _ in range(50):
+    v1.step()
+    v2.step()
+  q1, u1 = v1.get_state()
+  q2, u2 = v2.get_state()
+  assert np.isfinite(q2).all() and np.isfinite(u2).all()
+  np.testing.assert_array_equal(q1, q2)
+  np.testing.assert_array_equal(u1, u2)
+
+
+def test_coop_v2_env_switch(monkeypatch):
+  """`MUJOCO_WARP_MPS_COOP=v2` selects the balanced solve; it is inert off the coop path."""
+  mjm = mujoco.MjModel.from_xml_path("mujoco_warp/test_data/humanoid/humanoid.xml")
+  monkeypatch.setenv("MUJOCO_WARP_MPS_COOP", "v2")
+  coop = BatchedEngine(mjm, nworld=4)
+  assert coop.coop and coop.coop_solver == "v2"
+  solo = BatchedEngine(mjm, nworld=4, coop=False)
+  assert not solo.coop and solo.coop_solver == "v1"

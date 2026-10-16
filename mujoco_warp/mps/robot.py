@@ -15,9 +15,12 @@ Everything else raises at construction (`Rig`).
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 
+from .fused import coop_v2_body
 from .fused import dyn_source
 from .fused import solve_source
 from .fused import solve_source_coop
@@ -128,6 +131,9 @@ _INT_TABLES = [
   "pair_body2",
   "pair_ndim",
   "dof_anc",
+  "rev_dof",
+  "tri_pairs",
+  "tri_full",
   "flag_buf",
   "mesh_graph",
   "mesh_polymapadr",
@@ -223,6 +229,8 @@ class BatchedEngine:
     coop: bool = True,
     threadgroup: int = 32,
     coop_max_worlds: int = 2048,
+    m_layout: str | None = None,
+    coop_solver: str | None = None,
   ):
     """Builds kernels and static buffers for `nworld` worlds of `mjm`.
 
@@ -233,6 +241,20 @@ class BatchedEngine:
     throughput. The one-thread path stores constraint rows packed by their true
     support (`self.packed`, with `self.jmeta` holding each row's row kind) and
     the cooperative path stores dense `nv`-wide rows.
+
+    `m_layout` selects the mass-matrix storage consumed by the solve kernel:
+    `"dense"` (the original `nv x nv` block) or `"packed"` (one ancestor chain
+    per dof, applied by walking `dof_pad` plus its transpose `rev_dof`). The
+    packed layout rides the one-thread-per-world solve, so requesting it with
+    `coop` active (nworld <= coop_max_worlds) keeps the dense block.
+    Defaults to `$MUJOCO_WARP_MPS_M` (`dense` when unset).
+
+    `coop_solver` selects the cooperative solve variant (ignored when `coop` is
+    off): `"v1"` (default) is the row-owned Cholesky with a full-width row scan in
+    the rebuild; `"v2"` walks the trailing triangle and the rebuild's support
+    pairs as flat lists so every lane shares the same iteration count (bit-exact
+    with v1, ~1.04-1.25x faster at 64-2048 worlds on the humanoid). Requires
+    `threadgroup=32`. Defaults to `$MUJOCO_WARP_MPS_COOP` (`v1` when unset).
     """
     if threadgroup < 1 or (threadgroup & (threadgroup - 1)) != 0:
       raise ValueError(f"threadgroup must be a power of two, got {threadgroup}")
@@ -248,21 +270,19 @@ class BatchedEngine:
     self.iterations = int(iterations if iterations is not None else rig.iterations)
     self.warmstart = bool(warmstart and rig.warmstart)
 
-    # ---- dof ancestor chains for the mass matrix
-    nv = rig.nv
-    chains = []
-    for i in range(nv):
-      c = [i]
-      j = int(rig.dof_parentid[i])
-      while j >= 0:
-        c.append(j)
-        j = int(rig.dof_parentid[j])
-      chains.append(c)
-    maxlen = max(len(c) for c in chains)
-    pad = np.full((nv, maxlen), -1, dtype=np.int32)
-    for i, c in enumerate(chains):
-      pad[i, : len(c)] = np.asarray(c, np.int32)
-    self.dof_pad = np.ascontiguousarray(pad, np.int32)
+    # ---- mass-matrix layout: "dense" (nv x nv block) or "packed" (per-dof
+    # ancestor chain, `NCH` floats per dof, applied via dof_pad/rev_dof)
+    if m_layout is None:
+      m_layout = os.environ.get("MUJOCO_WARP_MPS_M", "dense")
+    m_layout = str(m_layout).lower()
+    if m_layout not in ("dense", "packed"):
+      raise ValueError(f"m_layout must be 'dense' or 'packed', got {m_layout!r}")
+    self.m_layout = m_layout
+    self.packed_m = m_layout == "packed"
+
+    # ---- dof ancestor chains for the mass matrix (rig builds dof_pad/rev_dof)
+    maxlen = rig.dof_nch
+    self.dof_pad = rig.dof_pad
 
     # ---- static friction rows (D and b are world-independent)
     fr_dofs = np.asarray(rig.friction_dofs, np.int32)
@@ -295,6 +315,8 @@ class BatchedEngine:
       MS=rig.maxsup,
       SDFPTS=rig.sdf_initpoints,
       SDFIT=rig.sdf_iterations,
+      NCH=rig.dof_nch,
+      RCH=rig.dof_nrev,
     )
     self._t_solve = dict(
       NJNT=rig.njnt,
@@ -307,6 +329,8 @@ class BatchedEngine:
       WARMSTART=1 if self.warmstart else 0,
       EULERDAMP=1 if rig.eulerdamp else 0,
       TG=threadgroup,
+      NCH=rig.dof_nch,
+      RCH=rig.dof_nrev,
     )
 
     # ---- packed static tables
@@ -387,6 +411,9 @@ class BatchedEngine:
       "pair_body2": rig.pair_body2,
       "pair_ndim": rig.pair_ndim,
       "dof_anc": rig.body_isdofancestor,
+      "rev_dof": rig.rev_dof,
+      "tri_pairs": rig.tri_pairs,
+      "tri_full": rig.tri_full,
       "flag_buf": np.array([rig.broadphase_filter], np.int32),
       "mesh_graph": rig.mesh_graph,
       "mesh_polymapadr": rig.mesh_polymapadr,
@@ -432,8 +459,35 @@ class BatchedEngine:
     # keeps dense rows (its lane-strided loops dislike per-entry dof gathers)
     packed = not self.coop
     self.packed = packed
-    base_outs = _DYN_BASE_OUTS if packed else _DYN_BASE_OUTS_DENSE
-    src, hdr = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=False, adr_s=self.adr_s, packed=packed)
+    # the packed mass-matrix layout rides the single-thread solve (its M path is
+    # per-lane in the cooperative solve, where chains save little); requesting it
+    # with `coop` active keeps the dense block
+    self.packed_m = bool(self.packed_m and not self.coop)
+    self.m_layout = "packed" if self.packed_m else "dense"
+    # cooperative solve variant: "v1" (row-owned factor) or "v2" (balanced
+    # flat-triangle factor); only meaningful when `coop` is active
+    if coop_solver is None:
+      coop_solver = os.environ.get("MUJOCO_WARP_MPS_COOP", "v1")
+    coop_solver = str(coop_solver).lower()
+    if coop_solver not in ("v1", "v2"):
+      raise ValueError(f"coop_solver must be 'v1' or 'v2', got {coop_solver!r}")
+    if coop_solver == "v2" and threadgroup != 32:
+      raise ValueError(f"coop_solver='v2' requires threadgroup=32, got {threadgroup}")
+    self.coop_solver = coop_solver if self.coop else "v1"
+    # coop-v2 walks support pairs, so it consumes the per-row meta table; the row
+    # storage itself stays dense (v1 dense-row loops elsewhere are unchanged)
+    self.want_jmeta = packed or self.coop_solver == "v2"
+    base_outs = _DYN_BASE_OUTS if self.want_jmeta else _DYN_BASE_OUTS_DENSE
+    src, hdr = dyn_source(
+      self._t_dyn,
+      self.adr_f,
+      self.adr_i,
+      kin=False,
+      adr_s=self.adr_s,
+      packed=packed,
+      packed_m=self.packed_m,
+      jmeta=self.want_jmeta,
+    )
     self.dyn_fn = mx.fast.metal_kernel(
       name="mps_dyn",
       input_names=_DYN_INPUTS,
@@ -441,7 +495,16 @@ class BatchedEngine:
       source=src,
       header=hdr,
     )
-    src_ik, hdr_ik = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=True, adr_s=self.adr_s, packed=packed)
+    src_ik, hdr_ik = dyn_source(
+      self._t_dyn,
+      self.adr_f,
+      self.adr_i,
+      kin=True,
+      adr_s=self.adr_s,
+      packed=packed,
+      packed_m=self.packed_m,
+      jmeta=self.want_jmeta,
+    )
     self.dyn_kin_fn = mx.fast.metal_kernel(
       name="mps_dyn_kin",
       input_names=_DYN_INPUTS,
@@ -460,18 +523,29 @@ class BatchedEngine:
         "jnt_dofadr",
         "sup_dofs",
         "sup_num",
+        "dof_pad",
+        "rev_dof",
       )
     }
-    src_s, hdr_s = solve_source(self._t_solve, _solve_adr)
+    src_s, hdr_s = solve_source(self._t_solve, _solve_adr, packed_m=self.packed_m)
     if self.coop:
       src_s, hdr_s = solve_source_coop(
         self._t_solve,
         {k: self.adr_i[k] for k in ("jnt_type", "jnt_qposadr", "jnt_dofadr")},
         tg=self.threadgroup,
       )
+      if self.coop_solver == "v2":
+        src_s = coop_v2_body(
+          src_s,
+          self.nv,
+          self.threadgroup,
+          self.rowcap,
+          self.rig.maxsup,
+          {k: self.adr_i[k] for k in ("tri_pairs", "tri_full", "sup_dofs", "sup_num")},
+        )
     self.solve_fn = mx.fast.metal_kernel(
       name="mps_solve",
-      input_names=_SOLVE_INPUTS if packed else _SOLVE_INPUTS_DENSE,
+      input_names=_SOLVE_INPUTS if self.want_jmeta else _SOLVE_INPUTS_DENSE,
       output_names=_SOLVE_OUTS,
       source=src_s,
       header=hdr_s,
@@ -546,6 +620,22 @@ class BatchedEngine:
     mx.eval(self.qpos, self.qvel)
     return np.array(self.qpos), np.array(self.qvel)
 
+  def dense_M(self) -> np.ndarray:
+    """NumPy (nworld, nv, nv) mass matrix; reconstructed when `m_layout='packed'`."""
+    mx.eval(self.M)
+    if not self.packed_m:
+      return np.array(self.M)  # (nw, nv, nv)
+    M = np.array(self.M).reshape(self.nworld, self.nv, self.rig.dof_nch)
+    out = np.zeros((self.nworld, self.nv, self.nv), np.float32)
+    for i in range(self.nv):
+      for c in range(self.rig.dof_nch):
+        j = int(self.rig.dof_pad[i, c])
+        if j < 0:
+          break
+        out[:, i, j] = M[:, i, c]
+        out[:, j, i] = M[:, i, c]
+    return out
+
   def dense_J(self) -> np.ndarray:
     """NumPy (nworld, rowcap, nv) Jacobian (force-evaluates the pending graph)."""
     mx.eval(self.J)
@@ -575,15 +665,15 @@ class BatchedEngine:
     nw = self.nworld
     fn = self.dyn_kin_fn if kin else self.dyn_fn
     # packed rows add a `jmeta` output after J holding each row's kind
-    jmeta_shapes = [(nw, self.rowcap)] if self.packed else []
-    jmeta_dtypes = [mx.int32] if self.packed else []
+    jmeta_shapes = [(nw, self.rowcap)] if self.want_jmeta else []
+    jmeta_dtypes = [mx.int32] if self.want_jmeta else []
     dyn_out = fn(
       inputs=[self.qpos, self.qvel, self.ctrl, self._nw_buf, self.mbf, self.mif, self.mbs],
       template=self._dyn_template,
       grid=(nw, 1, 1),
       threadgroup=(32, 1, 1),
       output_shapes=[
-        (nw, self.nv, self.nv),
+        (nw, self.nv * self.rig.dof_nch) if self.packed_m else (nw, self.nv, self.nv),
         (nw, self.nv),
         (nw, self.nv),
         (nw, self.rowcap, self.rig.maxsup if self.packed else self.nv),
@@ -615,8 +705,8 @@ class BatchedEngine:
       + ([F] * 9 + [mx.int32] if kin else []),
     )
     self.M, self.smooth, self.qfrc_bias, self.J = dyn_out[:4]
-    tail = 5 if self.packed else 4
-    if self.packed:
+    tail = 5 if self.want_jmeta else 4
+    if self.want_jmeta:
       self.jmeta = dyn_out[4]
     (self.D, self.aref, self.fl, self.nefc, self.ncon, self.overflow) = dyn_out[tail : tail + 6]
     tail += 6
@@ -659,7 +749,7 @@ class BatchedEngine:
         self.mif,
         self._solve_opt,
       ]
-      + ([self.jmeta] if self.packed else []),
+      + ([self.jmeta] if self.want_jmeta else []),
       template=self._solve_template,
       grid=(nw * self.threadgroup if self.coop else nw, 1, 1),
       threadgroup=(self.threadgroup if self.coop else 32, 1, 1),

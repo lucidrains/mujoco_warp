@@ -14,6 +14,8 @@ Optionally emits per-stage intermediates (``kin=True``) for validation.
 
 from __future__ import annotations
 
+import re
+
 MJ_MINVAL = 1e-15
 
 _MSL_HELPERS = r"""
@@ -454,7 +456,16 @@ static inline float g_halton(int index, int base) {
 
 
 # --------------------------------------------------------------------- K1 dyn+rows
-def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool = False, adr_s: dict[str, int] | None = None, packed: bool = True) -> tuple[str, str]:
+def dyn_source(
+  t: dict,
+  adr_f: dict[str, int],
+  adr_i: dict[str, int],
+  kin: bool = False,
+  adr_s: dict[str, int] | None = None,
+  packed: bool = True,
+  packed_m: bool = False,
+  jmeta: bool = False,
+) -> tuple[str, str]:
   """Returns (source, header) for the K1 dyn kernel (source is the kernel body).
 
   Templates: NBODY NJNT NQ NV NGEOM NCHAIN NU NP RC NFR NLIM BF MBS MS.
@@ -465,6 +476,10 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   body_mass, actuator gains, pair friction, ...) can differ per world - that is
   what per-world ramps/terrain and per-world domain randomization ride on.
   `kin=True` adds intermediates for validation (cdof, subtree_com, geom poses).
+  `packed_m=True` streams the mass matrix as one chain of entries per dof
+  (`NV * NCHAIN` floats) instead of the dense `NV * NV` block.  `jmeta=True`
+  emits the per-row meta table on the dense row layout (the cooperative v2
+  solve walks support pairs while reading dense rows).
   """
   NB, NJ, NQ, NV = t["NBODY"], t["NJNT"], t["NQ"], t["NV"]
   NGE, NCH, NU = t["NGEOM"], t["NCHAIN"], t["NU"]
@@ -473,6 +488,47 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   MS = t["MS"]
   MBS = t["MBS"]
   SDFPTS, SDFIT = t["SDFPTS"], t["SDFIT"]
+
+  # mass matrix stream: dense `NV * NV` block, or one ancestor chain per dof
+  m_build = (
+    f"""  // ==================================================== mass matrix (packed by dof chain)
+  // M is a tree matrix: row i holds only its ancestor chain (dof_pad), self first
+  device float* Mw = M_out + ((long)w) * {NV} * {NCH};
+  for (int i = 0; i < {NV}; ++i) {{
+    int b = dof_bodyid[i];
+    thread float buf[6];
+    g_inert_vec(&crb[b * 10], &cdof[i * 6], buf);
+    for (int c = 0; c < {NCH}; ++c) {{
+      int j = dof_pad[i * {NCH} + c];
+      if (j < 0) break;
+      float val = 0.0f;
+      for (int s = 0; s < 6; ++s) val += cdof[j * 6 + s] * buf[s];
+      if (j == i) val += dof_armature[i];
+      Mw[i * {NCH} + c] = val;
+    }}
+  }}"""
+    if packed_m
+    else f"""  // ==================================================== mass matrix (streamed to M_out)
+  device float* Mw = M_out + ((long)w) * {NV} * {NV};
+  for (int i = 0; i < {NV} * {NV}; ++i) Mw[i] = 0.0f;
+  for (int i = 0; i < {NV}; ++i) {{
+    int b = dof_bodyid[i];
+    thread float buf[6];
+    g_inert_vec(&crb[b * 10], &cdof[i * 6], buf);
+    for (int c = 0; c < {NCH}; ++c) {{
+      int j = dof_pad[i * {NCH} + c];
+      if (j < 0) break;
+      float val = 0.0f;
+      for (int s = 0; s < 6; ++s) val += cdof[j * 6 + s] * buf[s];
+      if (j == i) {{
+        Mw[i * {NV} + i] = val + dof_armature[i];
+      }} else {{
+        Mw[i * {NV} + j] = val;
+        Mw[j * {NV} + i] = val;
+      }}
+    }}
+  }}"""
+  )
 
   kin_geom = (
     f"""
@@ -530,15 +586,19 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   )
 
   # row storage: `packed` writes only the support entries (Jw[r * MS + k], dof
-  # sup_dofs[meta * MS + k], meta = jmetaw[r]); else dense nv-wide rows for coop
+  # sup_dofs[meta * MS + k], meta = jmetaw[r]); else dense nv-wide rows for coop.
+  # `jmeta` emits the per-row meta table independently of the row storage (coop-v2
+  # walks support pairs while reading dense rows).
+  emit_jmeta = packed or jmeta
+  jmeta_ptr = f"\n  device int* jmetaw = jmeta_out + ((long)w) * {RC};" if emit_jmeta else ""
+  jmeta_fr = "    jmetaw[rowidx] = k;\n" if emit_jmeta else ""
+  jmeta_lim = f"    jmetaw[rowidx] = {NFR} + k;\n" if emit_jmeta else ""
+  jmeta_pt = f"        jmetaw[rowidx + dim] = {NFR} + {NLIM} + p;\n" if emit_jmeta else ""
   if packed:
-    jptr = (
-      f"  device float* Jw = J_out + ((long)w) * {RC} * {MS};\n"
-      f"  device int* jmetaw = jmeta_out + ((long)w) * {RC};"
-    )
-    fr_write = f"    jmetaw[rowidx] = k;\n    Jw[rowidx * {MS} + 0] = 1.0f;"
-    lim_write = f"    jmetaw[rowidx] = {NFR} + k;\n    Jw[rowidx * {MS} + 0] = sgn;"
-    pt_meta = f"        jmetaw[rowidx + dim] = {NFR} + {NLIM} + p;\n        flw[rowidx + dim] = 0.0f;"
+    jptr = f"  device float* Jw = J_out + ((long)w) * {RC} * {MS};{jmeta_ptr}"
+    fr_write = f"{jmeta_fr}    Jw[rowidx * {MS} + 0] = 1.0f;"
+    lim_write = f"{jmeta_lim}    Jw[rowidx * {MS} + 0] = sgn;"
+    pt_meta = f"{jmeta_pt}        flw[rowidx + dim] = 0.0f;"
     pt_open = "      int kk = 0;\n"
     pt_val = f"          Jw[(rowidx + dim) * {MS} + kk] = val;"
     pt_close = "        kk += 1;\n"
@@ -548,10 +608,14 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       "  // below the support's length (sup_num / jmeta give the row's dof list)"
     )
   else:
-    jptr = f"  device float* Jw = J_out + ((long)w) * {RC} * {NV};"
-    fr_write = f"    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = 1.0f;"
-    lim_write = f"    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = sgn;"
-    pt_meta = f"        for (int d = 0; d < {NV}; ++d) Jw[(rowidx + dim) * {NV} + d] = 0.0f;\n        flw[rowidx + dim] = 0.0f;"
+    jptr = f"  device float* Jw = J_out + ((long)w) * {RC} * {NV};{jmeta_ptr}"
+    fr_write = (
+      f"{jmeta_fr}    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = 1.0f;"
+    )
+    lim_write = (
+      f"{jmeta_lim}    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = sgn;"
+    )
+    pt_meta = f"{jmeta_pt}        for (int d = 0; d < {NV}; ++d) Jw[(rowidx + dim) * {NV} + d] = 0.0f;\n        flw[rowidx + dim] = 0.0f;"
     pt_open = ""
     pt_val = f"          Jw[(rowidx + dim) * {NV} + dof] = val;"
     pt_close = ""
@@ -949,26 +1013,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     bias_out[w * {NV} + d] = s;
   }}
 
-  // ==================================================== mass matrix (streamed to M_out)
-  device float* Mw = M_out + ((long)w) * {NV} * {NV};
-  for (int i = 0; i < {NV} * {NV}; ++i) Mw[i] = 0.0f;
-  for (int i = 0; i < {NV}; ++i) {{
-    int b = dof_bodyid[i];
-    thread float buf[6];
-    g_inert_vec(&crb[b * 10], &cdof[i * 6], buf);
-    for (int c = 0; c < {NCH}; ++c) {{
-      int j = dof_pad[i * {NCH} + c];
-      if (j < 0) break;
-      float val = 0.0f;
-      for (int s = 0; s < 6; ++s) val += cdof[j * 6 + s] * buf[s];
-      if (j == i) {{
-        Mw[i * {NV} + i] = val + dof_armature[i];
-      }} else {{
-        Mw[i * {NV} + j] = val;
-        Mw[j * {NV} + i] = val;
-      }}
-    }}
-  }}
+{m_build}
 
   // ==================================================== qfrc_smooth = -bias+passive+actuation
   thread float smoothf[{NV}];
@@ -1496,13 +1541,54 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
 
 
 # --------------------------------------------------------------------- K2 solve+integrate
-def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str]:
-  """K2 source. Templates: NJNT NQ NV RC MS ITER LSITER WARMSTART EULERDAMP."""
+def solve_source(t: dict, adr_i: dict[str, int] | None = None, packed_m: bool = False) -> tuple[str, str]:
+  """K2 source. Templates: NJNT NQ NV RC MS ITER LSITER WARMSTART EULERDAMP NCH RCH.
+
+  `packed_m=True` consumes the ancestor-chain mass matrix (`NV * NCH` floats,
+  `dof_pad`/`rev_dof` index tables) and applies it by walking the chain plus its
+  transpose instead of a dense `NV * NV` block.
+  """
   NJ, NQ, NV = t["NJNT"], t["NQ"], t["NV"]
   RC, ITER, LSITER = t["RC"], t["ITER"], t["LSITER"]
   MS = t["MS"]
   WS = t["WARMSTART"]
   ED = t["EULERDAMP"]
+  NCH, RCH = t["NCH"], t["RCH"]
+
+  # packed-M fragments (the dense path keeps the original inline code verbatim)
+  m_load = (
+    f"""
+  // packed mass matrix: row i holds its ancestor chain (dof_pad), self first
+  thread float M[{NV} * {NCH}];
+  for (int i = 0; i < {NV} * {NCH}; ++i) M[i] = M_in[w * {NV} * {NCH} + i];
+"""
+    if packed_m
+    else f"""
+  thread float M[{NV} * {NV}];
+  for (int i = 0; i < {NV} * {NV}; ++i) M[i] = M_in[w * {NV} * {NV} + i];
+"""
+  )
+
+  def _matvec(vec: str, out: str, ind: str) -> str:
+    """`out = M * vec` in the packed layout: row chain, then its transpose."""
+    return (
+      f"{ind}for (int i = 0; i < {NV}; ++i) {{\n"
+      + f"{ind}  float ss = 0.0f;\n"
+      + f"{ind}  for (int c = 0; c < {NCH}; ++c) {{ int j = dof_pad[i * {NCH} + c]; if (j < 0) break; ss += M[i * {NCH} + c] * {vec}[j]; }}\n"
+      + f"{ind}  for (int t = 0; t < {RCH}; ++t) {{ int e = rev_dof[i * {RCH} + t]; if (e < 0) break; ss += M[(e >> 8) * {NCH} + (e & 255)] * {vec}[e >> 8]; }}\n"
+      + f"{ind}  {out}[i] = ss;\n"
+      + f"{ind}}}\n"
+    )
+
+  def _h_init_flat(ind: str) -> str:
+    """`h = M` packed, statement-per-line form (used outside the REBUILD macro)."""
+    return (
+      f"{ind}for (int i = 0; i < {NV}; ++i) for (int j = 0; j <= i; ++j) h[i * {NV} + j] = 0.0f;\n"
+      + f"{ind}for (int i = 0; i < {NV}; ++i) {{\n"
+      + f"{ind}  for (int c = 0; c < {NCH}; ++c) {{ int j = dof_pad[i * {NCH} + c]; if (j < 0) break; h[i * {NV} + j] = M[i * {NCH} + c]; }}\n"
+      + f"{ind}}}\n"
+    )
+
   body = f"""
   int w = (int)thread_position_in_grid.x;
   if (w >= nworld_buf[0]) return;
@@ -1511,10 +1597,7 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
   const float tol = opt_buf[1];
   const float meaninertia = opt_buf[2];
   const float ls_tol = opt_buf[3];
-
-  thread float M[{NV} * {NV}];
-  for (int i = 0; i < {NV} * {NV}; ++i) M[i] = M_in[w * {NV} * {NV} + i];
-
+{m_load}
   thread float smooth[{NV}];
   for (int i = 0; i < {NV}; ++i) smooth[i] = smooth_in[w * {NV} + i];
   int nefc = nefc_in[w];
@@ -1873,12 +1956,168 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
   }}
   niter_out[w] = nit;
 """
+  if packed_m:
+    body = _pack_m_body(body, NV, NCH, RCH, _matvec, _h_init_flat)
   for name, off in sorted((adr_i or {}).items(), key=lambda x: -len(x[0])):
     body = body.replace(f"{name}[", f"mif[{off} + ")
   return body, _MSL_HELPERS
 
 
+def _pack_m_body(body: str, nv: int, nch: int, rch: int, matvec, h_init_flat) -> str:
+  """Rewrites the solo solve's dense-M idioms into chain-packed form.
+
+  The dense kernel reads `M[i * nv + j]` for the full square; the packed kernel
+  stores `M[i * nch + c]` (chain `dof_pad`) and walks the transpose (`rev_dof`)
+  for the descendant half of each matvec.  Arithmetic order per output element
+  changes only in the matvecs (documented; parity validated numerically).
+  """
+  subs = []
+
+  # h = M (whole-matrix copy sites: nefc == 0 branch, warmstart-else, euler damping)
+  # anchored on the leading newline so the 4-space pattern cannot match inside the
+  # 6-space lines; every occurrence must be rewritten (each has its own h init)
+  subs.append(
+    (
+      f"\n    for (int i = 0; i < {nv} * {nv}; ++i) h[i] = M[i];",
+      "\n" + h_init_flat("    ").rstrip("\n"),
+    )
+  )
+  subs.append(
+    (
+      f"\n      for (int i = 0; i < {nv} * {nv}; ++i) h[i] = M[i];",
+      "\n" + h_init_flat("      ").rstrip("\n"),
+    )
+  )
+  # REBUILD_LH init (macro continuation lines end with a backslash)
+  subs.append(
+    (
+      f"      for (int i = 0; i < {nv}; ++i) \\\n        for (int j = 0; j <= i; ++j) h[i * {nv} + j] = M[i * {nv} + j]; \\\n",
+      f"      for (int i = 0; i < {nv}; ++i) \\\n"
+      f"        for (int j = 0; j <= i; ++j) h[i * {nv} + j] = 0.0f; \\\n"
+      f"      for (int i = 0; i < {nv}; ++i) {{ \\\n"
+      f"        for (int c = 0; c < {nch}; ++c) {{ int j = dof_pad[i * {nch} + c]; if (j < 0) break; h[i * {nv} + j] = M[i * {nch} + c]; }} \\\n"
+      f"      }} \\\n",
+    )
+  )
+  # matvecs: Ma = M acc, mv = M search, Ma2 = M acc (euler damping)
+  subs.append(
+    (
+      f"    for (int i = 0; i < {nv}; ++i) {{\n"
+      f"      float ss = 0.0f;\n"
+      f"      for (int j = 0; j < {nv}; ++j) ss += M[i * {nv} + j] * acc[j];\n"
+      f"      Ma[i] = ss;\n"
+      f"    }}\n",
+      matvec("acc", "Ma", "    "),
+    )
+  )
+  subs.append(
+    (
+      f"      for (int i = 0; i < {nv}; ++i) {{\n"
+      f"        float sss = 0.0f;\n"
+      f"        for (int j = 0; j < {nv}; ++j) sss += M[i * {nv} + j] * search[j];\n"
+      f"        mv[i] = sss;\n"
+      f"      }}\n",
+      matvec("search", "mv", "      "),
+    )
+  )
+  subs.append(
+    (
+      f"      float Ma2[{nv}];\n"
+      f"      for (int i = 0; i < {nv}; ++i) {{\n"
+      f"        float sss = 0.0f;\n"
+      f"        for (int j = 0; j < {nv}; ++j) sss += M[i * {nv} + j] * acc[j];\n"
+      f"        Ma2[i] = sss;\n"
+      f"      }}\n",
+      f"      float Ma2[{nv}];\n" + matvec("acc", "Ma2", "      "),
+    )
+  )
+  for old, new in subs:
+    assert old in body, f"packed-M rewrite missed a fragment:\n{old}"
+    body = body.replace(old, new)
+  # every dense-M read must be gone (the chain form uses M[i * nch + c])
+  assert f"M[i * {nv} + j]" not in body, "packed-M rewrite left a dense M read"
+  assert "h[i] = M[i]" not in body, "packed-M rewrite left a dense M copy"
+  return body
+
+
 # --------------------------------------------------------------------- K2 cooperative
+def coop_v2_body(src: str, nv: int, tg: int, rc: int, ms: int, off: dict[str, int]) -> str:
+  """Rewrites the cooperative solve into the balanced (coop-v2) form.
+
+  * factor: the v1 factorization is row-owned - for column k, lane i updates its
+    own row's trailing entries, so the warp issues `max_i(i - k)` divergent
+    iterations and the last row (i = nv - 1) dominates the critical path.  v2
+    walks the trailing triangle as a flat pair list (`tri_pairs`), so every lane
+    handles the same ceil(count / TG) iterations with all lanes active; each
+    element still receives its column-k update once, in ascending k order, so
+    the arithmetic is unchanged.
+  * rebuild: v1 loops the full `nv`-wide rows (each lane owns one matrix row and
+    scans all `nv` columns, including the zeros outside the row's support); v2
+    walks the support pairs (`tri_full` over `sup_dofs`) with all lanes sharing
+    the work, reading the row's dense values at the support dofs only.
+
+  `off` carries the packed int-table offsets (tri_pairs, tri_full, sup_dofs,
+  sup_num); the caller passes them because the rendered source has already
+  substituted table names to `mif` offsets.
+  """
+  assert tg == 32, "coop-v2 assumes a 32-lane threadgroup"
+  pat = re.compile(r"(#define PAR_CHOL\(A\) \\\n  \{ \\\n    if \(" + str(tg) + r" == 32\) \{ \\\n).*?(\n    \} else \{ \\)", re.S)
+  m = pat.search(src)
+  assert m, "coop-v2: PAR_CHOL 32-lane branch not found"
+  tri_off = off["tri_pairs"]
+  body = (
+    f"      for (int k = 0; k < {nv}; ++k) {{ \\\n"
+    f"        float dk_loc = (lane == (k & 31)) ? metal::sqrt(metal::max((A)[k * {nv} + k], 1e-30f)) : 0.0f; \\\n"
+    f"        float dk = metal::simd_broadcast(dk_loc, (ushort)(k & 31)); \\\n"
+    f"        if (lane == (k & 31)) (A)[k * {nv} + k] = dk; \\\n"
+    f"        for (int i = k + 1 + lane; i < {nv}; i += 32) (A)[i * {nv} + k] /= dk; \\\n"
+    f"        threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    f"        const int _m = {nv} - k; \\\n"
+    f"        const int _npair = (_m - 1) * _m / 2; \\\n"
+    f"        for (int t = lane; t < _npair; t += 32) {{ \\\n"
+    f"          int _ii = mif[{tri_off} + 2 * t]; \\\n"
+    f"          int _jj = mif[{tri_off} + 2 * t + 1]; \\\n"
+    f"          (A)[(k + _ii) * {nv} + (k + _jj)] -= (A)[(k + _ii) * {nv} + k] * (A)[(k + _jj) * {nv} + k]; \\\n"
+    f"        }} \\\n"
+    f"      }} \\\n"
+    f"      threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+  )
+  out = src[: m.end(1)] + body + src[m.start(2) + 1 :]
+  # a blank line inside a backslash-continued macro terminates it early
+  start = out.index("#define PAR_CHOL")
+  end = out.index("    } else { \\", start)
+  assert "\n\n" not in out[start:end], "coop-v2: blank line inside the PAR_CHOL macro"
+
+  # ---- support-pair Hessian rebuild
+  pat_re = re.compile(r"(#define REBUILD_LH\(\) \\\n).*?(\n    \}\n)", re.S)
+  m = pat_re.search(out)
+  assert m, "coop-v2: REBUILD_LH macro not found"
+  tf, sd, sn = off["tri_full"], off["sup_dofs"], off["sup_num"]
+  rebuild = (
+    f"    {{ \\\n"
+    f"      for (int i = lane; i < {nv}; i += {tg}) \\\n"
+    f"        for (int j = 0; j <= i; ++j) sh_h[i * {nv} + j] = sh_M[i * {nv} + j]; \\\n"
+    f"      for (int r = 0; r < nefc; ++r) {{ \\\n"
+    f"        float dqr = sh_squad[r] * sh_Dd[r]; \\\n"
+    f"        if (dqr == 0.0f) continue; \\\n"
+    f"        int _meta = jmeta_in[w * {rc} + r]; \\\n"
+    f"        int _num = mif[{sn} + _meta]; \\\n"
+    f"        int _base = _meta * {ms}; \\\n"
+    f"        const long _jb = ((long)w * {rc} + r) * {nv}; \\\n"
+    f"        const int _np = _num * (_num + 1) / 2; \\\n"
+    f"        for (int t = lane; t < _np; t += {tg}) {{ \\\n"
+    f"          int _da = mif[{sd} + _base + mif[{tf} + 2 * t]]; \\\n"
+    f"          int _db = mif[{sd} + _base + mif[{tf} + 2 * t + 1]]; \\\n"
+    f"          sh_h[_da * {nv} + _db] += dqr * J_in[_jb + _da] * J_in[_jb + _db]; \\\n"
+    f"        }} \\\n"
+    f"      }} \\\n"
+    f"      threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+    f"    }}\n"
+  )
+  out = out[: m.end(1)] + rebuild + out[m.end(2) :]
+  return out
+
+
 def solve_source_coop(t: dict, adr_i: dict[str, int] | None = None, tg: int = 32) -> tuple[str, str]:
   """K2 source, cooperative: one threadgroup (TG threads) per world.
 

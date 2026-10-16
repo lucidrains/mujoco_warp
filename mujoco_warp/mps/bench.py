@@ -24,13 +24,21 @@ def _load(scene: str):
   return mujoco.MjModel.from_xml_path(SCENES.get(scene, scene))
 
 
-def bench_mlx(mjm, nworld: int, steps: int, warm: int = 5, eval_every: int = 1) -> float:
+def bench_mlx(
+  mjm,
+  nworld: int,
+  steps: int,
+  warm: int = 5,
+  eval_every: int = 1,
+  m_layout: str | None = None,
+  coop_solver: str | None = None,
+) -> float:
   """Returns seconds per substep on MLX GPU."""
   import mlx.core as mx
 
   from mujoco_warp.mps.robot import BatchedEngine
 
-  eng = BatchedEngine(mjm, nworld=nworld)
+  eng = BatchedEngine(mjm, nworld=nworld, m_layout=m_layout, coop_solver=coop_solver)
   qpos = np.tile(np.array(mjm.qpos0, np.float32), (nworld, 1))
   qvel = np.zeros((nworld, mjm.nv), np.float32)
   ctrl = np.zeros((nworld, mjm.nu), np.float32)
@@ -93,6 +101,8 @@ def main():
   ap.add_argument("--cpu-worlds", default="64,256,1024,4096", help="comma-separated warp-CPU world counts")
   ap.add_argument("--cpu-steps", type=int, default=20)
   ap.add_argument("--eval-every", type=int, default=1, help="force MLX eval every N steps (default 1 for step latency)")
+  ap.add_argument("--m-layout", default=None, choices=["dense", "packed"], help="mass-matrix layout (default: $MUJOCO_WARP_MPS_M)")
+  ap.add_argument("--coop-solver", default=None, choices=["v1", "v2"], help="cooperative solve variant (default: $MUJOCO_WARP_MPS_COOP)")
   args = ap.parse_args()
 
   mjm = _load(args.scene)
@@ -100,7 +110,7 @@ def main():
 
   mlx_results: dict[int, float] = {}
   for nw in _worlds(args.worlds):
-    dt = bench_mlx(mjm, nw, args.steps, eval_every=args.eval_every)
+    dt = bench_mlx(mjm, nw, args.steps, eval_every=args.eval_every, m_layout=args.m_layout, coop_solver=args.coop_solver)
     mlx_results[nw] = dt
     print(f"MLX      nworld={nw:6d}: {dt * 1e3:9.2f} ms/substep  {dt / nw * 1e6:8.2f} us/world  {nw / dt:12,.0f} worlds/s")
 

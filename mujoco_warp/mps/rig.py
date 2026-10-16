@@ -439,3 +439,44 @@ class Rig:
     # per-geom broadphase band (margin+gap) and local aabb (OBB filter)
     self.geom_mg = np.ascontiguousarray(self.geom_margin + self.geom_gap)
     self.geom_aabb = np.ascontiguousarray(m.geom_aabb.numpy().astype(np.float32).reshape(self.ngeom, 6))
+
+    # ---- dof ancestor chains (`dof_pad`) and their transpose (`rev_dof`)
+    # M is a tree matrix: dof i couples to j iff one is the other's ancestor, so the
+    # packed layout stores, per dof, the chain [i, parent(i), ...] (`dof_pad`, stride
+    # `dof_nch`); `rev_dof` maps each ancestor i to its descendants, encoding the
+    # descendant dof and its chain slot as `(j << 8) | slot`
+    nv = self.nv
+    chains = []
+    for i in range(nv):
+      c = [i]
+      j = int(mjm.dof_parentid[i])
+      while j >= 0:
+        c.append(j)
+        j = int(mjm.dof_parentid[j])
+      chains.append(c)
+    self.dof_nch = int(max([1] + [len(c) for c in chains]))
+    pad = np.full((nv, self.dof_nch), -1, np.int32)
+    for i, c in enumerate(chains):
+      pad[i, : len(c)] = np.asarray(c, np.int32)
+    self.dof_pad = np.ascontiguousarray(pad)
+    rev = [[] for _ in range(nv)]
+    for j, c in enumerate(chains):
+      for slot, a in enumerate(c):
+        if a != j:
+          rev[a].append((j, slot))
+    self.dof_nrev = int(max([1] + [len(r) for r in rev]))
+    rev_enc = np.full((nv, self.dof_nrev), -1, np.int32)
+    for i, r in enumerate(rev):
+      for t, (j, slot) in enumerate(r):
+        rev_enc[i, t] = (j << 8) | slot
+    self.rev_dof = np.ascontiguousarray(rev_enc)
+
+    # ---- flat lower-triangle pair table for the balanced cooperative Cholesky:
+    # slot t -> (ii, jj) with 1 <= jj <= ii < nv, row-major; a sub-triangle of
+    # size m (m = nv - k) is exactly the prefix of (m - 1) * m / 2 slots
+    pairs = [(i, j) for i in range(1, nv) for j in range(1, i + 1)]
+    self.tri_pairs = np.asarray(pairs, np.int32).reshape(-1) if pairs else np.zeros(0, np.int32)
+    # full lower-triangle pairs (0 <= j <= i < nv), same prefix property; a
+    # support of length num uses the first num(num+1)/2 slots
+    full = [(i, j) for i in range(nv) for j in range(i + 1)]
+    self.tri_full = np.asarray(full, np.int32).reshape(-1) if full else np.zeros(0, np.int32)
