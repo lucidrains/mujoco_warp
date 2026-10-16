@@ -10,13 +10,16 @@ Usage:
 
 from __future__ import annotations
 
+import pathlib
+
 import mujoco
 import numpy as np
 
 import mujoco_warp
 from mujoco_warp.mps.robot import BatchedEngine
 
-SCENE = "mujoco_warp/test_data/humanoid/humanoid.xml"
+# resolved against the package so `python -m mujoco_warp.mps.validate` works from any cwd
+SCENE = str(pathlib.Path(__file__).resolve().parent.parent / "test_data" / "humanoid" / "humanoid.xml")
 
 
 def compare_step(mjm, with_contacts: bool = True, seed: int = 0) -> dict:

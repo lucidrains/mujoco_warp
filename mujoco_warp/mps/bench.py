@@ -8,13 +8,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import pathlib
 import time
 
 import mujoco
 import numpy as np
 
+# resolved against the package so `python -m mujoco_warp.mps.bench` works from any cwd
 SCENES = {
-  "humanoid": "mujoco_warp/test_data/humanoid/humanoid.xml",
+  "humanoid": str(pathlib.Path(__file__).resolve().parent.parent / "test_data" / "humanoid" / "humanoid.xml"),
 }
 
 
