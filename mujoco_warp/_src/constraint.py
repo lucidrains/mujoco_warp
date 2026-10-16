@@ -5697,6 +5697,7 @@ def make_constraint(m: types.Model, d: types.Data):
               d.njmax,
               d.contact.efc_address.shape[1],
               int(m.flg_adhesion),
+              int(m.opt.cone == types.ConeType.ELLIPTIC),
               nim_cpu.ptr(d.contact.type),
               nim_cpu.ptr(d.contact.dim),
               nim_cpu.ptr(d.contact.worldid),

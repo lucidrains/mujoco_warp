@@ -1249,19 +1249,62 @@ def crb(m: Model, d: Data):
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
-  wp.copy(d.crb, d.cinert)
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("crb_dense")
+    and all(nim_cpu.is_contiguous(a) for a in (d.cinert, d.crb))
+  ):
+    body_tree, tree_offsets = _body_tree_flat(m)
+    nim_ops.crb_dense(
+      d.nworld,
+      m.nbody,
+      len(m.body_tree),
+      nim_cpu.layout(d.cinert)[1],
+      nim_cpu.layout(d.crb)[1],
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(body_tree),
+      nim_cpu.ptr(tree_offsets),
+      nim_cpu.ptr(d.cinert),
+      nim_cpu.ptr(d.crb),
+    )
+  else:
+    wp.copy(d.crb, d.cinert)
 
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
+    for i in reversed(range(len(m.body_tree))):
+      body_tree = m.body_tree[i]
+      wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
 
   d.M.zero_()
-  wp.launch(
-    _M,
-    dim=(d.nworld, m.nv),
-    inputs=[m.dof_bodyid, m.dof_parentid, m.dof_armature, m.M_rownnz, m.M_rowadr, d.cdof, d.crb],
-    outputs=[d.M],
-  )
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("mass_matrix_dense")
+    and all(nim_cpu.is_contiguous(a) for a in (m.dof_armature, d.cdof, d.crb, d.M))
+  ):
+    nim_ops.mass_matrix_dense(
+      d.nworld,
+      m.nv,
+      nim_cpu.layout(m.dof_armature)[0],
+      nim_cpu.layout(m.dof_armature)[1],
+      nim_cpu.layout(d.cdof)[1],
+      nim_cpu.layout(d.crb)[1],
+      nim_cpu.layout(d.M)[1],
+      nim_cpu.ptr(m.dof_bodyid),
+      nim_cpu.ptr(m.dof_parentid),
+      nim_cpu.ptr(m.M_rownnz),
+      nim_cpu.ptr(m.M_rowadr),
+      nim_cpu.ptr(m.dof_armature),
+      nim_cpu.ptr(d.cdof),
+      nim_cpu.ptr(d.crb),
+      nim_cpu.ptr(d.M),
+    )
+  else:
+    wp.launch(
+      _M,
+      dim=(d.nworld, m.nv),
+      inputs=[m.dof_bodyid, m.dof_parentid, m.dof_armature, m.M_rownnz, m.M_rowadr, d.cdof, d.crb],
+      outputs=[d.M],
+    )
 
 
 @wp.kernel

@@ -27,6 +27,15 @@ actuator gains, friction and gravity are expressed; large static tables
 (`mesh_vert`, `mesh_polynormal`) stay shared across worlds in `mbs`, and int
 tables live in `mif`.
 
+CPU fast paths: on the Warp CPU backend every kernel runs on a single lane, so the
+scalar step pipeline dominates. The Nim worker pool (`_src/nim_cpu_ops.nim`, loaded
+best-effort via `nimporter-plus`) mirrors the hot kernels - dense solver, forward
+kinematics, subtree CoM/inertias, body velocities, NxN broadphase, contact rows,
+actuation, passive forces, applied forces, integration - and reproduces the serial
+Warp ordering (contacts are emitted world-major). The ported kernels are bit-exact
+against their Warp counterparts on the humanoid and the full test suite passes with
+the fast paths enabled (`MUJOCO_WARP_DISABLE_NIM=1` forces the stock kernels).
+
 Plane-convex contacts follow MuJoCo's `mjc_PlaneConvex`: the support point is the
 first contact, and up to three more come from the max-area quad (`hull4f`) of the
 mesh face incident to the deepest vertex whose normal is most anti-aligned with
@@ -74,7 +83,7 @@ uv run python -m mujoco_warp.mps.validate
 ```
 
 Checks on the humanoid model across 100 simulation steps with random controls:
-- Trajectory drift remains at float32 noise level ($\sim 2.6 \times 10^{-6}$ max abs error in `qpos`, $\sim 1.3 \times 10^{-4}$ in `qvel`).
+- Trajectory drift remains at float32 noise level ($\sim 2.5 \times 10^{-6}$ max abs error in `qpos`, $\sim 2.5 \times 10^{-4}$ in `qvel`).
 - Active constraint count (`nefc`) and contact detections match bit-for-bit.
 
 ---
@@ -94,21 +103,26 @@ uv run python -m mujoco_warp.mps.bench
 
 ### Humanoid Benchmark Results (Apple M1 Pro, 10 CPU cores / 16 GPU cores)
 
-The MLX column is one (warm-laptop) session of `bench.py` (`--steps 50`); the warp-CPU
-column is the baseline from the same machine and is unaffected by engine changes. Sustained
-GPU load throttles the M1 Pro by ~40%, so compare ratios from runs taken back-to-back.
+Both columns are one (warm-laptop) session of `bench.py` (`--steps 50`), measured
+back-to-back. Sustained GPU load throttles the M1 Pro by ~40%, so compare ratios
+from runs taken back-to-back. The warp-CPU column runs the Nim fast paths (dense
+solver, kinematics, collisions, contact rows, actuation), which are enabled
+automatically when `nimporter-plus` and a Nim compiler are present.
 
 ```
  worlds | MLX ms/substep | warp-CPU ms/substep | speedup
 --------+----------------+---------------------+--------
-     64 |           1.93 |                9.38 |     4.9x
-    256 |           1.98 |               24.09 |    12.2x
-   1024 |           3.73 |               88.19 |    23.6x
-   4096 |          10.68 |              336.25 |    31.5x
-  16384 |          42.50 |                    - |        -
+     64 |           1.31 |                3.21 |     2.4x
+    256 |           1.65 |                4.95 |     3.0x
+   1024 |           3.36 |               11.71 |     3.5x
+   4096 |          10.14 |               41.08 |     4.1x
+  16384 |          42.83 |                    - |        -
 ```
 
-- At 4096 worlds, MLX runs at **~385,000 worlds/s** vs **~12,200 worlds/s** for `mujoco_warp` CPU (31.5x speedup); at 16,384 worlds it sustains **~385,000 worlds/s** (42.5 ms/substep).
+- At 4096 worlds, MLX runs at **~404,000 worlds/s** vs **~100,000 worlds/s** for `mujoco_warp` CPU (4.1x speedup); at 16,384 worlds it sustains **~383,000 worlds/s** (42.8 ms/substep).
+- The CPU column improved ~2.1x over the pre-optimization Nim baseline (88.4 ms/substep at
+  4096 worlds) by moving the remaining hot scalar kernels (broadphase, contact rows,
+  kinematics, inertias, velocities, actuation, integration) into the same worker pool.
 - Packed constraint rows speed up the one-thread-per-world path (nworld > 2048):
   same-process interleaved A/B (bit-identical trajectories, min over runs) gives 1.1-1.2x
   at 4,096 worlds and 1.3-1.4x at 16,384 worlds, mostly in K2's row loops; K1 also drops

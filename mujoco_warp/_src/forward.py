@@ -1942,7 +1942,9 @@ def _fixed_actuation(m: Model) -> bool:
     ok = bool(
       m.nactuator
       and m.na == 0
+      and m.ntendon == 0
       and m.nhistory == 0
+      and smooth._scalar_joint_transmission(m)
       and (m.actuator_gaintype.numpy() == 0).all()
       and (m.actuator_biastype.numpy() == 0).all()
       and (m.actuator_dyntype.numpy() == 0).all()
@@ -2178,20 +2180,49 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
     factorize: Flag to factorize inertia matrix.
   """
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
-  wp.launch(
-    _qfrc_smooth(enable_sleep),
-    dim=(d.nworld, m.nv),
-    inputs=[
-      m.body_treeid,
-      m.dof_bodyid,
-      d.qfrc_applied,
-      d.tree_awake,
-      d.qfrc_bias,
-      d.qfrc_passive,
-      d.qfrc_actuator,
-    ],
-    outputs=[d.qfrc_smooth],
-  )
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and nim_cpu.enabled("qfrc_smooth_dense")
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (d.qfrc_applied, d.tree_awake, d.qfrc_bias, d.qfrc_passive, d.qfrc_actuator, d.qfrc_smooth)
+    )
+  ):
+    nim_ops.qfrc_smooth_dense(
+      d.nworld,
+      m.nv,
+      1 if enable_sleep else 0,
+      nim_cpu.layout(d.qfrc_applied)[1],
+      nim_cpu.layout(d.tree_awake)[1],
+      nim_cpu.layout(d.qfrc_bias)[1],
+      nim_cpu.layout(d.qfrc_passive)[1],
+      nim_cpu.layout(d.qfrc_actuator)[1],
+      nim_cpu.layout(d.qfrc_smooth)[1],
+      nim_cpu.ptr(m.body_treeid),
+      nim_cpu.ptr(m.dof_bodyid),
+      nim_cpu.ptr(d.qfrc_applied),
+      nim_cpu.ptr(d.tree_awake),
+      nim_cpu.ptr(d.qfrc_bias),
+      nim_cpu.ptr(d.qfrc_passive),
+      nim_cpu.ptr(d.qfrc_actuator),
+      nim_cpu.ptr(d.qfrc_smooth),
+    )
+  else:
+    wp.launch(
+      _qfrc_smooth(enable_sleep),
+      dim=(d.nworld, m.nv),
+      inputs=[
+        m.body_treeid,
+        m.dof_bodyid,
+        d.qfrc_applied,
+        d.tree_awake,
+        d.qfrc_bias,
+        d.qfrc_passive,
+        d.qfrc_actuator,
+      ],
+      outputs=[d.qfrc_smooth],
+    )
   xfrc_accumulate(m, d, d.qfrc_smooth)
 
   if m.opt.integrator == IntegratorType.DISCRETE:

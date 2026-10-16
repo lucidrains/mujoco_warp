@@ -1055,8 +1055,8 @@ wheels = [
 ]
 
 [[package]]
-name = "mujoco-warp"
-version = "3.14.0"
+name = "mujoco-warp-mlx"
+version = "3.14.1"
 source = { editable = "." }
 dependencies = [
     { name = "absl-py" },
@@ -1068,6 +1068,11 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "mlx" },
+    { name = "nimporter-plus" },
+    { name = "setuptools" },
+]
 cpu = [
     { name = "jax", version = "0.6.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "jax", version = "0.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1104,9 +1109,11 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
     { name = "lsprotocol", marker = "extra == 'dev'", specifier = ">=2023.0.1,<2024.0.0" },
     { name = "mjviser", marker = "extra == 'dev'", specifier = ">=0.0.13" },
+    { name = "mlx", marker = "extra == 'all'" },
     { name = "mlx", marker = "extra == 'mlx'" },
     { name = "mujoco", specifier = ">=3.12.0", index = "https://py.mujoco.org/" },
     { name = "mujoco", marker = "extra == 'dev'", specifier = ">=3.11.0", index = "https://py.mujoco.org/" },
+    { name = "nimporter-plus", marker = "extra == 'all'" },
     { name = "nimporter-plus", marker = "extra == 'nim'" },
     { name = "numpy" },
     { name = "pillow", marker = "extra == 'dev'" },
@@ -1115,11 +1122,12 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "setuptools", marker = "extra == 'all'" },
     { name = "setuptools", marker = "extra == 'nim'" },
     { name = "warp-lang", specifier = ">=1.15", index = "https://pypi.nvidia.com/" },
     { name = "warp-lang", marker = "extra == 'dev'", specifier = ">=1.15", index = "https://pypi.nvidia.com/" },
 ]
-provides-extras = ["dev", "cpu", "cuda", "mlx", "nim"]
+provides-extras = ["mlx", "nim", "all", "dev", "cpu", "cuda"]
 
 [[package]]
 name = "nimporter-plus"

@@ -1815,7 +1815,7 @@ func kbimp(disableflags: int32, timestep: float32,
 type
   EfcContactInitArgs = object
     nworld, nacon, njmax, nmaxdim: int
-    flgAdhesion: bool
+    flgAdhesion, isElliptic: bool
     contactType, contactDim, contactWorldid, contactGeom: ptr UncheckedArray[int32]
     contactDist, contactIncludemargin, contactAdhesion: ptr UncheckedArray[float32]
     nefc: ptr UncheckedArray[int32]
@@ -1844,7 +1844,7 @@ proc efcContactInitWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} 
         else: pos < 0.0'f32
       if not active:
         continue
-      let ndim = if condim == 1: 1 else: 2 * (condim - 1)
+      let ndim = if a.isElliptic: condim else: (if condim == 1: 1 else: 2 * (condim - 1))
       let baseEfc = base
       base += ndim
       for dim in 0 ..< ndim:
@@ -1858,7 +1858,7 @@ proc efcContactInitWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} 
 
 proc efcContactInitDense*(
   nworld, nacon, njmax, nmaxdim: int,
-  flgAdhesion: int,
+  flgAdhesion, isElliptic: int,
   contactType, contactDim, contactWorldid, contactGeom: uint64,
   contactDist, contactIncludemargin, contactAdhesion: uint64,
   nefc, efcAddress, efcId: uint64,
@@ -1869,7 +1869,7 @@ proc efcContactInitDense*(
     return 1
   var args = EfcContactInitArgs(
     nworld: nworld, nacon: nacon, njmax: njmax, nmaxdim: nmaxdim,
-    flgAdhesion: flgAdhesion != 0,
+    flgAdhesion: flgAdhesion != 0, isElliptic: isElliptic != 0,
     contactType: toPtr[int32](contactType), contactDim: toPtr[int32](contactDim),
     contactWorldid: toPtr[int32](contactWorldid), contactGeom: toPtr[int32](contactGeom),
     contactDist: toPtr[float32](contactDist), contactIncludemargin: toPtr[float32](contactIncludemargin),
@@ -2668,7 +2668,7 @@ type
     flgAdd: bool
     xiposStride, comStride, cdofStride, ftStride, qfrcStride, isdofStride: int
     xipos, subtreeCom, cdof, ft, qfrc: ptr UncheckedArray[float32]
-    bodyParentid, bodyRootid, dofBodyid, bodyIsdofancestor: ptr UncheckedArray[int32]
+    bodyParentid, bodyRootid, dofBodyid: ptr UncheckedArray[int32]
 
 proc applyFtWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
   let a = cast[ptr ApplyFtArgs](arg)
@@ -2751,7 +2751,7 @@ proc applyFtDense*(
     xipos: toPtr[float32](xipos), subtreeCom: toPtr[float32](subtreeCom), cdof: toPtr[float32](cdof),
     ft: toPtr[float32](ft), qfrc: toPtr[float32](qfrc),
     bodyParentid: toPtr[int32](bodyParentid), bodyRootid: toPtr[int32](bodyRootid),
-    dofBodyid: toPtr[int32](dofBodyid), bodyIsdofancestor: nil,
+    dofBodyid: toPtr[int32](dofBodyid),
   )
   runJob(applyFtWorker, addr args, nworld)
 
@@ -2858,7 +2858,6 @@ type
     gravityEnabled: bool
     ctrlWorlds, ctrlRangeWorlds, gainWorlds, gainStride: int
     forceRangeWorlds, forceRangeStride: int
-    actFrcEnabled: bool
     actFrcRangeWorlds, actFrcRangeStride: int
     ctrlStride, ctrlRangeStride, forceStride, qfrcStride, gravcompStride, qvelStride: int
     ctrladr: ptr UncheckedArray[int32]
@@ -2936,7 +2935,7 @@ proc actuatorForceDense*(
     nworld: nworld, nu: nu, nv: nv, clampCtrl: clampCtrl != 0, gravityEnabled: gravityEnabled != 0,
     ctrlWorlds: ctrlWorlds, ctrlRangeWorlds: ctrlRangeWorlds, gainWorlds: gainWorlds, gainStride: gainStride,
     forceRangeWorlds: forceRangeWorlds, forceRangeStride: forceRangeStride,
-    actFrcEnabled: false, actFrcRangeWorlds: actFrcRangeWorlds, actFrcRangeStride: actFrcRangeStride,
+    actFrcRangeWorlds: actFrcRangeWorlds, actFrcRangeStride: actFrcRangeStride,
     ctrlStride: ctrlStride, ctrlRangeStride: ctrlRangeStride, forceStride: forceStride,
     qfrcStride: qfrcStride, gravcompStride: gravcompStride, qvelStride: qvelStride,
     ctrladr: toPtr[int32](ctrladr), trnid: toPtr[int32](trnid),
@@ -3158,3 +3157,169 @@ proc qfrcPassiveDense*(
     qfrcAdhesion: toPtr[float32](qfrcAdhesion), qfrcPassive: toPtr[float32](qfrcPassive),
   )
   runJob(qfrcPassiveWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Composite rigid body inertias and the joint-space inertia matrix
+# (mirror of smooth.crb / _M / _crb_accumulate), plus the qfrc_smooth reduction.
+
+type
+  CrbArgs = object
+    nworld, nbody, nlevels: int
+    cinertStride, crbStride: int
+    bodyParentid, bodyTree: ptr UncheckedArray[int32]
+    treeOffsets: ptr UncheckedArray[int32]
+    cinert, crb: ptr UncheckedArray[float32]
+
+proc crbWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr CrbArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let ciOff = w * a.cinertStride
+      let crOff = w * a.crbStride
+      for b in 0 ..< a.nbody * 10:
+        a.crb[crOff + b] = a.cinert[ciOff + b]
+      for level in countdown(a.nlevels - 1, 0):
+        for idx in int(a.treeOffsets[level]) ..< int(a.treeOffsets[level + 1]):
+          let b = int(a.bodyTree[idx])
+          let p = int(a.bodyParentid[b])
+          if p == 0:
+            continue  # the world body does not accumulate crb
+          for c in 0 ..< 10:
+            a.crb[crOff + p * 10 + c] += a.crb[crOff + b * 10 + c]
+
+proc crbDense*(
+  nworld, nbody, nlevels: int,
+  cinertStride, crbStride: int,
+  bodyParentid, bodyTree, treeOffsets: uint64,
+  cinert, crb: uint64,
+): void {.exportpy: "crb_dense".} =
+  var args = CrbArgs(
+    nworld: nworld, nbody: nbody, nlevels: nlevels,
+    cinertStride: cinertStride, crbStride: crbStride,
+    bodyParentid: toPtr[int32](bodyParentid), bodyTree: toPtr[int32](bodyTree),
+    treeOffsets: toPtr[int32](treeOffsets),
+    cinert: toPtr[float32](cinert), crb: toPtr[float32](crb),
+  )
+  runJob(crbWorker, addr args, nworld)
+
+func inertVec(c: ptr UncheckedArray[float32], co: int, v: ptr UncheckedArray[float32], vo: int): array[6, float32] {.inline.} =
+  # mju_mulInertVec: 6D vector times 6D inertia
+  let i0 = c[co]
+  let i1 = c[co + 1]
+  let i2 = c[co + 2]
+  let i3 = c[co + 3]
+  let i4 = c[co + 4]
+  let i5 = c[co + 5]
+  let i6 = c[co + 6]
+  let i7 = c[co + 7]
+  let i8 = c[co + 8]
+  let i9 = c[co + 9]
+  array[6, float32]([
+    i0 * v[vo] + i3 * v[vo + 1] + i4 * v[vo + 2] - i8 * v[vo + 4] + i7 * v[vo + 5],
+    i3 * v[vo] + i1 * v[vo + 1] + i5 * v[vo + 2] + i8 * v[vo + 3] - i6 * v[vo + 5],
+    i4 * v[vo] + i5 * v[vo + 1] + i2 * v[vo + 2] - i7 * v[vo + 3] + i6 * v[vo + 4],
+    i8 * v[vo + 1] - i7 * v[vo + 2] + i9 * v[vo + 3],
+    i6 * v[vo + 2] - i8 * v[vo] + i9 * v[vo + 4],
+    i7 * v[vo] - i6 * v[vo + 1] + i9 * v[vo + 5],
+  ])
+
+type
+  MassMatrixArgs = object
+    nworld, nv: int
+    armatureWorlds, armatureStride: int
+    cdofStride, crbStride, MStride: int
+    dofBodyid, dofParentid, mRownnz, mRowadr: ptr UncheckedArray[int32]
+    dofArmature, cdof, crb, M: ptr UncheckedArray[float32]
+
+proc massMatrixWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr MassMatrixArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let cdOff = w * a.cdofStride
+      let crOff = w * a.crbStride
+      let mOff = w * a.MStride
+      let armOff = (w mod a.armatureWorlds) * a.armatureStride
+      for dof0 in 0 ..< a.nv:
+        let bodyid = int(a.dofBodyid[dof0])
+        var madrIj = int(a.mRowadr[dof0]) + int(a.mRownnz[dof0]) - 1
+        a.M[mOff + madrIj] = a.dofArmature[armOff + dof0]
+        let buf = inertVec(a.crb, crOff + bodyid * 10, a.cdof, cdOff + dof0 * 6)
+        var dofid = dof0
+        while dofid >= 0:
+          var dot = 0.0'f32
+          for c in 0 ..< 6:
+            dot += a.cdof[cdOff + dofid * 6 + c] * buf[c]
+          a.M[mOff + madrIj] += dot
+          madrIj -= 1
+          dofid = int(a.dofParentid[dofid])
+
+proc massMatrixDense*(
+  nworld, nv, armatureWorlds, armatureStride, cdofStride, crbStride, MStride: int,
+  dofBodyid, dofParentid, mRownnz, mRowadr: uint64,
+  dofArmature, cdof, crb, M: uint64,
+): void {.exportpy: "mass_matrix_dense".} =
+  var args = MassMatrixArgs(
+    nworld: nworld, nv: nv, armatureWorlds: armatureWorlds, armatureStride: armatureStride,
+    cdofStride: cdofStride, crbStride: crbStride, MStride: MStride,
+    dofBodyid: toPtr[int32](dofBodyid), dofParentid: toPtr[int32](dofParentid),
+    mRownnz: toPtr[int32](mRownnz), mRowadr: toPtr[int32](mRowadr),
+    dofArmature: toPtr[float32](dofArmature), cdof: toPtr[float32](cdof),
+    crb: toPtr[float32](crb), M: toPtr[float32](M),
+  )
+  runJob(massMatrixWorker, addr args, nworld)
+
+type
+  QfrcSmoothArgs = object
+    nworld, nv: int
+    enableSleep: bool
+    appliedStride, awakeStride, biasStride, passiveStride, actuatorStride, smoothStride: int
+    bodyTreeid, dofBodyid: ptr UncheckedArray[int32]
+    qfrcApplied, treeAwake, qfrcBias, qfrcPassive, qfrcActuator, qfrcSmooth: ptr UncheckedArray[float32]
+
+proc qfrcSmoothWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr QfrcSmoothArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      for dof in 0 ..< a.nv:
+        if a.enableSleep:
+          let tree = int(a.bodyTreeid[int(a.dofBodyid[dof])])
+          if tree >= 0 and a.treeAwake[w * a.awakeStride + tree] == 0:
+            a.qfrcSmooth[w * a.smoothStride + dof] = 0.0'f32
+            continue
+        a.qfrcSmooth[w * a.smoothStride + dof] =
+          a.qfrcPassive[w * a.passiveStride + dof] -
+          a.qfrcBias[w * a.biasStride + dof] +
+          a.qfrcActuator[w * a.actuatorStride + dof] +
+          a.qfrcApplied[w * a.appliedStride + dof]
+
+proc qfrcSmoothDense*(
+  nworld, nv, enableSleep: int,
+  appliedStride, awakeStride, biasStride, passiveStride, actuatorStride, smoothStride: int,
+  bodyTreeid, dofBodyid: uint64,
+  qfrcApplied, treeAwake, qfrcBias, qfrcPassive, qfrcActuator, qfrcSmooth: uint64,
+): void {.exportpy: "qfrc_smooth_dense".} =
+  var args = QfrcSmoothArgs(
+    nworld: nworld, nv: nv, enableSleep: enableSleep != 0,
+    appliedStride: appliedStride, awakeStride: awakeStride, biasStride: biasStride,
+    passiveStride: passiveStride, actuatorStride: actuatorStride, smoothStride: smoothStride,
+    bodyTreeid: toPtr[int32](bodyTreeid), dofBodyid: toPtr[int32](dofBodyid),
+    qfrcApplied: toPtr[float32](qfrcApplied), treeAwake: toPtr[float32](treeAwake),
+    qfrcBias: toPtr[float32](qfrcBias), qfrcPassive: toPtr[float32](qfrcPassive),
+    qfrcActuator: toPtr[float32](qfrcActuator), qfrcSmooth: toPtr[float32](qfrcSmooth),
+  )
+  runJob(qfrcSmoothWorker, addr args, nworld)

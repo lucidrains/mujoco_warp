@@ -3,27 +3,28 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name="mujoco-warp"
-version = "3.14.0"
-# TODO(team): create a distribution list
+name = "mujoco-warp-mlx"
+version = "3.14.1"
 authors = [
     {name = "Newton Developers", email = "mujoco@deepmind.com"},
+    {name = "lucidrains"},
 ]
-description = "MuJoCo Warp (MJWarp)"
-readme = {file = "README.md", content-type = "text/markdown"}
+description = "MuJoCo Warp fork with an MLX (Metal) rigid-body engine and Nim CPU fast paths"
+readme = {file = "mujoco_warp/mps/README.md", content-type = "text/markdown"}
 license = "Apache-2.0"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Natural Language :: English",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -32,6 +33,15 @@ dependencies = [
     "mujoco>=3.12.0",
     "numpy",
     "warp-lang>=1.15",
+]
+keywords = [
+    "mujoco",
+    "physics",
+    "simulation",
+    "warp",
+    "mlx",
+    "metal",
+    "apple-silicon",
 ]
 
 [[tool.uv.index]]
@@ -49,6 +59,20 @@ warp-lang = {index = "nvidia"}
 mujoco = {index = "mujoco"}
 
 [project.optional-dependencies]
+# MLX (Metal) rigid-body engine, `mujoco_warp.mps` (Apple silicon)
+mlx = [
+    "mlx",
+]
+# Nim CPU fast paths for the dense solver and step kernels
+nim = [
+    "nimporter-plus",
+    "setuptools",
+]
+all = [
+    "mlx",
+    "nimporter-plus",
+    "setuptools",
+]
 dev = [
     "pre-commit",
     "pytest",
@@ -68,13 +92,6 @@ cpu = [
 cuda = [
     "jax[cuda12]"
 ]
-mlx = [
-    "mlx",
-]
-nim = [
-    "nimporter-plus",
-    "setuptools",
-]
 
 [project.scripts]
 mjwarp-testspeed = "mujoco_warp.testspeed:main"
@@ -83,9 +100,10 @@ mjwarp-record = "mujoco_warp.record:main"
 
 
 [project.urls]
-Homepage = "https://github.com/google-deepmind/mujoco_warp"
+Homepage = "https://github.com/lucidrains/mujoco_warp"
 Documentation = "https://mujoco.readthedocs.io"
-Repository = "https://github.com/google-deepmind/mujoco_warp"
+Repository = "https://github.com/lucidrains/mujoco_warp"
+Upstream = "https://github.com/google-deepmind/mujoco_warp"
 Changelog = "https://mujoco.readthedocs.io/en/stable/changelog.html"
 
 [tool.ruff]
@@ -130,7 +148,11 @@ testpaths = ["mujoco_warp"]
 norecursedirs = ["benchmarks", "contrib"]
 
 [tool.setuptools]
-package-data = { "mujoco_warp" = ["test_data/**", "_src/*.nim", "_src/*.nim.cfg"] }
+package-data = { "mujoco_warp" = [
+    "test_data/**",
+    "_src/*.nim",
+    "_src/*.nim.cfg",
+] }
 
 [tool.setuptools.packages.find]
 include = ["mujoco_warp*"]
