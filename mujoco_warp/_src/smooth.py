@@ -1246,11 +1246,7 @@ def crb(m: Model, d: Data):
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
   nim_ops = nim_cpu.get_ops()
-  if (
-    nim_ops is not None
-    and nim_cpu.enabled("crb_dense")
-    and all(nim_cpu.is_contiguous(a) for a in (d.cinert, d.crb))
-  ):
+  if nim_ops is not None and nim_cpu.enabled("crb_dense") and all(nim_cpu.is_contiguous(a) for a in (d.cinert, d.crb)):
     body_tree, tree_offsets = _body_tree_flat(m)
     nim_ops.crb_dense(
       d.nworld,
@@ -1713,6 +1709,58 @@ def rne(m: Model, d: Data, flg_acc: bool = False):
     d: The data object containing the current state and output arrays.
     flg_acc: If True, includes joint accelerations in the computation.
   """
+  nim_ops = nim_cpu.get_ops()
+  if (
+    nim_ops is not None
+    and not flg_acc
+    and nim_cpu.enabled("rne_dense")
+    and m.nv >= 1
+    and d.cdof.is_contiguous
+    and d.cdof_dot.is_contiguous
+    and d.cinert.is_contiguous
+    and d.cvel.is_contiguous
+    and d.cacc.is_contiguous
+    and d.cfrc_int.is_contiguous
+    and d.qvel.is_contiguous
+    and d.qacc.is_contiguous
+    and d.qfrc_bias.is_contiguous
+  ):
+    body_tree, tree_offsets = _body_tree_flat(m)
+    nim_ops.rne_dense(
+      d.nworld,
+      m.nbody,
+      m.nbranch,
+      m.nv,
+      len(m.body_tree),
+      nim_cpu.layout(m.opt.gravity)[0],
+      d.qvel.shape[1],
+      d.qacc.shape[1],
+      nim_cpu.layout(d.cdof)[1],
+      nim_cpu.layout(d.cdof_dot)[1],
+      d.qfrc_bias.shape[1],
+      nim_cpu.layout(d.cacc)[1],
+      0 if m.opt.disableflags & DisableBit.GRAVITY else 1,
+      nim_cpu.ptr(m.body_parentid),
+      nim_cpu.ptr(m.body_dofnum),
+      nim_cpu.ptr(m.body_dofadr),
+      nim_cpu.ptr(m.body_branches),
+      nim_cpu.ptr(m.body_branch_start),
+      nim_cpu.ptr(m.dof_bodyid),
+      nim_cpu.ptr(body_tree),
+      nim_cpu.ptr(tree_offsets),
+      nim_cpu.ptr(m.opt.gravity),
+      nim_cpu.ptr(d.qvel),
+      nim_cpu.ptr(d.qacc),
+      nim_cpu.ptr(d.cdof),
+      nim_cpu.ptr(d.cdof_dot),
+      nim_cpu.ptr(d.cinert),
+      nim_cpu.ptr(d.cvel),
+      nim_cpu.ptr(d.cacc),
+      nim_cpu.ptr(d.cfrc_int),
+      nim_cpu.ptr(d.qfrc_bias),
+    )
+    return
+
   _rne_cacc_world(m, d)
   _rne_cacc_forward(m, d, flg_acc=flg_acc)
   _rne_cfrc(m, d)

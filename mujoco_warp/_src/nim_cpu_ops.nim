@@ -35,8 +35,10 @@ const
   LinearNeg = 2'i32  # types.ConstraintState.LINEARNEG
   LinearPos = 3'i32  # types.ConstraintState.LINEARPOS
   MaxPoolThreads = 64
+  JRowMax = 256  # stack row buffer bound for the Newton H build
   AlphaNoiseEps = 8.0'f32 * 1.1920929e-07'f32
   MjMaxVal = 1.0e10'f32
+  MjMinMu = 1.0e-5'f32
   OverflowIterations = 512'i32  # types.OverflowType.ITERATIONS (1 << 9)
   OverflowLsIterations = 1024'i32  # types.OverflowType.LS_ITERATIONS (1 << 10)
 
@@ -149,27 +151,29 @@ proc runJob(job: Job, arg: pointer, nTasks = MaxPoolThreads) =
 
 func choleskyFactorize(a: ptr UncheckedArray[float32], n, stride: int) {.inline.} =
   ## In-place upper Cholesky factorization A = UᵀU using row-oriented unit-stride inner loops.
+  ## Row pointers are hoisted: with a single float pointer gcc must assume the two rows
+  ## alias and cannot keep them in registers (~40% of the factorization).
   for i in 0 ..< n:
-    let iRow = i * stride
+    let pi = cast[ptr UncheckedArray[float32]](addr a[i * stride])
     for k in 0 ..< i:
-      let kRow = k * stride
-      let uki = a[kRow + i]
+      let pk = cast[ptr UncheckedArray[float32]](addr a[k * stride])
+      let uki = pk[i]
       for j in i ..< n:
-        a[iRow + j] -= uki * a[kRow + j]
-    let uii = sqrt(a[iRow + i])
-    a[iRow + i] = uii
+        pi[j] = pi[j] - uki * pk[j]
+    let uii = sqrt(pi[i])
+    pi[i] = uii
     let inv = 1.0'f32 / uii
     for j in (i + 1) ..< n:
-      a[iRow + j] *= inv
+      pi[j] = pi[j] * inv
 
 func choleskySolve(a: ptr UncheckedArray[float32], n, stride: int, x: ptr UncheckedArray[float32]) {.inline.} =
   ## In-place solve UᵀUx = b for upper triangular U using unit-stride inner loops.
   for k in 0 ..< n:
-    let kRow = k * stride
-    let xk = x[k] / a[kRow + k]
+    let pk = cast[ptr UncheckedArray[float32]](addr a[k * stride])
+    let xk = x[k] / pk[k]
     x[k] = xk
     for i in (k + 1) ..< n:
-      x[i] -= a[kRow + i] * xk
+      x[i] = x[i] - pk[i] * xk
   for i in countdown(n - 1, 0):
     let iRow = i * stride
     var s = x[i]
@@ -972,6 +976,8 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
     if w >= a.nworld:
       break
 
+    var jrow {.noinit.}: array[JRowMax, float32]
+
     let ne = int(a.ne[w])
     let nf = int(a.nf[w])
     let nefc = min(njmax, int(a.nefc[w]))
@@ -1053,13 +1059,26 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
       if dk == 0.0'f32:
         continue
       let jk = jWorldOff + efcid * nvPad
-      for i in 0 ..< nv:
-        let ji = dk * a.efcJ[jk + i]
-        if ji == 0.0'f32:
-          continue
-        let hRow = i * nvPad
-        for jj in i ..< nv:
-          hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
+      if nvPad <= JRowMax:
+        # copy the row locally: with raw float pointers gcc must assume the
+        # hLocal stores alias the J row and cannot vectorize the update
+        for q in 0 ..< nv:
+          jrow[q] = a.efcJ[jk + q]
+        for i in 0 ..< nv:
+          let ji = dk * jrow[i]
+          if ji == 0.0'f32:
+            continue
+          let hRow = i * nvPad
+          for jj in i ..< nv:
+            hLocal[hRow + jj] += ji * jrow[jj]
+      else:
+        for i in 0 ..< nv:
+          let ji = dk * a.efcJ[jk + i]
+          if ji == 0.0'f32:
+            continue
+          let hRow = i * nvPad
+          for jj in i ..< nv:
+            hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
 
     for i in 0 ..< nv:
       let rowOff = i * nvPad + i
@@ -1170,13 +1189,24 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
             if dk == 0.0'f32:
               continue
             let jk = jWorldOff + efcid * nvPad
-            for i in 0 ..< nv:
-              let ji = dk * a.efcJ[jk + i]
-              if ji == 0.0'f32:
-                continue
-              let hRow = i * nvPad
-              for jj in i ..< nv:
-                hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
+            if nvPad <= JRowMax:
+              for q in 0 ..< nv:
+                jrow[q] = a.efcJ[jk + q]
+              for i in 0 ..< nv:
+                let ji = dk * jrow[i]
+                if ji == 0.0'f32:
+                  continue
+                let hRow = i * nvPad
+                for jj in i ..< nv:
+                  hLocal[hRow + jj] += ji * jrow[jj]
+            else:
+              for i in 0 ..< nv:
+                let ji = dk * a.efcJ[jk + i]
+                if ji == 0.0'f32:
+                  continue
+                let hRow = i * nvPad
+                for jj in i ..< nv:
+                  hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
           for i in 0 ..< nv:
             let rowOff = i * nvPad + i
             copyMem(addr factorPtr[rowOff], addr hLocal[rowOff], (nv - i) * sizeof(float32))
@@ -3351,3 +3381,882 @@ proc qfrcSmoothDense*(
     qfrcActuator: toPtr[float32](qfrcActuator), qfrcSmooth: toPtr[float32](qfrcSmooth),
   )
   runJob(qfrcSmoothWorker, addr args, nworld)
+
+# ------------------------------------------------------------------------------
+# Primitive narrowphase (mirror of collision_primitive._primitive_narrowphase).
+#
+# Warp launches one lane per naconmax slot (nworld * nconmax, ~12x the number of
+# broadphase pairs on the humanoid), and every active lane runs the whole
+# contact_params + geometry + write_contact chain on a single CPU core.  Here the
+# pairs are walked directly: contacts are computed per pair in parallel into a
+# scratch buffer, then appended in pair order so the contact arrays (and the
+# downstream efcid assignment) match the serial Warp layout exactly.
+
+const
+  NpKmax = 8  # plane-box emits up to 8 contacts
+  NpParamStride = 17  # friction 5, solref 2, solreffriction 2, solimp 5, margin, gap, adhesion
+  NpContactStride = 14  # dist, pos 3, frame 9, original contact index
+  NpIntStride = 8  # count, condim, pairid0, pairid1, worldid, geom1, geom2, append start
+  CtConstraint = 1'i32
+  CtSensor = 2'i32
+
+var
+  npFbuf: seq[float32]
+  npIbuf: seq[int32]
+
+type
+  NpGeom = object
+    pos, size, normal: Vec3f
+    rot: array[9, float32]  # column-major, rot[c * 3 + r]
+    index: int32
+    margin: float32
+
+  NpArgs = object
+    nworld, ncollision, naconmax, njmax, ngeom, npair: int
+    marginLead, gapLead, adhesionLead, solmixLead, frictionLead, solrefLead, solimpLead, sizeLead: int
+    pmarginLead, pgapLead, pfrictionLead, psolrefLead, psolreffrictionLead, psolimpLead, padhesionLead: int
+    geomType, geomCondim, geomPriority, pairDim: ptr UncheckedArray[int32]
+    geomSolmix, geomSolref, geomSolimp, geomFriction, geomMargin, geomGap, geomAdhesion, geomSize: ptr UncheckedArray[float32]
+    pairSolref, pairSolreffriction, pairSolimp, pairMargin, pairGap, pairAdhesion, pairFriction: ptr UncheckedArray[float32]
+    geomXpos, geomXmat: ptr UncheckedArray[float32]
+    collisionPair, collisionPairid, collisionWorldid, ncollisionPtr: ptr UncheckedArray[int32]
+    contactDist, contactPos, contactFrame, contactIncludemargin, contactFriction: ptr UncheckedArray[float32]
+    contactSolref, contactSolreffriction, contactSolimp, contactAdhesion: ptr UncheckedArray[float32]
+    contactDim, contactGeom, contactEfcAddress, contactWorldid, contactType, contactGeomCollisionId: ptr UncheckedArray[int32]
+    nacon: ptr UncheckedArray[int32]
+    fbuf: ptr UncheckedArray[float32]
+    ibuf: ptr UncheckedArray[int32]
+
+func `+`(a, b: Vec3f): Vec3f {.inline.} = [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+func `-`(a, b: Vec3f): Vec3f {.inline.} = [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+func `-`(a: Vec3f): Vec3f {.inline.} = [-a[0], -a[1], -a[2]]
+func `*`(a: Vec3f, s: float32): Vec3f {.inline.} = [a[0] * s, a[1] * s, a[2] * s]
+func `*`(s: float32, a: Vec3f): Vec3f {.inline.} = a * s
+func `*`(a: Vec3f, b: Vec3f): Vec3f {.inline.} = [a[0] * b[0], a[1] * b[1], a[2] * b[2]]  # cw_mul
+func `/`(a: Vec3f, s: float32): Vec3f {.inline.} = [a[0] / s, a[1] / s, a[2] / s]
+
+func npDot(a, b: Vec3f): float32 {.inline.} = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+func npSign(x: float32): float32 {.inline.} =
+  if x < 0.0'f32: -1.0'f32 else: 1.0'f32
+
+func npCross(a, b: Vec3f): Vec3f {.inline.} =
+  [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+func npLen(a: Vec3f): float32 {.inline.} =
+  sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+func npNormalize(a: Vec3f): Vec3f {.inline.} =
+  let l = npLen(a)
+  if l > 0.0'f32: a / l else: [0.0'f32, 0.0'f32, 0.0'f32]
+
+func npNormalizeWithNorm(a: Vec3f): (Vec3f, float32) {.inline.} =
+  let norm = npLen(a)
+  if norm == 0.0'f32: (a, 0.0'f32) else: (a / norm, norm)
+
+func npMatVec(m: array[9, float32], v: Vec3f): Vec3f {.inline.} =
+  # warp mul(mat, vec): row-wise dot, r[j] = m[j * 3] * v0 + m[j * 3 + 1] * v1 + ...
+  [m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+   m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+   m[6] * v[0] + m[7] * v[1] + m[8] * v[2]]
+
+func npMatTVec(m: array[9, float32], v: Vec3f): Vec3f {.inline.} =
+  # transpose(m) @ v = column-wise dot
+  let c0 = [m[0], m[1], m[2]] * v[0]
+  let c1 = [m[3], m[4], m[5]] * v[1]
+  let c2 = [m[6], m[7], m[8]] * v[2]
+  c0 + c1 + c2
+
+func npOrthogonals(a: Vec3f): (Vec3f, Vec3f) {.inline.} =
+  var b = if -0.5'f32 < a[1] and a[1] < 0.5'f32: [0.0'f32, 1.0'f32, 0.0'f32]
+          else: [0.0'f32, 0.0'f32, 1.0'f32]
+  b = b - a * npDot(a, b)
+  b = npNormalize(b)
+  if npLen(a) == 0.0'f32:
+    b = [0.0'f32, 0.0'f32, 0.0'f32]
+  (b, npCross(a, b))
+
+func npMakeFrame(a: Vec3f): array[9, float32] {.inline.} =
+  let n = npNormalize(a)
+  let (b, c) = npOrthogonals(n)
+  [n[0], n[1], n[2], b[0], b[1], b[2], c[0], c[1], c[2]]
+
+func npClosestSegmentPoint(a, b, pt: Vec3f): Vec3f {.inline.} =
+  let ab = b - a
+  let t = npDot(pt - a, ab) / (npDot(ab, ab) + 1e-6'f32)
+  a + min(max(t, 0.0'f32), 1.0'f32) * ab  # careful: see below
+
+func npPlaneSphere(n, planePos, spherePos: Vec3f, radius: float32): (float32, Vec3f) {.inline.} =
+  let dist = npDot(spherePos - planePos, n) - radius
+  (dist, spherePos - n * (radius + 0.5'f32 * dist))
+
+func npSphereSphere(pos1: Vec3f, r1: float32, pos2: Vec3f, r2: float32): (float32, Vec3f, Vec3f) {.inline.} =
+  let dir = pos2 - pos1
+  var dist = npLen(dir)
+  let n = if dist == 0.0'f32: [1.0'f32, 0.0'f32, 0.0'f32] else: dir / dist
+  dist = dist - (r1 + r2)
+  (dist, pos1 + n * (r1 + 0.5'f32 * dist), n)
+
+func npSphereCapsule(spherePos: Vec3f, sphereRadius: float32,
+                     capPos, capAxis: Vec3f, capRadius, capHalfLen: float32): (float32, Vec3f, Vec3f) {.inline.} =
+  let segment = capAxis * capHalfLen
+  let pt = npClosestSegmentPoint(capPos - segment, capPos + segment, spherePos)
+  npSphereSphere(spherePos, sphereRadius, pt, capRadius)
+
+func npPlaneCapsule(n, planePos, capPos, capAxis: Vec3f,
+                    radius, halfLen: float32): (array[2, float32], array[2, Vec3f], array[9, float32]) {.inline.} =
+  var b: Vec3f
+  var bNorm: float32
+  (b, bNorm) = npNormalizeWithNorm(capAxis - n * npDot(n, capAxis))
+  if bNorm < 0.5'f32:
+    if -0.5'f32 < n[1] and n[1] < 0.5'f32:
+      b = [0.0'f32, 1.0'f32, 0.0'f32]
+    else:
+      b = [0.0'f32, 0.0'f32, 1.0'f32]
+  let c = npCross(n, b)
+  let frame = [n[0], n[1], n[2], b[0], b[1], b[2], c[0], c[1], c[2]]
+  let segment = capAxis * halfLen
+  let (dist1, pos1) = npPlaneSphere(n, planePos, capPos + segment, radius)
+  let (dist2, pos2) = npPlaneSphere(n, planePos, capPos - segment, radius)
+  ([dist1, dist2], [pos1, pos2], frame)
+
+func npSphereCylinder(spherePos: Vec3f, sphereRadius: float32,
+                      cylinderPos, cylinderAxis: Vec3f,
+                      cylinderRadius, cylinderHalfHeight: float32): (float32, Vec3f, Vec3f) {.inline.} =
+  let vec = spherePos - cylinderPos
+  let x = npDot(vec, cylinderAxis)
+  let aProj = cylinderAxis * x
+  let pProj = vec - aProj
+  let pProjSqr = npDot(pProj, pProj)
+  var collideSide = abs(x) < cylinderHalfHeight
+  let collideCap = pProjSqr < (cylinderRadius * cylinderRadius)
+  var useSide = collideSide
+  var useCap = collideCap
+  if collideSide and collideCap:
+    let distCap = cylinderHalfHeight - abs(x)
+    let distRadius = cylinderRadius - sqrt(pProjSqr)
+    if distCap < distRadius:
+      useSide = false
+    else:
+      useCap = false
+  if useSide:
+    let posTarget = cylinderPos + aProj
+    npSphereSphere(spherePos, sphereRadius, posTarget, cylinderRadius)
+  elif useCap:
+    var posCap: Vec3f
+    var planeNormal: Vec3f
+    if x > 0.0'f32:
+      posCap = cylinderPos + cylinderAxis * cylinderHalfHeight
+      planeNormal = cylinderAxis
+    else:
+      posCap = cylinderPos - cylinderAxis * cylinderHalfHeight
+      planeNormal = -cylinderAxis
+    let (dist, pos) = npPlaneSphere(planeNormal, posCap, spherePos, sphereRadius)
+    (dist, pos, -planeNormal)
+  else:
+    let invLen = safeDiv(1.0'f32, sqrt(pProjSqr))
+    let pProjScaled = pProj * (cylinderRadius * invLen)
+    let capOffset = cylinderAxis * (npSign(x) * cylinderHalfHeight)
+    let posCorner = cylinderPos + capOffset + pProjScaled
+    npSphereSphere(spherePos, sphereRadius, posCorner, 0.0'f32)
+
+func npPlaneEllipsoid(n, planePos, ellipsoidPos: Vec3f, ellipsoidRot: array[9, float32],
+                      ellipsoidSize: Vec3f): (float32, Vec3f) {.inline.} =
+  let sphereSupport = -npNormalize(npMatTVec(ellipsoidRot, n) * ellipsoidSize)
+  var pos = ellipsoidPos + npMatVec(ellipsoidRot, sphereSupport * ellipsoidSize)
+  let dist = npDot(n, pos - planePos)
+  pos = pos - n * dist * 0.5'f32
+  (dist, pos)
+
+func npPlaneCylinder(n, planePos, cylinderCenter, cylinderAxis: Vec3f,
+                     cylinderRadius, cylinderHalfHeight: float32): (array[4, float32], array[4, Vec3f]) {.inline.} =
+  var contactDist = [MjMaxVal, MjMaxVal, MjMaxVal, MjMaxVal]
+  var contactPos: array[4, Vec3f]
+  var axis = cylinderAxis
+  var prjaxis = npDot(n, axis)
+  if prjaxis > 0.0'f32:
+    axis = -axis
+    prjaxis = -prjaxis
+  let dist0 = npDot(cylinderCenter - planePos, n)
+  var vec = axis * prjaxis - n
+  let lenSqr = npDot(vec, vec)
+  if lenSqr >= 1e-12'f32:
+    vec = vec * safeDiv(cylinderRadius, sqrt(lenSqr))
+  else:
+    vec = [cylinderRadius, 0.0'f32, 0.0'f32]
+  let prjvec = npDot(vec, n)
+  let axisScaled = axis * cylinderHalfHeight
+  let prjaxisScaled = prjaxis * cylinderHalfHeight
+  let dist1 = dist0 + prjaxisScaled + prjvec
+  let pos1 = cylinderCenter + vec + axisScaled - n * (dist1 * 0.5'f32)
+  contactDist[0] = dist1
+  contactPos[0] = pos1
+  let dist2 = dist0 - prjaxisScaled + prjvec
+  let pos2 = cylinderCenter + vec - axisScaled - n * (dist2 * 0.5'f32)
+  contactDist[1] = dist2
+  contactPos[1] = pos2
+  let prjvec1 = -prjvec * 0.5'f32
+  let dist3 = dist0 + prjaxisScaled + prjvec1
+  var vec1 = npCross(vec, axisScaled)
+  vec1 = npNormalize(vec1) * (cylinderRadius * sqrt(3.0'f32) * 0.5'f32)
+  let pos3 = cylinderCenter + vec1 + axisScaled - vec * 0.5'f32 - n * (dist3 * 0.5'f32)
+  contactDist[2] = dist3
+  contactPos[2] = pos3
+  let pos4 = cylinderCenter - vec1 + axisScaled - vec * 0.5'f32 - n * (dist3 * 0.5'f32)
+  contactDist[3] = dist3
+  contactPos[3] = pos4
+  (contactDist, contactPos)
+
+func npPlaneBox(n, planePos, boxPos: Vec3f, boxRot: array[9, float32],
+                boxSize: Vec3f): (array[8, float32], array[8, Vec3f]) {.inline.} =
+  let centerDist = npDot(boxPos - planePos, n)
+  var dist: array[8, float32]
+  var pos: array[8, Vec3f]
+  for i in 0 ..< 8:
+    var corner = [
+      (if (i and 1) != 0: boxSize[0] else: -boxSize[0]),
+      (if (i and 2) != 0: boxSize[1] else: -boxSize[1]),
+      (if (i and 4) != 0: boxSize[2] else: -boxSize[2]),
+    ]
+    corner = npMatVec(boxRot, corner)
+    let ldist = npDot(n, corner)
+    let cdist = centerDist + ldist
+    dist[i] = cdist
+    pos[i] = corner + boxPos - 0.5'f32 * n * cdist
+  (dist, pos)
+
+func npCapsuleCapsule(cap1Pos, cap1Axis: Vec3f, cap1Radius, cap1HalfLen: float32,
+                      cap2Pos, cap2Axis: Vec3f, cap2Radius, cap2HalfLen: float32,
+                      margin: float32): (array[2, float32], array[2, Vec3f], array[2, Vec3f]) {.inline.} =
+  var contactDist: array[2, float32] = [float32(Inf), float32(Inf)]
+  var contactPos: array[2, Vec3f]
+  var contactNormal: array[2, Vec3f]
+  let axis1 = cap1Axis * cap1HalfLen
+  let axis2 = cap2Axis * cap2HalfLen
+  let dif = cap1Pos - cap2Pos
+  let ma = npDot(axis1, axis1)
+  let mb = -npDot(axis1, axis2)
+  let mc = npDot(axis2, axis2)
+  let u = -npDot(axis1, dif)
+  let v = npDot(axis2, dif)
+  let det = ma * mc - mb * mb
+  if abs(det) >= MjMinVal:
+    let invDet = 1.0'f32 / det
+    var x1 = (mc * u - mb * v) * invDet
+    var x2 = (ma * v - mb * u) * invDet
+    if x1 > 1.0'f32:
+      x1 = 1.0'f32
+      x2 = (v - mb) / mc
+    elif x1 < -1.0'f32:
+      x1 = -1.0'f32
+      x2 = (v + mb) / mc
+    if x2 > 1.0'f32:
+      x2 = 1.0'f32
+      x1 = min(max((u - mb) / ma, -1.0'f32), 1.0'f32)
+    elif x2 < -1.0'f32:
+      x2 = -1.0'f32
+      x1 = min(max((u + mb) / ma, -1.0'f32), 1.0'f32)
+    let vec1 = cap1Pos + axis1 * x1
+    let vec2 = cap2Pos + axis2 * x2
+    let (dist, pos, normal) = npSphereSphere(vec1, cap1Radius, vec2, cap2Radius)
+    if dist <= margin:
+      contactDist[0] = dist
+      contactPos[0] = pos
+      contactNormal[0] = normal
+  else:
+    var contactCount = 0
+    block:
+      let vec1 = cap1Pos + axis1
+      let x2 = min(max((v - mb) / mc, -1.0'f32), 1.0'f32)
+      let vec2 = cap2Pos + axis2 * x2
+      let (dist, pos, normal) = npSphereSphere(vec1, cap1Radius, vec2, cap2Radius)
+      if dist <= margin:
+        contactDist[contactCount] = dist
+        contactPos[contactCount] = pos
+        contactNormal[contactCount] = normal
+        inc contactCount
+    block:
+      let vec1 = cap1Pos - axis1
+      let x2 = min(max((v + mb) / mc, -1.0'f32), 1.0'f32)
+      let vec2 = cap2Pos + axis2 * x2
+      let (dist, pos, normal) = npSphereSphere(vec1, cap1Radius, vec2, cap2Radius)
+      if dist <= margin:
+        contactDist[contactCount] = dist
+        contactPos[contactCount] = pos
+        contactNormal[contactCount] = normal
+        inc contactCount
+    if contactCount < 2:
+      let vec2 = cap2Pos + axis2
+      let x1 = min(max((u - mb) / ma, -1.0'f32), 1.0'f32)
+      let vec1 = cap1Pos + axis1 * x1
+      let (dist, pos, normal) = npSphereSphere(vec1, cap1Radius, vec2, cap2Radius)
+      if dist <= margin:
+        contactDist[contactCount] = dist
+        contactPos[contactCount] = pos
+        contactNormal[contactCount] = normal
+        inc contactCount
+    if contactCount < 2:
+      let vec2 = cap2Pos - axis2
+      let x1 = min(max((u + mb) / ma, -1.0'f32), 1.0'f32)
+      let vec1 = cap1Pos + axis1 * x1
+      let (dist, pos, normal) = npSphereSphere(vec1, cap1Radius, vec2, cap2Radius)
+      if dist <= margin:
+        contactDist[contactCount] = dist
+        contactPos[contactCount] = pos
+        contactNormal[contactCount] = normal
+  (contactDist, contactPos, contactNormal)
+
+func npContactMarginGap(a: ptr NpArgs, geoms: array[2, int32], pairid: int32,
+                        worldid: int): (float32, float32) {.inline.} =
+  if pairid > -1:
+    let pr = worldid mod a.pmarginLead
+    (a.pairMargin[pr * a.npair + int(pairid)],
+     a.pairGap[worldid mod a.pgapLead * a.npair + int(pairid)])
+  else:
+    let g1 = int(geoms[0])
+    let g2 = int(geoms[1])
+    let mw = worldid mod a.marginLead
+    let gw = worldid mod a.gapLead
+    (a.geomMargin[mw * a.ngeom + g1] + a.geomMargin[mw * a.ngeom + g2],
+     a.geomGap[gw * a.ngeom + g1] + a.geomGap[gw * a.ngeom + g2])
+
+func npContactMaterial(a: ptr NpArgs, geoms: array[2, int32], pairid: int32, worldid: int,
+                       condim: var int32, friction: var array[5, float32],
+                       solref: var array[2, float32], solreffriction: var array[2, float32],
+                       solimp: var array[5, float32], adhesion: var float32) {.inline.} =
+  if pairid > -1:
+    let rr = worldid mod a.pfrictionLead
+    condim = a.pairDim[int(pairid)]
+    for k in 0 ..< 5:
+      friction[k] = a.pairFriction[rr * a.npair * 5 + int(pairid) * 5 + k]
+    let sr = worldid mod a.psolrefLead
+    solref[0] = a.pairSolref[sr * a.npair * 2 + int(pairid) * 2]
+    solref[1] = a.pairSolref[sr * a.npair * 2 + int(pairid) * 2 + 1]
+    let sfr = worldid mod a.psolreffrictionLead
+    solreffriction[0] = a.pairSolreffriction[sfr * a.npair * 2 + int(pairid) * 2]
+    solreffriction[1] = a.pairSolreffriction[sfr * a.npair * 2 + int(pairid) * 2 + 1]
+    let si = worldid mod a.psolimpLead
+    for k in 0 ..< 5:
+      solimp[k] = a.pairSolimp[si * a.npair * 5 + int(pairid) * 5 + k]
+    adhesion = a.pairAdhesion[worldid mod a.padhesionLead * a.npair + int(pairid)]
+  else:
+    let g1 = int(geoms[0])
+    let g2 = int(geoms[1])
+    let smw = worldid mod a.solmixLead
+    let frw = worldid mod a.frictionLead
+    let srefw = worldid mod a.solrefLead
+    let simpw = worldid mod a.solimpLead
+    let adw = worldid mod a.adhesionLead
+    let solmix1 = a.geomSolmix[smw * a.ngeom + g1]
+    let solmix2 = a.geomSolmix[smw * a.ngeom + g2]
+    let condim1 = a.geomCondim[g1]
+    let condim2 = a.geomCondim[g2]
+    let p1 = a.geomPriority[g1]
+    let p2 = a.geomPriority[g2]
+    let a1 = a.geomAdhesion[adw * a.ngeom + g1]
+    let a2 = a.geomAdhesion[adw * a.ngeom + g2]
+    var mix: float32
+    var maxF: array[3, float32]
+    if p1 > p2:
+      mix = 1.0'f32
+      condim = condim1
+      for k in 0 ..< 3:
+        maxF[k] = a.geomFriction[frw * a.ngeom + g1 * 3 + k]
+      adhesion = a1
+    elif p2 > p1:
+      mix = 0.0'f32
+      condim = condim2
+      for k in 0 ..< 3:
+        maxF[k] = a.geomFriction[frw * a.ngeom + g2 * 3 + k]
+      adhesion = a2
+    else:
+      mix = safeDiv(solmix1, solmix1 + solmix2)
+      if solmix1 < MjMinVal and solmix2 < MjMinVal:
+        mix = 0.5'f32
+      if solmix1 < MjMinVal and solmix2 >= MjMinVal:
+        mix = 0.0'f32
+      if solmix1 >= MjMinVal and solmix2 < MjMinVal:
+        mix = 1.0'f32
+      condim = max(condim1, condim2)
+      for k in 0 ..< 3:
+        maxF[k] = max(a.geomFriction[frw * a.ngeom + g1 * 3 + k],
+                      a.geomFriction[frw * a.ngeom + g2 * 3 + k])
+      adhesion = a1 + a2
+    friction = [maxF[0], maxF[0], maxF[1], maxF[2], maxF[2]]
+    if a.geomSolref[srefw * a.ngeom + g1 * 2] > 0.0'f32 and
+       a.geomSolref[srefw * a.ngeom + g2 * 2] > 0.0'f32:
+      solref[0] = mix * a.geomSolref[srefw * a.ngeom + g1 * 2] +
+                  (1.0'f32 - mix) * a.geomSolref[srefw * a.ngeom + g2 * 2]
+      solref[1] = mix * a.geomSolref[srefw * a.ngeom + g1 * 2 + 1] +
+                  (1.0'f32 - mix) * a.geomSolref[srefw * a.ngeom + g2 * 2 + 1]
+    else:
+      solref[0] = min(a.geomSolref[srefw * a.ngeom + g1 * 2],
+                      a.geomSolref[srefw * a.ngeom + g2 * 2])
+      solref[1] = min(a.geomSolref[srefw * a.ngeom + g1 * 2 + 1],
+                      a.geomSolref[srefw * a.ngeom + g2 * 2 + 1])
+    solreffriction = [0.0'f32, 0.0'f32]
+    for k in 0 ..< 5:
+      solimp[k] = mix * a.geomSolimp[simpw * a.ngeom + g1 * 5 + k] +
+                  (1.0'f32 - mix) * a.geomSolimp[simpw * a.ngeom + g2 * 5 + k]
+
+  for k in 0 ..< 5:
+    friction[k] = max(MjMinMu, friction[k])
+
+func npReadGeom(a: ptr NpArgs, geoms: array[2, int32], worldid, which: int,
+                sizeLead: int): NpGeom {.inline.} =
+  let g = int(geoms[which])
+  let base = worldid * a.ngeom + g
+  result.pos = [a.geomXpos[base * 3], a.geomXpos[base * 3 + 1], a.geomXpos[base * 3 + 2]]
+  for k in 0 ..< 9:
+    result.rot[k] = a.geomXmat[base * 9 + k]
+  let sw = worldid mod sizeLead
+  result.size = [a.geomSize[sw * a.ngeom + g * 3],
+                 a.geomSize[sw * a.ngeom + g * 3 + 1],
+                 a.geomSize[sw * a.ngeom + g * 3 + 2]]
+  result.normal = [result.rot[2], result.rot[5], result.rot[8]]  # rot[0,2],rot[1,2],rot[2,2]
+  result.index = -1
+  result.margin = 0.0'f32
+
+# Geometry dispatch for one pair; returns the number of contacts (0 for pairs
+# without a fast path -- the Python side only enables the op when every pair
+# type present in the model is covered below).
+proc npPairContacts(ty1, ty2: int32, g1, g2: NpGeom, margin: float32,
+                    dist: var array[NpKmax, float32], pos: var array[NpKmax, Vec3f],
+                    frame: var array[NpKmax, array[9, float32]]): int =
+  if ty1 == 0 and ty2 == 2:  # plane, sphere
+    let (d, p) = npPlaneSphere(g1.normal, g1.pos, g2.pos, g2.size[0])
+    dist[0] = d
+    pos[0] = p
+    frame[0] = npMakeFrame(g1.normal)
+    return 1
+  if ty1 == 0 and ty2 == 3:  # plane, capsule
+    let axis = [g2.rot[2], g2.rot[5], g2.rot[8]]
+    let (d, p, f) = npPlaneCapsule(g1.normal, g1.pos, g2.pos, axis, g2.size[0], g2.size[1])
+    for i in 0 ..< 2:
+      dist[i] = d[i]
+      pos[i] = p[i]
+      frame[i] = f
+    return 2
+  if ty1 == 0 and ty2 == 4:  # plane, ellipsoid
+    let (d, p) = npPlaneEllipsoid(g1.normal, g1.pos, g2.pos, g2.rot, g2.size)
+    dist[0] = d
+    pos[0] = p
+    frame[0] = npMakeFrame(g1.normal)
+    return 1
+  if ty1 == 0 and ty2 == 5:  # plane, cylinder
+    let axis = [g2.rot[2], g2.rot[5], g2.rot[8]]
+    let (d, p) = npPlaneCylinder(g1.normal, g1.pos, g2.pos, axis, g2.size[0], g2.size[1])
+    for i in 0 ..< 4:
+      dist[i] = d[i]
+      pos[i] = p[i]
+      frame[i] = npMakeFrame(g1.normal)
+    return 4
+  if ty1 == 0 and ty2 == 6:  # plane, box
+    let (d, p) = npPlaneBox(g1.normal, g1.pos, g2.pos, g2.rot, g2.size)
+    for i in 0 ..< 8:
+      dist[i] = d[i]
+      pos[i] = p[i]
+      frame[i] = npMakeFrame(g1.normal)
+    return 8
+  if ty1 == 2 and ty2 == 2:  # sphere, sphere
+    let (d, p, n) = npSphereSphere(g1.pos, g1.size[0], g2.pos, g2.size[0])
+    dist[0] = d
+    pos[0] = p
+    frame[0] = npMakeFrame(n)
+    return 1
+  if ty1 == 2 and ty2 == 3:  # sphere, capsule
+    let axis = [g2.rot[2], g2.rot[5], g2.rot[8]]
+    let (d, p, n) = npSphereCapsule(g1.pos, g1.size[0], g2.pos, axis, g2.size[0], g2.size[1])
+    dist[0] = d
+    pos[0] = p
+    frame[0] = npMakeFrame(n)
+    return 1
+  if ty1 == 2 and ty2 == 5:  # sphere, cylinder
+    let axis = [g2.rot[2], g2.rot[5], g2.rot[8]]
+    let (d, p, n) = npSphereCylinder(g1.pos, g1.size[0], g2.pos, axis, g2.size[0], g2.size[1])
+    dist[0] = d
+    pos[0] = p
+    frame[0] = npMakeFrame(n)
+    return 1
+  if ty1 == 3 and ty2 == 3:  # capsule, capsule
+    let axis1 = [g1.rot[2], g1.rot[5], g1.rot[8]]
+    let axis2 = [g2.rot[2], g2.rot[5], g2.rot[8]]
+    let (d, p, n) = npCapsuleCapsule(g1.pos, axis1, g1.size[0], g1.size[1],
+                                     g2.pos, axis2, g2.size[0], g2.size[1], margin)
+    for i in 0 ..< 2:
+      dist[i] = d[i]
+      pos[i] = p[i]
+      frame[i] = npMakeFrame(n[i])
+    return 2
+  0
+
+const NpChunk = 16  # pairs per atomic claim
+
+proc claimChunk(): int {.inline, gcsafe.} =
+  pool.nextTask.fetchAdd(NpChunk, moRelaxed)
+
+proc npPairWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr NpArgs](arg)
+  let last = a.ncollision
+  while true:
+    let base = claimChunk()
+    if base >= last:
+      break
+    let stop = min(last, base + NpChunk)
+    for cid in base ..< stop:
+      let geoms = [a.collisionPair[cid * 2], a.collisionPair[cid * 2 + 1]]
+      let worldid = int(a.collisionWorldid[cid])
+      let pairid = a.collisionPairid[cid * 2]
+
+      var margin, gap: float32
+      (margin, gap) = npContactMarginGap(a, geoms, pairid, worldid)
+      var condim: int32
+      var friction: array[5, float32]
+      var solref: array[2, float32]
+      var solreffriction: array[2, float32]
+      var solimp: array[5, float32]
+      var adhesion: float32
+      npContactMaterial(a, geoms, pairid, worldid, condim, friction, solref, solreffriction, solimp, adhesion)
+
+      let g1 = npReadGeom(a, geoms, worldid, 0, a.sizeLead)
+      let g2 = npReadGeom(a, geoms, worldid, 1, a.sizeLead)
+      let ty1 = a.geomType[int(geoms[0])]
+      let ty2 = a.geomType[int(geoms[1])]
+
+      var dist: array[NpKmax, float32]
+      var pos: array[NpKmax, Vec3f]
+      var frame: array[NpKmax, array[9, float32]]
+      let count = npPairContacts(ty1, ty2, g1, g2, margin, dist, pos, frame)
+
+      let pOff = cid * NpParamStride
+      for k in 0 ..< 5:
+        a.fbuf[pOff + k] = friction[k]
+      a.fbuf[pOff + 5] = solref[0]
+      a.fbuf[pOff + 6] = solref[1]
+      a.fbuf[pOff + 7] = solreffriction[0]
+      a.fbuf[pOff + 8] = solreffriction[1]
+      for k in 0 ..< 5:
+        a.fbuf[pOff + 9 + k] = solimp[k]
+      a.fbuf[pOff + 14] = margin
+      a.fbuf[pOff + 15] = gap
+      a.fbuf[pOff + 16] = adhesion
+
+      let cBase = a.ncollision * NpParamStride + cid * NpKmax * NpContactStride
+      for i in 0 ..< count:
+        let cOff = cBase + i * NpContactStride
+        a.fbuf[cOff + 0] = dist[i]
+        for k in 0 ..< 3:
+          a.fbuf[cOff + 1 + k] = pos[i][k]
+        for k in 0 ..< 9:
+          a.fbuf[cOff + 4 + k] = frame[i][k]
+        a.fbuf[cOff + 13] = float32(i)
+
+      # apply write_contact's filters here so the append can run in parallel:
+      # only contacts that would be appended are kept
+      let pairid1 = a.collisionPairid[cid * 2 + 1]
+      var written = 0
+      for i in 0 ..< count:
+        let dist0 = a.fbuf[cBase + i * NpContactStride]
+        let detected = dist0 < margin + gap
+        if (pairid == -2 or not detected) and pairid1 == -1:
+          continue
+        if written != i:
+          let dst = cBase + written * NpContactStride
+          let src = cBase + i * NpContactStride
+          for k in 0 ..< NpContactStride:
+            a.fbuf[dst + k] = a.fbuf[src + k]
+        inc written
+
+      let iOff = cid * NpIntStride
+      a.ibuf[iOff + 0] = int32(written)
+      a.ibuf[iOff + 1] = condim
+      a.ibuf[iOff + 2] = pairid
+      a.ibuf[iOff + 3] = pairid1
+      a.ibuf[iOff + 4] = int32(worldid)
+      a.ibuf[iOff + 5] = geoms[0]
+      a.ibuf[iOff + 6] = geoms[1]
+
+proc npScanContacts(a: ptr NpArgs) {.nimcall, gcsafe.} =
+  # exclusive scan over the per-pair append counts: contact slots follow the
+  # serial warp lane order, so the downstream efcid assignment is unchanged
+  var run = int(a.nacon[0])
+  for c in 0 ..< a.ncollision:
+    let iOff = c * NpIntStride
+    a.ibuf[iOff + 7] = int32(run)
+    run += int(a.ibuf[iOff + 0])
+  a.nacon[0] = int32(run)
+
+proc npWriteWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr NpArgs](arg)
+  let last = a.ncollision
+  while true:
+    let base = claimChunk()
+    if base >= last:
+      break
+    let stop = min(last, base + NpChunk)
+    for c in base ..< stop:
+      let iOff = c * NpIntStride
+      let count = int(a.ibuf[iOff + 0])
+      if count == 0:
+        continue
+      let start = int(a.ibuf[iOff + 7])
+      let condimIn = a.ibuf[iOff + 1]
+      let pairid0 = a.ibuf[iOff + 2]
+      let pairid1 = a.ibuf[iOff + 3]
+      let worldid = int(a.ibuf[iOff + 4])
+      let geom1 = a.ibuf[iOff + 5]
+      let geom2 = a.ibuf[iOff + 6]
+      let pOff = c * NpParamStride
+      let margin = a.fbuf[pOff + 14]
+      let gap = a.fbuf[pOff + 15]
+      let adhesion = a.fbuf[pOff + 16]
+      let cBase = a.ncollision * NpParamStride + c * NpKmax * NpContactStride
+      for i in 0 ..< count:
+        let slot = start + i
+        if slot >= a.naconmax:
+          break
+        let cOff = cBase + i * NpContactStride
+        let dist = a.fbuf[cOff + 0]
+        let condim = if (adhesion != 0.0'f32) and (dist >= margin): 1'i32 else: condimIn
+        var contactType = 0'i32
+        if pairid0 >= -1 and dist < margin + gap:
+          contactType = contactType or CtConstraint
+        if pairid1 >= 0:
+          contactType = contactType or CtSensor
+        a.contactDist[slot] = dist
+        for k in 0 ..< 3:
+          a.contactPos[slot * 3 + k] = a.fbuf[cOff + 1 + k]
+        for k in 0 ..< 9:
+          a.contactFrame[slot * 9 + k] = a.fbuf[cOff + 4 + k]
+        a.contactIncludemargin[slot] = margin
+        for k in 0 ..< 5:
+          a.contactFriction[slot * 5 + k] = a.fbuf[pOff + k]
+        for k in 0 ..< 2:
+          a.contactSolref[slot * 2 + k] = a.fbuf[pOff + 5 + k]
+          a.contactSolreffriction[slot * 2 + k] = a.fbuf[pOff + 7 + k]
+        for k in 0 ..< 5:
+          a.contactSolimp[slot * 5 + k] = a.fbuf[pOff + 9 + k]
+        a.contactDim[slot] = condim
+        a.contactGeom[slot * 2] = geom1
+        a.contactGeom[slot * 2 + 1] = geom2
+        a.contactWorldid[slot] = int32(worldid)
+        a.contactType[slot] = contactType
+        a.contactGeomCollisionId[slot] = int32(a.fbuf[cOff + 13])
+        a.contactAdhesion[slot] = adhesion
+        for k in 0 ..< a.njmax:
+          a.contactEfcAddress[slot * a.njmax + k] = -1
+
+proc primitiveNarrowphaseDense*(
+  nworld, ncollision, naconmax, njmax, ngeom, npair: int,
+  marginLead, gapLead, adhesionLead, solmixLead, frictionLead, solrefLead, solimpLead, sizeLead: int,
+  pmarginLead, pgapLead, pfrictionLead, psolrefLead, psolreffrictionLead, psolimpLead, padhesionLead: int,
+  geomType, geomCondim, geomPriority, pairDim: uint64,
+  geomSolmix, geomSolref, geomSolimp, geomFriction, geomMargin, geomGap, geomAdhesion, geomSize: uint64,
+  pairSolref, pairSolreffriction, pairSolimp, pairMargin, pairGap, pairAdhesion, pairFriction: uint64,
+  geomXpos, geomXmat: uint64,
+  collisionPair, collisionPairid, collisionWorldid, ncollisionIn: uint64,
+  contactDist, contactPos, contactFrame, contactIncludemargin, contactFriction: uint64,
+  contactSolref, contactSolreffriction, contactSolimp, contactAdhesion: uint64,
+  contactDim, contactGeom, contactEfcAddress, contactWorldid, contactType, contactGeomCollisionId: uint64,
+  nacon: uint64,
+): void {.exportpy: "primitive_narrowphase_dense".} =
+  if ncollision <= 0:
+    return
+  # the broadphase stops recording pairs at naconmax (it keeps counting), and the
+  # stock kernel only ever visits the first naconmax lanes: ignore the overflow tail
+  let limit = min(ncollision, naconmax)
+  if npFbuf.len < limit * NpParamStride + limit * NpKmax * NpContactStride:
+    npFbuf.setLen(limit * (NpParamStride + NpKmax * NpContactStride))
+  if npIbuf.len < limit * NpIntStride:
+    npIbuf.setLen(limit * NpIntStride)
+  var args = NpArgs(
+    nworld: nworld, ncollision: limit, naconmax: naconmax, njmax: njmax,
+    ngeom: ngeom, npair: npair,
+    marginLead: marginLead, gapLead: gapLead, adhesionLead: adhesionLead, solmixLead: solmixLead,
+    frictionLead: frictionLead, solrefLead: solrefLead, solimpLead: solimpLead, sizeLead: sizeLead,
+    pmarginLead: pmarginLead, pgapLead: pgapLead, pfrictionLead: pfrictionLead,
+    psolrefLead: psolrefLead, psolreffrictionLead: psolreffrictionLead, psolimpLead: psolimpLead,
+    padhesionLead: padhesionLead,
+    geomType: toPtr[int32](geomType), geomCondim: toPtr[int32](geomCondim),
+    geomPriority: toPtr[int32](geomPriority), pairDim: toPtr[int32](pairDim),
+    geomSolmix: toPtr[float32](geomSolmix), geomSolref: toPtr[float32](geomSolref),
+    geomSolimp: toPtr[float32](geomSolimp), geomFriction: toPtr[float32](geomFriction),
+    geomMargin: toPtr[float32](geomMargin), geomGap: toPtr[float32](geomGap),
+    geomAdhesion: toPtr[float32](geomAdhesion), geomSize: toPtr[float32](geomSize),
+    pairSolref: toPtr[float32](pairSolref), pairSolreffriction: toPtr[float32](pairSolreffriction),
+    pairSolimp: toPtr[float32](pairSolimp), pairMargin: toPtr[float32](pairMargin),
+    pairGap: toPtr[float32](pairGap), pairAdhesion: toPtr[float32](pairAdhesion),
+    pairFriction: toPtr[float32](pairFriction),
+    geomXpos: toPtr[float32](geomXpos), geomXmat: toPtr[float32](geomXmat),
+    collisionPair: toPtr[int32](collisionPair), collisionPairid: toPtr[int32](collisionPairid),
+    collisionWorldid: toPtr[int32](collisionWorldid), ncollisionPtr: toPtr[int32](ncollisionIn),
+    contactDist: toPtr[float32](contactDist), contactPos: toPtr[float32](contactPos),
+    contactFrame: toPtr[float32](contactFrame), contactIncludemargin: toPtr[float32](contactIncludemargin),
+    contactFriction: toPtr[float32](contactFriction), contactSolref: toPtr[float32](contactSolref),
+    contactSolreffriction: toPtr[float32](contactSolreffriction),
+    contactSolimp: toPtr[float32](contactSolimp), contactAdhesion: toPtr[float32](contactAdhesion),
+    contactDim: toPtr[int32](contactDim), contactGeom: toPtr[int32](contactGeom),
+    contactEfcAddress: toPtr[int32](contactEfcAddress), contactWorldid: toPtr[int32](contactWorldid),
+    contactType: toPtr[int32](contactType), contactGeomCollisionId: toPtr[int32](contactGeomCollisionId),
+    nacon: toPtr[int32](nacon),
+    fbuf: cast[ptr UncheckedArray[float32]](addr npFbuf[0]),
+    ibuf: cast[ptr UncheckedArray[int32]](addr npIbuf[0]),
+  )
+  runJob(npPairWorker, addr args, limit)
+  npScanContacts(addr args)
+  runJob(npWriteWorker, addr args, limit)
+
+
+# ------------------------------------------------------------------------------
+# Recursive Newton-Euler (mirror of smooth.rne): bias forces and internal body
+# forces.  Warp runs the five stages as separate single-lane kernels over
+# (nworld, *) grids; here one worker walks a whole world, and the branch /
+# body-tree order is the serial kernel order, so results stay bit-exact.
+
+type
+  RneArgs = object
+    nworld, nbody, nbranch, nv, nlevel, gravityWorlds: int
+    qvelStride, qaccStride, cdofStride, cdofDotStride, qfrcBiasStride, caccStride: int
+    gravityEnabled: bool
+    bodyParentid, bodyDofnum, bodyDofadr, bodyBranches, bodyBranchStart, dofBodyid: ptr UncheckedArray[int32]
+    bodyTree, treeOffsets: ptr UncheckedArray[int32]
+    gravity, qvel, qacc, cdof, cdofDot, cinert, cvel, cacc, cfrcInt, qfrcBias: ptr UncheckedArray[float32]
+
+func inertVecArr(c: ptr UncheckedArray[float32], co: int, v: array[6, float32]): array[6, float32] {.inline.} =
+  # mju_mulInertVec: 6D vector times 6D inertia
+  let i0 = c[co]
+  let i1 = c[co + 1]
+  let i2 = c[co + 2]
+  let i3 = c[co + 3]
+  let i4 = c[co + 4]
+  let i5 = c[co + 5]
+  let i6 = c[co + 6]
+  let i7 = c[co + 7]
+  let i8 = c[co + 8]
+  let i9 = c[co + 9]
+  [i0 * v[0] + i3 * v[1] + i4 * v[2] - i8 * v[4] + i7 * v[5],
+   i3 * v[0] + i1 * v[1] + i5 * v[2] + i8 * v[3] - i6 * v[5],
+   i4 * v[0] + i5 * v[1] + i2 * v[2] - i7 * v[3] + i6 * v[4],
+   i8 * v[1] - i7 * v[2] + i9 * v[3],
+   i6 * v[2] - i8 * v[0] + i9 * v[4],
+   i7 * v[0] - i6 * v[1] + i9 * v[5]]
+
+func motionCrossForce(v: array[6, float32], f: array[6, float32]): array[6, float32] {.inline.} =
+  # ang = cross(v0, f0) + cross(v1, f1); vel = cross(v0, f1)
+  let ang0 = (v[1] * f[2] - v[2] * f[1]) + (v[4] * f[5] - v[5] * f[4])
+  let ang1 = (v[2] * f[0] - v[0] * f[2]) + (v[5] * f[3] - v[3] * f[5])
+  let ang2 = (v[0] * f[1] - v[1] * f[0]) + (v[3] * f[4] - v[4] * f[3])
+  let vel0 = v[1] * f[5] - v[2] * f[4]
+  let vel1 = v[2] * f[3] - v[0] * f[5]
+  let vel2 = v[0] * f[4] - v[1] * f[3]
+  [ang0, ang1, ang2, vel0, vel1, vel2]
+
+proc rneWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
+  let a = cast[ptr RneArgs](arg)
+  let chunk = max(1, (a.nworld + nthreads * 4 - 1) div (nthreads * 4))
+  while true:
+    let first = claimTask() * chunk
+    if first >= a.nworld:
+      break
+    let last = min(a.nworld, first + chunk)
+    for w in first ..< last:
+      let caccOff = w * a.caccStride
+      let cinOff = w * a.nbody * 10  # cinert is 10 wide per body
+      let qvOff = w * a.qvelStride
+      let qaOff = w * a.qaccStride
+      let cdOff = w * a.cdofStride
+      let cddOff = w * a.cdofDotStride
+
+      # cacc[0] = spatial_vector(0, -gravity)
+      for c in 0 ..< 6:
+        a.cacc[caccOff + c] = 0.0'f32
+      if a.gravityEnabled:
+        let gw = w mod a.gravityWorlds
+        for c in 0 ..< 3:
+          a.cacc[caccOff + 3 + c] = -a.gravity[gw * 3 + c]
+
+      # forward pass over branches
+      for branch in 0 ..< a.nbranch:
+        let start = int(a.bodyBranchStart[branch])
+        let stop = int(a.bodyBranchStart[branch + 1])
+        if start >= stop:
+          continue
+        let body0 = int(a.bodyBranches[start])
+        let pid = int(a.bodyParentid[body0])
+        var local: array[6, float32]
+        for c in 0 ..< 6:
+          local[c] = a.cacc[caccOff + pid * 6 + c]
+        for i in start ..< stop:
+          let bodyid = int(a.bodyBranches[i])
+          let dofnum = int(a.bodyDofnum[bodyid])
+          let dofadr = int(a.bodyDofadr[bodyid])
+          for j in 0 ..< dofnum:
+            let k = 6 * (dofadr + j)
+            for c in 0 ..< 6:
+              local[c] += a.cdofDot[cddOff + k + c] * a.qvel[qvOff + dofadr + j]
+          for c in 0 ..< 6:
+            a.cacc[caccOff + bodyid * 6 + c] = local[c]
+
+      # cfrc: body 0 is zero, the rest from cinert, cvel and cacc
+      for c in 0 ..< 6:
+        a.cfrcInt[caccOff + c] = 0.0'f32
+      for bodyid in 1 ..< a.nbody:
+        let bo = caccOff + bodyid * 6
+        let io = cinOff + bodyid * 10
+        var cacc, cvel: array[6, float32]
+        for c in 0 ..< 6:
+          cacc[c] = a.cacc[bo + c]
+          cvel[c] = a.cvel[bo + c]
+        let frc = inertVecArr(a.cinert, io, cacc)
+        let tmp = inertVecArr(a.cinert, io, cvel)
+        let mcf = motionCrossForce(cvel, tmp)
+        for c in 0 ..< 6:
+          a.cfrcInt[bo + c] = frc[c] + mcf[c]
+
+      # backward pass: level order matches reversed(m.body_tree), node order is
+      # the kernel order, so parents accumulate children in the serial order
+      for level in countdown(a.nlevel - 1, 0):
+        for node in int(a.treeOffsets[level]) ..< int(a.treeOffsets[level + 1]):
+          let bodyid = int(a.bodyTree[node])
+          if bodyid == 0:
+            continue
+          let pid = int(a.bodyParentid[bodyid])
+          for c in 0 ..< 6:
+            a.cfrcInt[caccOff + pid * 6 + c] += a.cfrcInt[caccOff + bodyid * 6 + c]
+
+      # qfrc_bias = cdof . cfrc_int
+      for dof in 0 ..< a.nv:
+        let bodyid = int(a.dofBodyid[dof])
+        let cdofOff = cdOff + dof * 6
+        let cfOff = caccOff + bodyid * 6
+        var acc = 0.0'f32
+        for c in 0 ..< 6:
+          acc += a.cdof[cdofOff + c] * a.cfrcInt[cfOff + c]
+        a.qfrcBias[w * a.qfrcBiasStride + dof] = acc
+
+proc rneDense*(
+  nworld, nbody, nbranch, nv, nlevel, gravityWorlds: int,
+  qvelStride, qaccStride, cdofStride, cdofDotStride, qfrcBiasStride, caccStride: int,
+  gravityEnabled: int,
+  bodyParentid, bodyDofnum, bodyDofadr, bodyBranches, bodyBranchStart, dofBodyid: uint64,
+  bodyTree, treeOffsets: uint64,
+  gravity, qvel, qacc, cdof, cdofDot, cinert, cvel, cacc, cfrcInt, qfrcBias: uint64,
+): void {.exportpy: "rne_dense".} =
+  if nworld <= 0:
+    return
+  var args = RneArgs(
+    nworld: nworld, nbody: nbody, nbranch: nbranch, nv: nv, nlevel: nlevel,
+    gravityWorlds: gravityWorlds,
+    qvelStride: qvelStride, qaccStride: qaccStride, cdofStride: cdofStride,
+    cdofDotStride: cdofDotStride, qfrcBiasStride: qfrcBiasStride, caccStride: caccStride,
+    gravityEnabled: gravityEnabled != 0,
+    bodyParentid: toPtr[int32](bodyParentid), bodyDofnum: toPtr[int32](bodyDofnum),
+    bodyDofadr: toPtr[int32](bodyDofadr), bodyBranches: toPtr[int32](bodyBranches),
+    bodyBranchStart: toPtr[int32](bodyBranchStart), dofBodyid: toPtr[int32](dofBodyid),
+    bodyTree: toPtr[int32](bodyTree), treeOffsets: toPtr[int32](treeOffsets),
+    gravity: toPtr[float32](gravity), qvel: toPtr[float32](qvel), qacc: toPtr[float32](qacc),
+    cdof: toPtr[float32](cdof), cdofDot: toPtr[float32](cdofDot),
+    cinert: toPtr[float32](cinert), cvel: toPtr[float32](cvel), cacc: toPtr[float32](cacc),
+    cfrcInt: toPtr[float32](cfrcInt), qfrcBias: toPtr[float32](qfrcBias),
+  )
+  runJob(rneWorker, addr args, nworld)

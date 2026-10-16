@@ -26,10 +26,10 @@ the whole module skips.
 
 import unittest
 
+import mujoco
 import numpy as np
 import warp as wp
 
-import mujoco
 import mujoco_warp
 from mujoco_warp._src import nim_cpu
 
@@ -39,6 +39,7 @@ FAST_PATHS = (
   "smooth_com_pos_dense",
   "smooth_com_vel_dense",
   "nxn_broadphase_dense",
+  "primitive_narrowphase_dense",
   "efc_contact_init_dense",
   "efc_contact_update_dense",
   "gravity_force_dense",

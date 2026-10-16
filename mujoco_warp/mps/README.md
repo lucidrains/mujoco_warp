@@ -43,11 +43,19 @@ tables live in `mif`.
 CPU fast paths: on the Warp CPU backend every kernel runs on a single lane, so the
 scalar step pipeline dominates. The Nim worker pool (`_src/nim_cpu_ops.nim`, loaded
 best-effort via `nimporter-plus`) mirrors the hot kernels - dense solver, forward
-kinematics, subtree CoM/inertias, body velocities, NxN broadphase, contact rows,
-actuation, passive forces, applied forces, integration - and reproduces the serial
-Warp ordering (contacts are emitted world-major). The ported kernels are bit-exact
-against their Warp counterparts on the humanoid and the full test suite passes with
-the fast paths enabled (`MUJOCO_WARP_DISABLE_NIM=1` forces the stock kernels).
+kinematics, subtree CoM/inertias, body velocities, recursive Newton-Euler, NxN
+broadphase, primitive narrowphase, contact rows, actuation, passive forces, applied
+forces, integration - and reproduces the serial Warp ordering (the narrowphase
+computes contacts per pair in parallel, then appends them in pair order, so contacts
+are emitted world-major and the downstream efcid assignment is unchanged). The ported
+kernels are bit-exact against their Warp counterparts on the humanoid and the full
+test suite passes with the fast paths enabled (`MUJOCO_WARP_DISABLE_NIM=1` forces the
+stock kernels).
+
+The primitive narrowphase fast path covers plane/sphere/capsule/ellipsoid/cylinder/box
+pairs and capsule-capsule; a model that can emit any other primitive pair type (mesh
+convex, box-box, capsule-box...) keeps the stock kernel, so partial coverage never
+changes results.
 
 Plane-convex contacts follow MuJoCo's `mjc_PlaneConvex`: the support point is the
 first contact, and up to three more come from the max-area quad (`hull4f`) of the

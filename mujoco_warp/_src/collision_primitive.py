@@ -17,6 +17,7 @@ from typing import Tuple
 
 import warp as wp
 
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_core import contact_params
@@ -1445,6 +1446,169 @@ def _primitive_narrowphase(primitive_collisions_types, primitive_collisions_func
 _PRIMITIVE_COLLISION_TYPES = []
 _PRIMITIVE_COLLISION_FUNC = []
 
+# Pair types with a Nim implementation of the core geometry.  The fast path
+# only engages when every primitive pair type the model can emit is covered.
+_NIM_PRIMITIVE_PAIRS = frozenset(
+  {
+    (GeomType.PLANE, GeomType.SPHERE),
+    (GeomType.PLANE, GeomType.CAPSULE),
+    (GeomType.PLANE, GeomType.ELLIPSOID),
+    (GeomType.PLANE, GeomType.CYLINDER),
+    (GeomType.PLANE, GeomType.BOX),
+    (GeomType.SPHERE, GeomType.SPHERE),
+    (GeomType.SPHERE, GeomType.CAPSULE),
+    (GeomType.SPHERE, GeomType.CYLINDER),
+    (GeomType.CAPSULE, GeomType.CAPSULE),
+  }
+)
+
+
+def _nim_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table) -> bool:
+  """Runs the primitive narrowphase on the Nim worker pool when fully covered.
+
+  Returns True when the contacts were produced, False to fall back to Warp.
+  The pair set is checked against the model's pair counts, so a partially
+  covered model never takes this path.
+  """
+  nim_ops = nim_cpu.get_ops()
+  if nim_ops is None or not nim_cpu.enabled("primitive_narrowphase_dense"):
+    return False
+
+  for types in _PRIMITIVE_COLLISIONS:
+    if types not in collision_table:
+      continue
+    idx = upper_trid_index(len(GeomType), types[0].value, types[1].value)
+    if m.geom_pair_type_count[idx] and types not in _NIM_PRIMITIVE_PAIRS:
+      return False
+
+  tables = (
+    m.geom_type,
+    m.geom_condim,
+    m.geom_priority,
+    m.geom_solmix,
+    m.geom_solref,
+    m.geom_solimp,
+    m.geom_friction,
+    m.geom_margin,
+    m.geom_gap,
+    m.geom_adhesion,
+    m.geom_size,
+    m.pair_dim,
+    m.pair_solref,
+    m.pair_solreffriction,
+    m.pair_solimp,
+    m.pair_margin,
+    m.pair_gap,
+    m.pair_adhesion,
+    m.pair_friction,
+    d.geom_xpos,
+    d.geom_xmat,
+    ctx.collision_pair,
+    ctx.collision_pairid,
+    ctx.collision_worldid,
+    d.ncollision,
+    d.contact.dist,
+    d.contact.pos,
+    d.contact.frame,
+    d.contact.includemargin,
+    d.contact.friction,
+    d.contact.solref,
+    d.contact.solreffriction,
+    d.contact.solimp,
+    d.contact.dim,
+    d.contact.geom,
+    d.contact.efc_address,
+    d.contact.worldid,
+    d.contact.type,
+    d.contact.geomcollisionid,
+    d.contact.adhesion,
+    d.nacon,
+  )
+  if not all(nim_cpu.is_contiguous(a) for a in tables):
+    return False
+
+  margin_lead = nim_cpu.layout(m.geom_margin)[0]
+  gap_lead = nim_cpu.layout(m.geom_gap)[0]
+  adhesion_lead = nim_cpu.layout(m.geom_adhesion)[0]
+  solmix_lead = nim_cpu.layout(m.geom_solmix)[0]
+  friction_lead = nim_cpu.layout(m.geom_friction)[0]
+  solref_lead = nim_cpu.layout(m.geom_solref)[0]
+  solimp_lead = nim_cpu.layout(m.geom_solimp)[0]
+  size_lead = nim_cpu.layout(m.geom_size)[0]
+  pmargin_lead = nim_cpu.layout(m.pair_margin)[0]
+  pgap_lead = nim_cpu.layout(m.pair_gap)[0]
+  pfriction_lead = nim_cpu.layout(m.pair_friction)[0]
+  psolref_lead = nim_cpu.layout(m.pair_solref)[0]
+  psolreffriction_lead = nim_cpu.layout(m.pair_solreffriction)[0]
+  psolimp_lead = nim_cpu.layout(m.pair_solimp)[0]
+  padhesion_lead = nim_cpu.layout(m.pair_adhesion)[0]
+
+  nim_ops.primitive_narrowphase_dense(
+    d.nworld,
+    int(d.ncollision.numpy()[0]),
+    d.naconmax,
+    d.contact.efc_address.shape[1],
+    m.ngeom,
+    m.npair,
+    margin_lead,
+    gap_lead,
+    adhesion_lead,
+    solmix_lead,
+    friction_lead,
+    solref_lead,
+    solimp_lead,
+    size_lead,
+    pmargin_lead,
+    pgap_lead,
+    pfriction_lead,
+    psolref_lead,
+    psolreffriction_lead,
+    psolimp_lead,
+    padhesion_lead,
+    nim_cpu.ptr(m.geom_type),
+    nim_cpu.ptr(m.geom_condim),
+    nim_cpu.ptr(m.geom_priority),
+    nim_cpu.ptr(m.pair_dim),
+    nim_cpu.ptr(m.geom_solmix),
+    nim_cpu.ptr(m.geom_solref),
+    nim_cpu.ptr(m.geom_solimp),
+    nim_cpu.ptr(m.geom_friction),
+    nim_cpu.ptr(m.geom_margin),
+    nim_cpu.ptr(m.geom_gap),
+    nim_cpu.ptr(m.geom_adhesion),
+    nim_cpu.ptr(m.geom_size),
+    nim_cpu.ptr(m.pair_solref),
+    nim_cpu.ptr(m.pair_solreffriction),
+    nim_cpu.ptr(m.pair_solimp),
+    nim_cpu.ptr(m.pair_margin),
+    nim_cpu.ptr(m.pair_gap),
+    nim_cpu.ptr(m.pair_adhesion),
+    nim_cpu.ptr(m.pair_friction),
+    nim_cpu.ptr(d.geom_xpos),
+    nim_cpu.ptr(d.geom_xmat),
+    nim_cpu.ptr(ctx.collision_pair),
+    nim_cpu.ptr(ctx.collision_pairid),
+    nim_cpu.ptr(ctx.collision_worldid),
+    nim_cpu.ptr(d.ncollision),
+    nim_cpu.ptr(d.contact.dist),
+    nim_cpu.ptr(d.contact.pos),
+    nim_cpu.ptr(d.contact.frame),
+    nim_cpu.ptr(d.contact.includemargin),
+    nim_cpu.ptr(d.contact.friction),
+    nim_cpu.ptr(d.contact.solref),
+    nim_cpu.ptr(d.contact.solreffriction),
+    nim_cpu.ptr(d.contact.solimp),
+    nim_cpu.ptr(d.contact.adhesion),
+    nim_cpu.ptr(d.contact.dim),
+    nim_cpu.ptr(d.contact.geom),
+    nim_cpu.ptr(d.contact.efc_address),
+    nim_cpu.ptr(d.contact.worldid),
+    nim_cpu.ptr(d.contact.type),
+    nim_cpu.ptr(d.contact.geomcollisionid),
+    nim_cpu.ptr(d.nacon),
+  )
+  return True
+
 
 @event_scope
 def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]]):
@@ -1472,6 +1636,9 @@ def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_ta
     if m.geom_pair_type_count[idx] and types not in _PRIMITIVE_COLLISION_TYPES:
       _PRIMITIVE_COLLISION_TYPES.append(types)
       _PRIMITIVE_COLLISION_FUNC.append(func)
+
+  if _nim_narrowphase(m, d, ctx, collision_table):
+    return
 
   wp.launch(
     _primitive_narrowphase(_PRIMITIVE_COLLISION_TYPES, _PRIMITIVE_COLLISION_FUNC),

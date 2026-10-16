@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mujoco_warp_lucidrains_fork"
-version = "0.0.3"
+version = "0.0.4"
 authors = [
     {name = "Newton Developers", email = "mujoco@deepmind.com"},
     {name = "lucidrains"},
