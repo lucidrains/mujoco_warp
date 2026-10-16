@@ -13,10 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
+
+from __future__ import annotations
+
 from typing import Optional
 
 import warp as wp
 
+from mujoco_warp._src import nim_cpu
 from mujoco_warp._src.collision_convex import convex_narrowphase
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import create_collision_context
@@ -26,7 +30,6 @@ from mujoco_warp._src.collision_flex import flex_collision
 from mujoco_warp._src.collision_primitive import primitive_narrowphase
 from mujoco_warp._src.collision_sdf import sdf_narrowphase
 from mujoco_warp._src.math import upper_tri_index
-from mujoco_warp._src import nim_cpu
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import BroadphaseFilter
 from mujoco_warp._src.types import BroadphaseType

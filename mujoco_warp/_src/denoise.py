@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
 """SVGF-style a-trous denoiser for path-traced radiance.
 
 Pipeline (when primary-hit albedo is provided):
@@ -29,6 +30,8 @@ directly. Importance weights cap the tolerated luminance difference relative to
 the center luminance so bright outliers cannot smear while dark neighbors
 reject them (which would leak energy out of highlights).
 """
+
+from __future__ import annotations
 
 from typing import Optional
 

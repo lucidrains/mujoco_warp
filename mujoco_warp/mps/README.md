@@ -2,6 +2,19 @@
 
 World-batched rigid-body simulation engine written directly on MLX (Metal) for Apple silicon, mirroring the `mujoco_warp` physics pipeline in float32.
 
+## Install
+
+```bash
+pip install "mujoco_warp_lucidrains_fork[mlx,nim]"   # or: uv add ...
+```
+
+- `mlx` - the MLX (Metal) engine in `mujoco_warp.mps` (Apple silicon).
+- `nim` - the Nim CPU fast paths (requires a Nim compiler; the package builds them on first
+  import via `nimporter-plus` and falls back to the stock Warp kernels when unavailable).
+
+Both extras are best-effort at runtime: without `mlx` the Warp backends still work, and
+without `nim`/a compiler the CPU path uses the stock kernels.
+
 Fused Metal kernels:
 
 1. **K1 (`dyn`)**: Forward kinematics, local geom transforms, subtree CoM, composite rigid body inertia (`cinert`/`crb`), joint-space mass matrix $M$, spatial velocities and accelerations (`cvel`/`cacc`/`cdofdot`), recursive Newton-Euler bias forces (`qfrc_bias`), actuation, passive damping, and fused collision narrowphase + constraint row assembly (joint friction, hinge limits, pyramidal contacts).
