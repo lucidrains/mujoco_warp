@@ -1055,7 +1055,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mujoco-warp-mlx"
+name = "mujoco-warp-lucidrains-fork"
 version = "3.14.1"
 source = { editable = "." }
 dependencies = [

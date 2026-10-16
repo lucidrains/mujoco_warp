@@ -1,0 +1,6 @@
+# Keep the published artifacts to what ships at runtime: the package sources
+# (test modules are dropped by the build hook in setup.py), the Nim CPU sources
+# and the humanoid scene used by mujoco_warp.mps.bench / mujoco_warp.mps.validate.
+global-exclude *_test.py conftest.py
+prune mujoco_warp/test_data
+graft mujoco_warp/test_data/humanoid

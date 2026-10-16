@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco-warp-mlx"
+name = "mujoco_warp_lucidrains_fork"
 version = "3.14.1"
 authors = [
     {name = "Newton Developers", email = "mujoco@deepmind.com"},
@@ -148,8 +148,10 @@ testpaths = ["mujoco_warp"]
 norecursedirs = ["benchmarks", "contrib"]
 
 [tool.setuptools]
+# runtime data only: the humanoid scene used by `mps.bench` / `mps.validate`
+# plus the Nim sources the CPU fast paths compile on import
 package-data = { "mujoco_warp" = [
-    "test_data/**",
+    "test_data/humanoid/*",
     "_src/*.nim",
     "_src/*.nim.cfg",
 ] }
