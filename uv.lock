@@ -1056,7 +1056,7 @@ wheels = [
 
 [[package]]
 name = "mujoco-warp-lucidrains-fork"
-version = "3.14.1"
+version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "absl-py" },
