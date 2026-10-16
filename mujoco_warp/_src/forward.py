@@ -80,23 +80,6 @@ def check_discrete(m: Model):
       raise ValueError("Discrete integrator: sleep with flex not yet supported")
 
 
-_ACTUATION_CACHE: dict[int, tuple] = {}
-
-
-def _integrated_actuators(m: Model) -> bool:
-  """Whether any actuator integrates its activation (dyntype != none).
-
-  `_next_activation` is a no-op when every dyntype is none, so skip the launch.
-  """
-  key = id(m)
-  cached = _ACTUATION_CACHE.get(key)
-  if cached is None or cached[0] is not m:
-    dytypes = m.actuator_dyntype.numpy() if m.nactuator else []
-    cached = (m, bool(len(dytypes) and (dytypes != 0).any()))
-    _ACTUATION_CACHE[key] = cached
-  return cached[1]
-
-
 @wp.kernel
 def _next_position(
   # Model:
@@ -340,8 +323,8 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   """Advance state and time given activation derivatives and acceleration."""
   # TODO(team): can we assume static timesteps?
 
-  # advance activations
-  if _integrated_actuators(m):
+  # advance activations (the kernel writes nothing when no actuator integrates)
+  if m.na > 0:
     wp.launch(
       _next_activation,
       dim=(d.nworld, m.nactuator),
@@ -1473,9 +1456,12 @@ def fwd_velocity(m: Model, d: Data):
     nim_ops.actuator_velocity_dense(
       d.nworld,
       m.nactuator,
-      m.nv,
       nim_cpu.layout(d.qvel)[1],
       nim_cpu.layout(d.actuator_velocity)[1],
+      nim_cpu.layout(d.moment_rownnz)[1],
+      nim_cpu.layout(d.moment_rowadr)[1],
+      nim_cpu.layout(d.moment_colind)[1],
+      nim_cpu.layout(d.actuator_moment)[1],
       nim_cpu.ptr(d.moment_rownnz),
       nim_cpu.ptr(d.moment_rowadr),
       nim_cpu.ptr(d.moment_colind),
@@ -1927,19 +1913,15 @@ def _qfrc_actuator_gravcomp_limits(
   qfrc_actuator_out[worldid, dofid] = qfrc
 
 
-_FIXED_ACTUATION_CACHE: dict[int, tuple] = {}
-
-
 def _fixed_actuation(m: Model) -> bool:
   """Whether every actuator uses a fixed gain, no bias, and no activation dynamics.
 
   The Nim actuation fast path implements exactly this subset (together with the
   scalar joint transmissions checked by `smooth._scalar_joint_transmission`).
   """
-  key = id(m)
-  cached = _FIXED_ACTUATION_CACHE.get(key)
-  if cached is None or cached[0] is not m:
-    ok = bool(
+  cached = getattr(m, "_nim_fixed_actuation", None)
+  if cached is None:
+    cached = bool(
       m.nactuator
       and m.na == 0
       and m.ntendon == 0
@@ -1951,9 +1933,8 @@ def _fixed_actuation(m: Model) -> bool:
       and (m.actuator_actadr.numpy() < 0).all()
       and not (m.callback.act_dyn or m.callback.act_gain or m.callback.act_bias)
     )
-    cached = (m, ok)
-    _FIXED_ACTUATION_CACHE[key] = cached
-  return cached[1]
+    m._nim_fixed_actuation = cached
+  return cached
 
 
 @event_scope
@@ -2082,6 +2063,10 @@ def fwd_actuation(m: Model, d: Data):
         nim_cpu.layout(d.qfrc_actuator)[1],
         nim_cpu.layout(d.qfrc_gravcomp)[1],
         nim_cpu.layout(d.qvel)[1],
+        nim_cpu.layout(d.moment_rownnz)[1],
+        nim_cpu.layout(d.moment_rowadr)[1],
+        nim_cpu.layout(d.moment_colind)[1],
+        nim_cpu.layout(d.actuator_moment)[1],
         nim_cpu.ptr(m.actuator_ctrladr),
         nim_cpu.ptr(m.actuator_trnid),
         nim_cpu.ptr(m.actuator_ctrllimited),

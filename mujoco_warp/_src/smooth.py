@@ -904,22 +904,18 @@ def _cdof(
     res[dofid] = wp.spatial_vector(xaxis, wp.cross(xaxis, offset))
 
 
-_BODY_TREE_CACHE: dict[int, tuple] = {}
-
-
-def _body_tree_flat(m):
-  """Flat (body ids, level offsets) view of m.body_tree, cached per model."""
-  key = id(m)
-  cached = _BODY_TREE_CACHE.get(key)
-  if cached is None or cached[0] is not m:
+def _body_tree_flat(m: Model):
+  """Flat (body ids, level offsets) view of m.body_tree, built once per model."""
+  cached = getattr(m, "_nim_body_tree", None)
+  if cached is None:
     levels = [np.asarray(t.numpy(), np.int32) for t in m.body_tree]
     flat = np.concatenate(levels) if levels else np.zeros(0, np.int32)
     offsets = np.zeros(len(levels) + 1, np.int32)
     for i, level in enumerate(levels):
       offsets[i + 1] = offsets[i] + len(level)
-    cached = (m, wp.array(flat, dtype=int), wp.array(offsets, dtype=int))
-    _BODY_TREE_CACHE[key] = cached
-  return cached[1], cached[2]
+    cached = (wp.array(flat, dtype=int), wp.array(offsets, dtype=int))
+    m._nim_body_tree = cached
+  return cached
 
 
 @event_scope
@@ -3482,26 +3478,21 @@ def _transmission_body_moment_scale(
     actuator_moment_out[worldid, rowadr + dofid] /= -float(ncon)
 
 
-_TRANSMISSION_CACHE: dict[int, tuple] = {}
-
-
 def _scalar_joint_transmission(m: Model) -> bool:
   """Whether every actuator is a joint transmission driving a scalar (slide/hinge) joint."""
-  key = id(m)
-  cached = _TRANSMISSION_CACHE.get(key)
-  if cached is None or cached[0] is not m:
-    ok = True
+  cached = getattr(m, "_nim_scalar_joint_transmission", None)
+  if cached is None:
+    cached = True
     if m.nactuator:
       trntype = m.actuator_trntype.numpy()
       trnid = m.actuator_trnid.numpy()
       jnt_type = m.jnt_type.numpy()
-      ok = bool(
+      cached = bool(
         ((trntype == TrnType.JOINT) | (trntype == TrnType.JOINTINPARENT)).all()
         and all(jnt_type[int(trnid[uid][0])] in (JointType.SLIDE, JointType.HINGE) for uid in range(m.nactuator))
       )
-    cached = (m, ok)
-    _TRANSMISSION_CACHE[key] = cached
-  return cached[1]
+    m._nim_scalar_joint_transmission = cached
+  return cached
 
 
 @event_scope
@@ -3541,6 +3532,11 @@ def transmission(m: Model, d: Data):
       nim_cpu.layout(m.actuator_gear)[0],
       nim_cpu.layout(m.actuator_gear)[1],
       nim_cpu.layout(d.qpos)[1],
+      nim_cpu.layout(d.actuator_length)[1],
+      nim_cpu.layout(d.actuator_moment)[1],
+      nim_cpu.layout(d.moment_rownnz)[1],
+      nim_cpu.layout(d.moment_rowadr)[1],
+      nim_cpu.layout(d.moment_colind)[1],
       nim_cpu.ptr(m.actuator_trnid),
       nim_cpu.ptr(m.jnt_dofadr),
       nim_cpu.ptr(m.jnt_qposadr),

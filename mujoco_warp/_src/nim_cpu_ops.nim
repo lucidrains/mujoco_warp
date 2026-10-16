@@ -49,8 +49,6 @@ type
     nthreads, generation, remaining: int
     nextTask: Atomic[int]
     stop: bool
-    teamActive: bool
-    barrierCount, barrierPhase: Atomic[int]
 
   Worker = object
     pool: ptr Pool
@@ -67,21 +65,6 @@ func toPtr[T](address: uint64): ptr UncheckedArray[T] {.inline.} =
 
 proc claimTask(): int {.inline, gcsafe.} =
   pool.nextTask.fetchAdd(1, moRelaxed)
-
-proc teamBarrier() {.inline, gcsafe.} =
-  ## Join point for all pool workers inside one job.  No-op when the job owns the
-  ## calling thread (inline execution) or the pool has a single worker.
-  if not pool.teamActive or pool.nthreads <= 1:
-    return
-  let target = pool.nthreads
-  let phase = pool.barrierPhase.load(moRelaxed)
-  if pool.barrierCount.fetchAdd(1, moAcquireRelease) == target - 1:
-    pool.barrierCount.store(0, moRelaxed)
-    pool.nextTask.store(0, moRelaxed)  # each phase restarts task numbering at 0
-    pool.barrierPhase.store(phase + 1, moRelease)
-  else:
-    while pool.barrierPhase.load(moAcquire) == phase:
-      cpuRelax()
 
 proc scratch(buf: var seq[float32], n: int): ptr UncheckedArray[float32] {.inline.} =
   if buf.len < n:
@@ -125,9 +108,6 @@ proc initPool() =
   initCond(pool.work)
   initCond(pool.done)
   pool.nextTask.store(0, moRelaxed)
-  pool.teamActive = false
-  pool.barrierCount.store(0, moRelaxed)
-  pool.barrierPhase.store(0, moRelaxed)
   numThreads = max(1, min(MaxPoolThreads, countProcessors()))
   workers.setLen(numThreads)
   threads.setLen(numThreads)  # POSIX createThread passes `addr`, so the handles must outlive the workers
@@ -150,12 +130,10 @@ proc runJob(job: Job, arg: pointer, nTasks = MaxPoolThreads) =
   pool.nthreads = numThreads
   pool.remaining = numThreads
   pool.nextTask.store(0, moRelaxed)
-  pool.teamActive = true
   inc pool.generation
   broadcast(pool.work)
   while pool.remaining > 0:
     wait(pool.done, pool.lock)
-  pool.teamActive = false
   release(pool.lock)
 
 func choleskyFactorize(a: ptr UncheckedArray[float32], n, stride: int) {.inline.} =
@@ -1312,6 +1290,7 @@ func mulQuat(u, v: Quatf): Quatf {.inline.} =
   ])
 
 func rotVecQuat(vec: Vec3f, quat: Quatf): Vec3f {.inline.} =
+  # mirrors math.rot_vec_quat operation-for-operation (2 * (dot * u), then k * vec, then 2 * s * cross)
   let s = quat[0]
   let u = [quat[1], quat[2], quat[3]]
   let du = u[0] * vec[0] + u[1] * vec[1] + u[2] * vec[2]
@@ -1320,10 +1299,11 @@ func rotVecQuat(vec: Vec3f, quat: Quatf): Vec3f {.inline.} =
   let cx = u[1] * vec[2] - u[2] * vec[1]
   let cy = u[2] * vec[0] - u[0] * vec[2]
   let cz = u[0] * vec[1] - u[1] * vec[0]
+  let twoS = 2.0'f32 * s
   Vec3f([
-    2.0'f32 * du * u[0] + k0 * vec[0] + 2.0'f32 * s * cx,
-    2.0'f32 * du * u[1] + k0 * vec[1] + 2.0'f32 * s * cy,
-    2.0'f32 * du * u[2] + k0 * vec[2] + 2.0'f32 * s * cz,
+    2.0'f32 * (du * u[0]) + k0 * vec[0] + twoS * cx,
+    2.0'f32 * (du * u[1]) + k0 * vec[1] + twoS * cy,
+    2.0'f32 * (du * u[2]) + k0 * vec[2] + twoS * cz,
   ])
 
 func vadd(a, b: Vec3f): Vec3f {.inline.} =
@@ -2766,6 +2746,7 @@ type
     nworld, nu: int
     gearWorlds, gearStride: int
     qposStride: int
+    lengthStride, momentStride, rowNnzStride, rowAdrStride, colindStride: int
     trnid, jntDofadr, jntQposadr: ptr UncheckedArray[int32]
     gear, qpos, actuatorLength, actuatorMoment: ptr UncheckedArray[float32]
     momentRownnz, momentRowadr, momentColind: ptr UncheckedArray[int32]
@@ -2780,26 +2761,33 @@ proc transmissionWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
     let last = min(a.nworld, first + chunk)
     for w in first ..< last:
       let qpOff = w * a.qposStride
-      let awOff = w * a.nu
       let gwOff = (w mod a.gearWorlds) * a.gearStride
+      let lenOff = w * a.lengthStride
+      let rnOff = w * a.rowNnzStride
+      let raOff = w * a.rowAdrStride
+      let colOff = w * a.colindStride
+      let momOff = w * a.momentStride
       for actid in 0 ..< a.nu:
         let jntid = int(a.trnid[actid * 2])
         let vadr = int(a.jntDofadr[jntid])
         let qadr = int(a.jntQposadr[jntid])
         let gear0 = a.gear[gwOff + actid * 6]
-        a.actuatorLength[awOff + actid] = a.qpos[qpOff + qadr] * gear0
-        a.momentRownnz[awOff + actid] = 1'i32
-        a.momentRowadr[awOff + actid] = int32(actid)
-        a.momentColind[awOff + actid] = int32(vadr)
-        a.actuatorMoment[awOff + actid] = gear0
+        a.actuatorLength[lenOff + actid] = a.qpos[qpOff + qadr] * gear0
+        a.momentRownnz[rnOff + actid] = 1'i32
+        a.momentRowadr[raOff + actid] = int32(actid)
+        a.momentColind[colOff + actid] = int32(vadr)
+        a.actuatorMoment[momOff + actid] = gear0
 
 proc transmissionDense*(
   nworld, nu, gearWorlds, gearStride, qposStride: int,
+  lengthStride, momentStride, rowNnzStride, rowAdrStride, colindStride: int,
   trnid, jntDofadr, jntQposadr, gear, qpos: uint64,
   actuatorLength, actuatorMoment, momentRownnz, momentRowadr, momentColind: uint64,
 ): void {.exportpy: "transmission_dense".} =
   var args = TransmissionArgs(
     nworld: nworld, nu: nu, gearWorlds: gearWorlds, gearStride: gearStride, qposStride: qposStride,
+    lengthStride: lengthStride, momentStride: momentStride, rowNnzStride: rowNnzStride,
+    rowAdrStride: rowAdrStride, colindStride: colindStride,
     trnid: toPtr[int32](trnid), jntDofadr: toPtr[int32](jntDofadr), jntQposadr: toPtr[int32](jntQposadr),
     gear: toPtr[float32](gear), qpos: toPtr[float32](qpos),
     actuatorLength: toPtr[float32](actuatorLength), actuatorMoment: toPtr[float32](actuatorMoment),
@@ -2810,8 +2798,9 @@ proc transmissionDense*(
 
 type
   ActuatorVelocityArgs = object
-    nworld, nu, nv: int
+    nworld, nu: int
     qvelStride, actuatorVelocityStride: int
+    rowNnzStride, rowAdrStride, colindStride, momentStride: int
     momentRownnz, momentRowadr, momentColind: ptr UncheckedArray[int32]
     actuatorMoment, qvel, actuatorVelocity: ptr UncheckedArray[float32]
 
@@ -2826,24 +2815,31 @@ proc actuatorVelocityWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.
     for w in first ..< last:
       let qvOff = w * a.qvelStride
       let avOff = w * a.actuatorVelocityStride
+      let rnOff = w * a.rowNnzStride
+      let raOff = w * a.rowAdrStride
+      let colOff = w * a.colindStride
+      let momOff = w * a.momentStride
       for actid in 0 ..< a.nu:
-        let rownnz = int(a.momentRownnz[avOff + actid])
-        let rowadr = int(a.momentRowadr[avOff + actid])
+        let rownnz = int(a.momentRownnz[rnOff + actid])
+        let rowadr = int(a.momentRowadr[raOff + actid])
         var vel = 0.0'f32
         for i in 0 ..< rownnz:
           let sparseid = rowadr + i
-          let colind = int(a.momentColind[avOff + sparseid])
-          vel += a.actuatorMoment[avOff + sparseid] * a.qvel[qvOff + colind]
+          let colind = int(a.momentColind[colOff + sparseid])
+          vel += a.actuatorMoment[momOff + sparseid] * a.qvel[qvOff + colind]
         a.actuatorVelocity[avOff + actid] = vel
 
 proc actuatorVelocityDense*(
-  nworld, nu, nv, qvelStride, actuatorVelocityStride: int,
+  nworld, nu, qvelStride, actuatorVelocityStride: int,
+  rowNnzStride, rowAdrStride, colindStride, momentStride: int,
   momentRownnz, momentRowadr, momentColind: uint64,
   actuatorMoment, qvel, actuatorVelocity: uint64,
 ): void {.exportpy: "actuator_velocity_dense".} =
   var args = ActuatorVelocityArgs(
-    nworld: nworld, nu: nu, nv: nv,
+    nworld: nworld, nu: nu,
     qvelStride: qvelStride, actuatorVelocityStride: actuatorVelocityStride,
+    rowNnzStride: rowNnzStride, rowAdrStride: rowAdrStride,
+    colindStride: colindStride, momentStride: momentStride,
     momentRownnz: toPtr[int32](momentRownnz), momentRowadr: toPtr[int32](momentRowadr),
     momentColind: toPtr[int32](momentColind),
     actuatorMoment: toPtr[float32](actuatorMoment), qvel: toPtr[float32](qvel),
@@ -2853,13 +2849,14 @@ proc actuatorVelocityDense*(
 
 type
   ActuatorForceArgs = object
-    nworld, nu, nv: int
+    nworld, nu, nv, actuatorForceStride: int
     clampCtrl: bool
     gravityEnabled: bool
     ctrlWorlds, ctrlRangeWorlds, gainWorlds, gainStride: int
     forceRangeWorlds, forceRangeStride: int
     actFrcRangeWorlds, actFrcRangeStride: int
     ctrlStride, ctrlRangeStride, forceStride, qfrcStride, gravcompStride, qvelStride: int
+    rowNnzStride, rowAdrStride, colindStride, momentStride: int
     ctrladr: ptr UncheckedArray[int32]
     trnid: ptr UncheckedArray[int32]
     dofJntid, jntActgravcomp: ptr UncheckedArray[int32]
@@ -2878,8 +2875,12 @@ proc actuatorForceWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
       break
     let last = min(a.nworld, first + chunk)
     for w in first ..< last:
-      let awOff = w * a.nu
+      let awOff = w * a.actuatorForceStride
       let qfOff = a.qfrcActuatorStride
+      let rnOff = w * a.rowNnzStride
+      let raOff = w * a.rowAdrStride
+      let colOff = w * a.colindStride
+      let momOff = w * a.momentStride
       let crOff = (w mod a.ctrlRangeWorlds) * a.ctrlRangeStride
       let grOff = (w mod a.gainWorlds) * a.gainStride
       let frOff = (w mod a.forceRangeWorlds) * a.forceRangeStride
@@ -2900,12 +2901,12 @@ proc actuatorForceWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
           elif force > hi: force = hi
         a.actuatorForce[w * a.forceStride + actid] = force
 
-        let rownnz = int(a.momentRownnz[awOff + actid])
-        let rowadr = int(a.momentRowadr[awOff + actid])
+        let rownnz = int(a.momentRownnz[rnOff + actid])
+        let rowadr = int(a.momentRowadr[raOff + actid])
         for i in 0 ..< rownnz:
           let sparseid = rowadr + i
-          let colind = int(a.momentColind[awOff + sparseid])
-          a.qfrcActuator[w * qfOff + colind] += a.actuatorMoment[awOff + sparseid] * force
+          let colind = int(a.momentColind[colOff + sparseid])
+          a.qfrcActuator[w * qfOff + colind] += a.actuatorMoment[momOff + sparseid] * force
 
       # gravcomp + joint actuator force limits
       let arOff = (w mod a.actFrcRangeWorlds) * a.actFrcRangeStride
@@ -2926,13 +2927,15 @@ proc actuatorForceDense*(
   ctrlWorlds, ctrlRangeWorlds, gainWorlds, gainStride, forceRangeWorlds, forceRangeStride: int,
   actFrcRangeWorlds, actFrcRangeStride: int,
   ctrlStride, ctrlRangeStride, forceStride, qfrcStride, gravcompStride, qvelStride: int,
+  rowNnzStride, rowAdrStride, colindStride, momentStride: int,
   ctrladr, trnid, ctrllimited, forcelimited, dofJntid, jntActgravcomp, jntActfrclimited: uint64,
   ctrl, ctrlRange, gainprm, forcerange, jntActfrcrange: uint64,
   actuatorMoment, actuatorVelocity, actuatorForce, qfrcActuator, qfrcGravcomp: uint64,
   momentRownnz, momentRowadr, momentColind: uint64,
 ): void {.exportpy: "actuator_force_dense".} =
   var args = ActuatorForceArgs(
-    nworld: nworld, nu: nu, nv: nv, clampCtrl: clampCtrl != 0, gravityEnabled: gravityEnabled != 0,
+    nworld: nworld, nu: nu, nv: nv, actuatorForceStride: forceStride,
+    clampCtrl: clampCtrl != 0, gravityEnabled: gravityEnabled != 0,
     ctrlWorlds: ctrlWorlds, ctrlRangeWorlds: ctrlRangeWorlds, gainWorlds: gainWorlds, gainStride: gainStride,
     forceRangeWorlds: forceRangeWorlds, forceRangeStride: forceRangeStride,
     actFrcRangeWorlds: actFrcRangeWorlds, actFrcRangeStride: actFrcRangeStride,
@@ -2950,6 +2953,8 @@ proc actuatorForceDense*(
     momentRownnz: toPtr[int32](momentRownnz), momentRowadr: toPtr[int32](momentRowadr),
     momentColind: toPtr[int32](momentColind),
     qfrcActuatorStride: qfrcStride,
+    rowNnzStride: rowNnzStride, rowAdrStride: rowAdrStride,
+    colindStride: colindStride, momentStride: momentStride,
   )
   runJob(actuatorForceWorker, addr args, nworld)
 
