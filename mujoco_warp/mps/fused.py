@@ -454,10 +454,10 @@ static inline float g_halton(int index, int base) {
 
 
 # --------------------------------------------------------------------- K1 dyn+rows
-def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool = False, adr_s: dict[str, int] | None = None) -> tuple[str, str]:
+def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool = False, adr_s: dict[str, int] | None = None, packed: bool = True) -> tuple[str, str]:
   """Returns (source, header) for the K1 dyn kernel (source is the kernel body).
 
-  Templates: NBODY NJNT NQ NV NGEOM NCHAIN NU NP RC NFR NLIM BF MBS.
+  Templates: NBODY NJNT NQ NV NGEOM NCHAIN NU NP RC NFR NLIM BF MBS MS.
 
   `adr_f`/`adr_i` give the packed-buffer offsets of the static model tables
   (fewer device buffers than Metal's per-kernel limit). Float tables are read
@@ -470,6 +470,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   NGE, NCH, NU = t["NGEOM"], t["NCHAIN"], t["NU"]
   NP, RC = t["NP"], t["RC"]
   NFR, NLIM, BF = t["NFR"], t["NLIM"], t["BF"]
+  MS = t["MS"]
   MBS = t["MBS"]
   SDFPTS, SDFIT = t["SDFPTS"], t["SDFIT"]
 
@@ -527,6 +528,34 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     if kin
     else ""
   )
+
+  # row storage: `packed` writes only the support entries (Jw[r * MS + k], dof
+  # sup_dofs[meta * MS + k], meta = jmetaw[r]); else dense nv-wide rows for coop
+  if packed:
+    jptr = (
+      f"  device float* Jw = J_out + ((long)w) * {RC} * {MS};\n"
+      f"  device int* jmetaw = jmeta_out + ((long)w) * {RC};"
+    )
+    fr_write = f"    jmetaw[rowidx] = k;\n    Jw[rowidx * {MS} + 0] = 1.0f;"
+    lim_write = f"    jmetaw[rowidx] = {NFR} + k;\n    Jw[rowidx * {MS} + 0] = sgn;"
+    pt_meta = f"        jmetaw[rowidx + dim] = {NFR} + {NLIM} + p;\n        flw[rowidx + dim] = 0.0f;"
+    pt_open = "      int kk = 0;\n"
+    pt_val = f"          Jw[(rowidx + dim) * {MS} + kk] = val;"
+    pt_close = "        kk += 1;\n"
+    # keep bracketed table names out of comments: they get rewritten to mif offsets
+    rows_comment = (
+      f"  // packed rows: row r holds its support values packed at Jw[r * {MS} + k], k\n"
+      "  // below the support's length (sup_num / jmeta give the row's dof list)"
+    )
+  else:
+    jptr = f"  device float* Jw = J_out + ((long)w) * {RC} * {NV};"
+    fr_write = f"    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = 1.0f;"
+    lim_write = f"    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;\n    Jw[rowidx * {NV} + dof] = sgn;"
+    pt_meta = f"        for (int d = 0; d < {NV}; ++d) Jw[(rowidx + dim) * {NV} + d] = 0.0f;\n        flw[rowidx + dim] = 0.0f;"
+    pt_open = ""
+    pt_val = f"          Jw[(rowidx + dim) * {NV} + dof] = val;"
+    pt_close = ""
+    rows_comment = "  // rows stream straight to global memory (no per-thread row arrays)"
 
   # SDF narrowphase (op 6): halton initpoints in the AABB intersection (g1
   # frame) + mjwarp's gradient descent; the deepest point wins. Port of
@@ -978,8 +1007,8 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   }}
 
   // ==================================================== constraint rows
-  // rows stream straight to global memory (no per-thread row arrays)
-  device float* Jw = J_out + ((long)w) * {RC} * {NV};
+{rows_comment}
+{jptr}
   device float* Dw = D_out + ((long)w) * {RC};
   device float* arefw = aref_out + ((long)w) * {RC};
   device float* flw = fl_out + ((long)w) * {RC};
@@ -990,8 +1019,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
   // ---- friction-dof rows
   for (int k = 0; k < {NFR}; ++k) {{
     int dof = fr_dofs[k];
-    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;
-    Jw[rowidx * {NV} + dof] = 1.0f;
+{fr_write}
     Dw[rowidx] = fr_D[k];
     arefw[rowidx] = -fr_b[k] * v[dof];
     flw[rowidx] = fr_fl[k];
@@ -1011,8 +1039,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
     float pos_lim = metal::min(dmin, dmax) - mg;
     if (pos_lim >= 0.0f) continue;
     float sgn = dmin < dmax ? 1.0f : -1.0f;
-    for (int d = 0; d < {NV}; ++d) Jw[rowidx * {NV} + d] = 0.0f;
-    Jw[rowidx * {NV} + dof] = sgn;
+{lim_write}
     flw[rowidx] = 0.0f;
     thread float kb[3];
     g_kbimp(&jnt_solref[j * 2], &jnt_solimp[j * 5], pos_lim, timestep, kb);
@@ -1401,8 +1428,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       if (pos_c >= 0.0f) continue;
       if (rowidx + nd > {RC}) {{ ovr = 1; break; }}
       for (int dim = 0; dim < nd; ++dim) {{
-        for (int d = 0; d < {NV}; ++d) Jw[(rowidx + dim) * {NV} + d] = 0.0f;
-        flw[rowidx + dim] = 0.0f;
+{pt_meta}
       }}
       thread float kb[3];
       g_kbimp(&pair_solref[p * 2], &pair_solimp[p * 5], pos_c, timestep, kb);
@@ -1413,7 +1439,7 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
       const thread float* frmi = frms[i];
       float qv[10];
       for (int dim = 0; dim < nd; ++dim) qv[dim] = 0.0f;
-      for (int dof = 0; dof < {NV}; ++dof) {{
+{pt_open}      for (int dof = 0; dof < {NV}; ++dof) {{
         int a1 = dof_anc[b1 * {NV} + dof];
         int a2 = dof_anc[b2 * {NV} + dof];
         if ((a1 | a2) == 0) continue;
@@ -1441,10 +1467,10 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
           else if (dimd2 == 4) extra = e4;
           else extra = e5;
           float val = base0 + (nd > 1 ? sgnd * extra : 0.0f);
-          Jw[(rowidx + dim) * {NV} + dof] = val;
+{pt_val}
           qv[dim] += val * v[dof];
         }}
-      }}
+{pt_close}      }}
       for (int dim = 0; dim < nd; ++dim) {{
         Dw[rowidx + dim] = Dv;
         arefw[rowidx + dim] = -kb[0] * kb[2] * pos_c - kb[1] * qv[dim];
@@ -1471,9 +1497,10 @@ def dyn_source(t: dict, adr_f: dict[str, int], adr_i: dict[str, int], kin: bool 
 
 # --------------------------------------------------------------------- K2 solve+integrate
 def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str]:
-  """K2 source. Templates: NJNT NQ NV RC ITER LSITER WARMSTART EULERDAMP."""
+  """K2 source. Templates: NJNT NQ NV RC MS ITER LSITER WARMSTART EULERDAMP."""
   NJ, NQ, NV = t["NJNT"], t["NQ"], t["NV"]
   RC, ITER, LSITER = t["RC"], t["ITER"], t["LSITER"]
+  MS = t["MS"]
   WS = t["WARMSTART"]
   ED = t["EULERDAMP"]
   body = f"""
@@ -1527,9 +1554,12 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
     for (int r = 0; r < nefc; ++r) {{
       Dd[r] = D_in[w * {RC} + r];
       fld[r] = fl_in[w * {RC} + r];
+      int meta = jmeta_in[w * {RC} + r];
+      int num = sup_num[meta];
+      int base = meta * {MS};
       float ss = 0.0f;
       // direct index: small inputs may be in the constant address space
-      for (int i = 0; i < {NV}; ++i) ss += J_in[((long)w * {RC} + r) * {NV} + i] * acc[i];
+      for (int k = 0; k < num; ++k) ss += J_in[((long)w * {RC} + r) * {MS} + k] * acc[sup_dofs[base + k]];
       Jaref[r] = ss - aref_in[w * {RC} + r];
     }}
     thread float Ma[{NV}];
@@ -1554,7 +1584,8 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
     for (int i = 0; i < {NV}; ++i) qc[i] = 0.0f;
 
     // lower-triangle Hessian rebuild (h is never read above the diagonal); deferred
-    // past the convergence check so a converged last Newton iteration skips it
+    // past the convergence check so a converged last Newton iteration skips it;
+    // dofs ascend within each support, so di >= dj keeps the lower triangle
 #define REBUILD_LH() \\
     {{ \\
       for (int i = 0; i < {NV}; ++i) \\
@@ -1562,21 +1593,27 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
       for (int r = 0; r < nefc; ++r) {{ \\
         float dqr = squad[r] * Dd[r]; \\
         if (dqr == 0.0f) continue; \\
-        const long jb = ((long)w * {RC} + r) * {NV}; \\
-        thread float jr[{NV}]; \\
-        for (int j = 0; j < {NV}; ++j) jr[j] = J_in[jb + j]; \\
-        for (int i = 0; i < {NV}; ++i) {{ \\
-          float dq2 = dqr * jr[i]; \\
-          for (int j = 0; j <= i; ++j) h[i * {NV} + j] += dq2 * jr[j]; \\
+        int meta = jmeta_in[w * {RC} + r]; \\
+        int num = sup_num[meta]; \\
+        int base = meta * {MS}; \\
+        const long jb = ((long)w * {RC} + r) * {MS}; \\
+        for (int i = 0; i < num; ++i) {{ \\
+          float dq2 = dqr * J_in[jb + i]; \\
+          if (dq2 == 0.0f) continue; \\
+          int di = sup_dofs[base + i]; \\
+          for (int j = 0; j <= i; ++j) h[di * {NV} + sup_dofs[base + j]] += dq2 * J_in[jb + j]; \\
         }} \\
       }} \\
     }}
     REBUILD_LH();
     g_chol_inplace(h, {NV});
     for (int r = 0; r < nefc; ++r) {{
-      const long jbase = ((long)w * {RC} + r) * {NV};
+      int meta = jmeta_in[w * {RC} + r];
       float fr = force[r];
-      for (int i = 0; i < {NV}; ++i) qc[i] += fr * J_in[jbase + i];
+      for (int k = 0; k < sup_num[meta]; ++k) {{
+        int d = sup_dofs[meta * {MS} + k];
+        qc[d] += fr * J_in[((long)w * {RC} + r) * {MS} + k];
+      }}
     }}
     for (int i = 0; i < {NV}; ++i) grad[i] = Ma[i] - smooth[i] - qc[i];
 
@@ -1598,8 +1635,11 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
       float newton_dec = 0.0f;
       for (int i = 0; i < {NV}; ++i) newton_dec -= grad[i] * search[i];
       for (int r = 0; r < nefc; ++r) {{
+        int meta = jmeta_in[w * {RC} + r];
+        int num = sup_num[meta];
+        int base = meta * {MS};
         float ssr = 0.0f;
-        for (int i = 0; i < {NV}; ++i) ssr += J_in[((long)w * {RC} + r) * {NV} + i] * search[i];
+        for (int k = 0; k < num; ++k) ssr += J_in[((long)w * {RC} + r) * {MS} + k] * search[sup_dofs[base + k]];
         jv[r] = ssr;
       }}
 
@@ -1753,9 +1793,12 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
       }}
       for (int i = 0; i < {NV}; ++i) qc[i] = 0.0f;
       for (int r = 0; r < nefc; ++r) {{
-        const long jbase = ((long)w * {RC} + r) * {NV};
+        int meta = jmeta_in[w * {RC} + r];
         float fr = force[r];
-        for (int i = 0; i < {NV}; ++i) qc[i] += fr * J_in[jbase + i];
+        for (int k = 0; k < sup_num[meta]; ++k) {{
+          int d = sup_dofs[meta * {MS} + k];
+          qc[d] += fr * J_in[((long)w * {RC} + r) * {MS} + k];
+        }}
       }}
       float grad_dot = 0.0f;
       for (int i = 0; i < {NV}; ++i) {{
@@ -1839,7 +1882,7 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None) -> tuple[str, str
 def solve_source_coop(t: dict, adr_i: dict[str, int] | None = None, tg: int = 32) -> tuple[str, str]:
   """K2 source, cooperative: one threadgroup (TG threads) per world.
 
-  Templates: NJNT NQ NV RC ITER LSITER WARMSTART EULERDAMP TG.
+  Templates: NJNT NQ NV RC MS ITER LSITER WARMSTART EULERDAMP TG.
   Matrices and vectors live in threadgroup memory; row loops are lane-strided.
   """
   subs = {
@@ -1847,6 +1890,7 @@ def solve_source_coop(t: dict, adr_i: dict[str, int] | None = None, tg: int = 32
     "@NQ@": str(t["NQ"]),
     "@NJ@": str(t["NJNT"]),
     "@RC@": str(t["RC"]),
+    "@MS@": str(t["MS"]),
     "@ITER@": str(t["ITER"]),
     "@LSITER@": str(t["LSITER"]),
     "@WS@": str(t["WARMSTART"]),

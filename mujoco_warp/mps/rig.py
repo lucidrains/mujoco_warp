@@ -415,6 +415,27 @@ class Rig:
     self.contact_row_cap = min(contact_row_cap, max(1, max_rows_needed))
     self.rowcap = self.nfrlim + self.contact_row_cap
 
+    # ---- sparse constraint-row supports: row r walks sup_dofs[meta[r] * maxsup + k],
+    # k < sup_num[meta[r]], with meta[r] = r for friction/limit rows and nfrlim + pair
+    # for contact rows (a pair's rows share the ancestor dofs of its two bodies)
+    sup_dofs, sup_num = [], []
+    for dof in self.friction_dofs:
+      sup_dofs.append([int(dof)])
+    for j in self.limited_joints:
+      sup_dofs.append([int(self.jnt_dofadr[int(j)])])
+    for p in range(self.npairc):
+      b1, b2 = int(self.pair_body1[p]), int(self.pair_body2[p])
+      mask = self.body_isdofancestor[b1] | self.body_isdofancestor[b2]
+      sup_dofs.append([int(d) for d in np.nonzero(mask)[0]])
+    for dofs in sup_dofs:
+      sup_num.append(len(dofs))
+    self.maxsup = int(max(1, max(sup_num) if sup_num else 1))
+    self.sup_num = np.asarray(sup_num, np.int32)
+    padded = np.zeros((len(sup_dofs), self.maxsup), np.int32)
+    for s, dofs in enumerate(sup_dofs):
+      padded[s, : len(dofs)] = dofs
+    self.sup_dofs = np.ascontiguousarray(padded)
+
     # per-geom broadphase band (margin+gap) and local aabb (OBB filter)
     self.geom_mg = np.ascontiguousarray(self.geom_margin + self.geom_gap)
     self.geom_aabb = np.ascontiguousarray(m.geom_aabb.numpy().astype(np.float32).reshape(self.ngeom, 6))

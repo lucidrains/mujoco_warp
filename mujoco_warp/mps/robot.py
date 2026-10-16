@@ -25,36 +25,18 @@ from .rig import Rig
 
 F = mx.float32
 
-_DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF", "MBS", "SDFPTS", "SDFIT")
-_SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "ITER", "LSITER", "WARMSTART", "EULERDAMP", "TG")
+_DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF", "MBS", "MS", "SDFPTS", "SDFIT")
+_SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "MS", "ITER", "LSITER", "WARMSTART", "EULERDAMP", "TG")
 
 _DYN_INPUTS = ["qpos_in", "qvel_in", "ctrl_in", "nworld_buf", "mbf", "mif", "mbs"]
+_SOLVE_CORE = ["qpos_in", "qvel_in", "warm_in", "M_in", "smooth_in", "J_in", "D_in", "aref_in", "fl_in", "nefc_in"]
 _SOLVE_TAIL = ["nworld_buf", "dof_damping", "mif", "opt_buf"]
-_SOLVE_INPUTS = [
-  "qpos_in",
-  "qvel_in",
-  "warm_in",
-  "M_in",
-  "smooth_in",
-  "J_in",
-  "D_in",
-  "aref_in",
-  "fl_in",
-  "nefc_in",
-] + _SOLVE_TAIL
+_SOLVE_INPUTS = _SOLVE_CORE + _SOLVE_TAIL + ["jmeta_in"]  # packed rows only
+_SOLVE_INPUTS_DENSE = _SOLVE_CORE + _SOLVE_TAIL
 
-_DYN_BASE_OUTS = [
-  "M_out",
-  "smooth_out",
-  "bias_out",
-  "J_out",
-  "D_out",
-  "aref_out",
-  "fl_out",
-  "nefc_out",
-  "ncon_out",
-  "overflow_out",
-]
+_DYN_OUTS_TAIL = ["D_out", "aref_out", "fl_out", "nefc_out", "ncon_out", "overflow_out"]
+_DYN_BASE_OUTS = ["M_out", "smooth_out", "bias_out", "J_out", "jmeta_out"] + _DYN_OUTS_TAIL  # packed rows only
+_DYN_BASE_OUTS_DENSE = ["M_out", "smooth_out", "bias_out", "J_out"] + _DYN_OUTS_TAIL
 _DYN_KIN_OUTS = [
   "cdof_out",
   "subtree_com_out",
@@ -160,6 +142,8 @@ _INT_TABLES = [
   "pair_vertnum",
   "pair_usegraph",
   "pair_polyadr",
+  "sup_dofs",
+  "sup_num",
 ]
 
 
@@ -246,7 +230,9 @@ class BatchedEngine:
     cooperating on each world; it wins on latency for small batches and is
     disabled above `coop_max_worlds` (or when threadgroup memory would exceed
     the device budget), where the one-thread-per-world kernel has better
-    throughput.
+    throughput. The one-thread path stores constraint rows packed by their true
+    support (`self.packed`, with `self.jmeta` holding each row's row kind) and
+    the cooperative path stores dense `nv`-wide rows.
     """
     if threadgroup < 1 or (threadgroup & (threadgroup - 1)) != 0:
       raise ValueError(f"threadgroup must be a power of two, got {threadgroup}")
@@ -306,6 +292,7 @@ class BatchedEngine:
       NFR=len(fr_dofs),
       NLIM=rig.nlim,
       BF=rig.broadphase_filter,
+      MS=rig.maxsup,
       SDFPTS=rig.sdf_initpoints,
       SDFIT=rig.sdf_iterations,
     )
@@ -314,6 +301,7 @@ class BatchedEngine:
       NQ=rig.nq,
       NV=rig.nv,
       RC=rig.rowcap,
+      MS=rig.maxsup,
       ITER=max(1, self.iterations),
       LSITER=max(1, rig.ls_iterations),
       WARMSTART=1 if self.warmstart else 0,
@@ -385,6 +373,8 @@ class BatchedEngine:
       "geom_bodyid_i": rig.geom_bodyid,
       "geom_type_i": rig.geom_type,
       "geom_sdf_kind": rig.geom_sdf_kind,
+      "sup_dofs": rig.sup_dofs,
+      "sup_num": rig.sup_num,
       "act_trnid": rig.actuator_trnid[:, 0],
       "act_ctrllimited": rig.actuator_ctrllimited,
       "act_forcelimited": rig.actuator_forcelimited,
@@ -434,30 +424,45 @@ class BatchedEngine:
     self.dof_damping_mx = mx_f32_arr(rig.dof_damping)
     self._solve_opt = mx_f32_arr(np.array([rig.timestep, rig.tolerance, rig.meaninertia, rig.ls_tolerance]))
 
-    src, hdr = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=False, adr_s=self.adr_s)
-    self.dyn_fn = mx.fast.metal_kernel(
-      name="mps_dyn",
-      input_names=_DYN_INPUTS,
-      output_names=_DYN_BASE_OUTS,
-      source=src,
-      header=hdr,
-    )
-    src_ik, hdr_ik = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=True, adr_s=self.adr_s)
-    self.dyn_kin_fn = mx.fast.metal_kernel(
-      name="mps_dyn_kin",
-      input_names=_DYN_INPUTS,
-      output_names=_DYN_BASE_OUTS + _DYN_KIN_OUTS,
-      source=src_ik,
-      header=hdr_ik,
-    )
-    src_s, hdr_s = solve_source(
-      self._t_solve,
-      {k: self.adr_i[k] for k in ("body_parentid", "body_jntadr", "body_jntnum", "jnt_type", "jnt_qposadr", "jnt_dofadr")},
-    )
     # threadgroup memory estimate for the cooperative solve (see fused.solve_source_coop)
     tg_bytes = (2 * rig.nv * rig.nv + 9 * rig.nv + rig.nq + 6 * rig.rowcap + 3 * threadgroup) * 4
     self.coop = bool(coop and nworld <= coop_max_worlds and tg_bytes <= 24 * 1024)
     self.threadgroup = int(threadgroup)
+    # sparse (packed) rows feed the single-thread solve; the cooperative solve
+    # keeps dense rows (its lane-strided loops dislike per-entry dof gathers)
+    packed = not self.coop
+    self.packed = packed
+    base_outs = _DYN_BASE_OUTS if packed else _DYN_BASE_OUTS_DENSE
+    src, hdr = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=False, adr_s=self.adr_s, packed=packed)
+    self.dyn_fn = mx.fast.metal_kernel(
+      name="mps_dyn",
+      input_names=_DYN_INPUTS,
+      output_names=base_outs,
+      source=src,
+      header=hdr,
+    )
+    src_ik, hdr_ik = dyn_source(self._t_dyn, self.adr_f, self.adr_i, kin=True, adr_s=self.adr_s, packed=packed)
+    self.dyn_kin_fn = mx.fast.metal_kernel(
+      name="mps_dyn_kin",
+      input_names=_DYN_INPUTS,
+      output_names=base_outs + _DYN_KIN_OUTS,
+      source=src_ik,
+      header=hdr_ik,
+    )
+    _solve_adr = {
+      k: self.adr_i[k]
+      for k in (
+        "body_parentid",
+        "body_jntadr",
+        "body_jntnum",
+        "jnt_type",
+        "jnt_qposadr",
+        "jnt_dofadr",
+        "sup_dofs",
+        "sup_num",
+      )
+    }
+    src_s, hdr_s = solve_source(self._t_solve, _solve_adr)
     if self.coop:
       src_s, hdr_s = solve_source_coop(
         self._t_solve,
@@ -466,7 +471,7 @@ class BatchedEngine:
       )
     self.solve_fn = mx.fast.metal_kernel(
       name="mps_solve",
-      input_names=_SOLVE_INPUTS,
+      input_names=_SOLVE_INPUTS if packed else _SOLVE_INPUTS_DENSE,
       output_names=_SOLVE_OUTS,
       source=src_s,
       header=hdr_s,
@@ -541,6 +546,24 @@ class BatchedEngine:
     mx.eval(self.qpos, self.qvel)
     return np.array(self.qpos), np.array(self.qvel)
 
+  def dense_J(self) -> np.ndarray:
+    """NumPy (nworld, rowcap, nv) Jacobian (force-evaluates the pending graph)."""
+    mx.eval(self.J)
+    if not self.packed:
+      return np.array(self.J)  # (nw, RC, nv)
+    mx.eval(self.jmeta)
+    J = np.array(self.J)  # (nw, RC, maxsup)
+    meta = np.array(self.jmeta)  # (nw, RC)
+    ms, nv = self.rig.maxsup, self.nv
+    meta = np.clip(meta, 0, self.rig.sup_num.shape[0] - 1)
+    cnt = self.rig.sup_num[meta]  # (nw, RC)
+    kmask = np.arange(ms)[None, None, :] < cnt[:, :, None]
+    # padding entries scatter into a trash column instead of dof 0
+    idx = np.where(kmask, self.rig.sup_dofs[meta], nv).astype(np.intp)
+    dense = np.zeros((self.nworld, self.rowcap, nv + 1), np.float32)
+    np.put_along_axis(dense, idx, J, axis=2)
+    return dense[:, :, :nv]
+
   def step_np(self, ctrl=None):
     """Optional NumPy ctrl in; NumPy (qpos, qvel) out."""
     if ctrl is not None:
@@ -551,6 +574,9 @@ class BatchedEngine:
   def _dyn_dispatch(self, kin: bool):
     nw = self.nworld
     fn = self.dyn_kin_fn if kin else self.dyn_fn
+    # packed rows add a `jmeta` output after J holding each row's kind
+    jmeta_shapes = [(nw, self.rowcap)] if self.packed else []
+    jmeta_dtypes = [mx.int32] if self.packed else []
     dyn_out = fn(
       inputs=[self.qpos, self.qvel, self.ctrl, self._nw_buf, self.mbf, self.mif, self.mbs],
       template=self._dyn_template,
@@ -560,7 +586,8 @@ class BatchedEngine:
         (nw, self.nv, self.nv),
         (nw, self.nv),
         (nw, self.nv),
-        (nw, self.rowcap, self.nv),
+        (nw, self.rowcap, self.rig.maxsup if self.packed else self.nv),
+        *jmeta_shapes,
         (nw, self.rowcap),
         (nw, self.rowcap),
         (nw, self.rowcap),
@@ -584,12 +611,15 @@ class BatchedEngine:
         if kin
         else []
       ),
-      output_dtypes=[F, F, F, F, F, F, F, mx.int32, mx.int32, mx.int32]
+      output_dtypes=[F, F, F, F, *jmeta_dtypes, F, F, F, mx.int32, mx.int32, mx.int32]
       + ([F] * 9 + [mx.int32] if kin else []),
     )
-    self.M, self.smooth, self.qfrc_bias, self.J, self.D, self.aref, self.fl, self.nefc, self.ncon, self.overflow = (
-      dyn_out[:10]
-    )
+    self.M, self.smooth, self.qfrc_bias, self.J = dyn_out[:4]
+    tail = 5 if self.packed else 4
+    if self.packed:
+      self.jmeta = dyn_out[4]
+    (self.D, self.aref, self.fl, self.nefc, self.ncon, self.overflow) = dyn_out[tail : tail + 6]
+    tail += 6
     if kin:
       (
         self.cdof,
@@ -602,7 +632,7 @@ class BatchedEngine:
         self.xipos,
         self.cinert,
         self.pair_conct,
-      ) = dyn_out[10:20]
+      ) = dyn_out[tail : tail + 10]
 
   # --------------------------------------------------------------- step
   def step(self, kin: bool = False, ctrl=None):
@@ -628,7 +658,8 @@ class BatchedEngine:
         self.dof_damping_mx,
         self.mif,
         self._solve_opt,
-      ],
+      ]
+      + ([self.jmeta] if self.packed else []),
       template=self._solve_template,
       grid=(nw * self.threadgroup if self.coop else nw, 1, 1),
       threadgroup=(self.threadgroup if self.coop else 32, 1, 1),

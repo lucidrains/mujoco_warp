@@ -10,6 +10,30 @@ Fused Metal kernels:
 
 Supported scope: free, slide, and hinge joints; collision geoms (primitives, plane-convex meshes, and plugin SDFs incl. metric threaded nut/bolt); pyramidal contacts; Euler integrator; joint motor and position actuators.
 
+Sparse constraint rows: the one-thread-per-world path stores each Jacobian row packed
+by its true support (`J[r * MS + k]` for dof `sup_dofs[meta * MS + k]`, row kind in
+`jmeta`) - the ancestor dofs of the contact pair, or the single friction/limit dof.
+Row assembly in K1 and the `Jaref`/`Jv`/`J^T f`/`J^T D J` loops in K2 then walk 1-15
+entries instead of the full `nv` (and skip the dense zero-fill). The cooperative
+kernel keeps dense rows: its lane-strided loops are latency-bound, and per-entry dof
+gathers measured slower there than the work they remove.
+
+Supported scope: free, slide, and hinge joints; collision geoms (primitives, plane-convex meshes, and plugin SDFs incl. metric threaded nut/bolt); pyramidal contacts; Euler integrator; joint motor and position actuators.
+
+Model tables: the fused dyn kernel reads float tables through a per-world buffer
+(`mbf[w * MBS + offset]`, set via `BatchedEngine.set_world_tables`), which is how
+per-world ramps (`geom_quat`/`geom_pos` of a plane), payloads (`body_mass`),
+actuator gains, friction and gravity are expressed; large static tables
+(`mesh_vert`, `mesh_polynormal`) stay shared across worlds in `mbs`, and int
+tables live in `mif`.
+
+Plane-convex contacts follow MuJoCo's `mjc_PlaneConvex`: the support point is the
+first contact, and up to three more come from the max-area quad (`hull4f`) of the
+mesh face incident to the deepest vertex whose normal is most anti-aligned with
+the plane normal. Both the Metal kernel and the warp CPU `plane_convex` implement
+this, so engine contacts match vanilla MuJoCo on curved meshes (e.g. the
+microduck's multi-thousand-vertex sole meshes) rather than only on boxes.
+
 ---
 
 ## Python API
@@ -36,6 +60,12 @@ eng.step()  # appends to pending MLX graph
 ---
 
 ## Validation
+
+Run the whole check (engine tests in both solve layouts + numeric validation, ~12s):
+
+```bash
+just check
+```
 
 Validate numerical agreement against the `mujoco_warp` CPU backend:
 
@@ -64,14 +94,23 @@ uv run python -m mujoco_warp.mps.bench
 
 ### Humanoid Benchmark Results (Apple M1 Pro, 10 CPU cores / 16 GPU cores)
 
+The MLX column is one (warm-laptop) session of `bench.py` (`--steps 50`); the warp-CPU
+column is the baseline from the same machine and is unaffected by engine changes. Sustained
+GPU load throttles the M1 Pro by ~40%, so compare ratios from runs taken back-to-back.
+
 ```
  worlds | MLX ms/substep | warp-CPU ms/substep | speedup
 --------+----------------+---------------------+--------
-     64 |           1.73 |                9.38 |     5.4x
-    256 |           2.30 |               24.09 |    10.5x
-   1024 |           4.59 |               88.19 |    19.2x
-   4096 |          12.85 |              336.25 |    26.2x
+     64 |           1.93 |                9.38 |     4.9x
+    256 |           1.98 |               24.09 |    12.2x
+   1024 |           3.73 |               88.19 |    23.6x
+   4096 |          10.68 |              336.25 |    31.5x
+  16384 |          42.50 |                    - |        -
 ```
 
-- At 4096 worlds, MLX runs at **~319,000 worlds/s** vs **~12,200 worlds/s** for `mujoco_warp` CPU (**26.2x speedup**).
-- At 16,384 worlds, MLX scales to **~330,000 worlds/s** (49.7 ms/substep).
+- At 4096 worlds, MLX runs at **~385,000 worlds/s** vs **~12,200 worlds/s** for `mujoco_warp` CPU (31.5x speedup); at 16,384 worlds it sustains **~385,000 worlds/s** (42.5 ms/substep).
+- Packed constraint rows speed up the one-thread-per-world path (nworld > 2048):
+  same-process interleaved A/B (bit-identical trajectories, min over runs) gives 1.1-1.2x
+  at 4,096 worlds and 1.3-1.4x at 16,384 worlds, mostly in K2's row loops; K1 also drops
+  its dense row zero-fill. The cooperative kernel (nworld <= 2048) is unchanged
+  (bit-identical Metal sources).
