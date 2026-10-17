@@ -4211,6 +4211,133 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       ctx.search_unchanged.ptr,
       ctx.done.ptr,
       ctx.ls_exhausted.ptr,
+      1 if nim_cpu.tree_enabled(m) else 0,
+      *nim_cpu.tree_tables(m),
+      0,
+      0,
+      0,
+      0,
+      0,
+    )
+    return
+
+  if (
+    nim_ops is not None
+    and nim_cpu.sparse_enabled(m)
+    and nim_cpu.enabled("newton_solve_sparse")
+    and not compact
+    and m.is_sparse
+    and m.opt.solver == types.SolverType.NEWTON
+    and m.opt.cone == types.ConeType.PYRAMIDAL
+    and m.opt.integrator != types.IntegratorType.DISCRETE
+    and m.nv >= 1
+    and all(
+      nim_cpu.is_contiguous(a)
+      for a in (
+        d.M,
+        d.qfrc_smooth,
+        d.qacc_smooth,
+        d.qacc_warmstart,
+        d.qacc,
+        d.qfrc_constraint,
+        d.efc.J,
+        d.efc.J_rownnz,
+        d.efc.J_rowadr,
+        d.efc.J_colind,
+        d.efc.D,
+        d.efc.aref,
+        d.efc.frictionloss,
+        d.efc.force,
+        d.efc.Ma,
+        d.efc.state,
+        ctx.Jaref,
+        ctx.search,
+        ctx.mv,
+        ctx.jv,
+        ctx.grad,
+        ctx.quad_changed_ids,
+      )
+    )
+    and d.efc.J.shape[1] == 1
+    and d.efc.J.shape[2] > 0
+    and d.efc.J_rownnz.shape[1] == d.njmax
+    and d.efc.J_rowadr.shape[1] == d.njmax
+    and ctx.Jaref.shape[1] == d.njmax
+    and ctx.jv.shape[1] == d.njmax
+    and ctx.search.shape[1] == m.nv
+    and ctx.mv.shape[1] == m.nv
+    and ctx.grad.shape[1] == m.nv_pad
+  ):
+    nim_ops.newton_solve_dense(
+      d.nworld,
+      m.nv,
+      m.nv_pad,
+      d.njmax,
+      m.nC,
+      m.opt.iterations,
+      m.opt.ls_iterations,
+      1 if warmstart else 0,
+      m.opt.tolerance.shape[0],
+      m.opt.ls_tolerance.shape[0],
+      m.stat.meaninertia.shape[0],
+      d.qfrc_smooth.shape[1],
+      d.qacc_smooth.shape[1],
+      d.qacc_warmstart.shape[1],
+      d.qacc.shape[1],
+      d.qfrc_constraint.shape[1],
+      d.efc.Ma.shape[1],
+      m.opt.tolerance.ptr,
+      m.opt.ls_tolerance.ptr,
+      m.stat.meaninertia.ptr,
+      m.M_colind.ptr,
+      m.M_hinit_i.ptr,
+      m.M_mulm_rowadr.ptr,
+      m.M_mulm_col.ptr,
+      m.M_mulm_madr.ptr,
+      d.ne.ptr,
+      d.nf.ptr,
+      d.nefc.ptr,
+      d.solver_niter.ptr,
+      d.overflow.ptr,
+      d.M.ptr,
+      d.qfrc_smooth.ptr,
+      d.qacc_smooth.ptr,
+      d.qacc_warmstart.ptr,
+      d.qacc.ptr,
+      d.qfrc_constraint.ptr,
+      d.efc.J.ptr,
+      d.efc.D.ptr,
+      d.efc.aref.ptr,
+      d.efc.frictionloss.ptr,
+      d.efc.force.ptr,
+      d.efc.Ma.ptr,
+      d.efc.state.ptr,
+      ctx.quad_changed_ids.ptr,
+      ctx.quad_changed_count.ptr,
+      ctx.state_changed_count.ptr,
+      ctx.Jaref.ptr,
+      ctx.search.ptr,
+      ctx.search_dot.ptr,
+      ctx.mv.ptr,
+      ctx.jv.ptr,
+      ctx.grad.ptr,
+      ctx.grad_dot.ptr,
+      ctx.newton_decrement.ptr,
+      ctx.grad_scale.ptr,
+      ctx.improvement.ptr,
+      ctx.alpha.ptr,
+      0,
+      0,
+      ctx.search_unchanged.ptr,
+      ctx.done.ptr,
+      ctx.ls_exhausted.ptr,
+      1 if nim_cpu.tree_enabled(m) else 0,
+      *nim_cpu.tree_tables(m),
+      1,
+      d.efc.J_rowadr.ptr,
+      d.efc.J_rownnz.ptr,
+      d.efc.J_colind.ptr,
+      d.efc.J.shape[2],
     )
     return
 

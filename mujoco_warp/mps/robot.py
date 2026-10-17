@@ -28,7 +28,24 @@ from .rig import Rig
 
 F = mx.float32
 
-_DYN_TEMPLATE_KEYS = ("NBODY", "NJNT", "NQ", "NV", "NGEOM", "NCHAIN", "NU", "NP", "RC", "NFR", "NLIM", "BF", "MBS", "MS", "SDFPTS", "SDFIT")
+_DYN_TEMPLATE_KEYS = (
+  "NBODY",
+  "NJNT",
+  "NQ",
+  "NV",
+  "NGEOM",
+  "NCHAIN",
+  "NU",
+  "NP",
+  "RC",
+  "NFR",
+  "NLIM",
+  "BF",
+  "MBS",
+  "MS",
+  "SDFPTS",
+  "SDFIT",
+)
 _SOLVE_TEMPLATE_KEYS = ("NJNT", "NQ", "NV", "RC", "MS", "ITER", "LSITER", "WARMSTART", "EULERDAMP", "TG")
 
 _DYN_INPUTS = ["qpos_in", "qvel_in", "ctrl_in", "nworld_buf", "mbf", "mif", "mbs"]
@@ -131,6 +148,9 @@ _INT_TABLES = [
   "pair_body2",
   "pair_ndim",
   "dof_anc",
+  "dof_desc_ptr",
+  "dof_desc_idx",
+  "dof_depth",
   "rev_dof",
   "tri_pairs",
   "tri_full",
@@ -228,19 +248,23 @@ class BatchedEngine:
     warmstart: bool = True,
     coop: bool = True,
     threadgroup: int = 32,
-    coop_max_worlds: int = 2048,
+    coop_max_worlds: int = 16384,
+    coop_max_j_bytes: int = 1 << 30,
     m_layout: str | None = None,
     coop_solver: str | None = None,
+    tree: bool = False,
   ):
     """Builds kernels and static buffers for `nworld` worlds of `mjm`.
 
     `coop` runs the solve kernel with one threadgroup (`threadgroup` lanes)
     cooperating on each world; it wins on latency for small batches and is
-    disabled above `coop_max_worlds` (or when threadgroup memory would exceed
-    the device budget), where the one-thread-per-world kernel has better
-    throughput. The one-thread path stores constraint rows packed by their true
-    support (`self.packed`, with `self.jmeta` holding each row's row kind) and
-    the cooperative path stores dense `nv`-wide rows.
+    disabled above `coop_max_worlds`, when threadgroup memory would exceed the
+    device budget, or when the dense cooperative Jacobian would exceed
+    `coop_max_j_bytes` (the one-thread path stores the same rows packed by
+    support, so it scales to larger batches). The one-thread path stores
+    constraint rows packed by their true support (`self.packed`, with
+    `self.jmeta` holding each row's row kind) and the cooperative path stores
+    dense `nv`-wide rows.
 
     `m_layout` selects the mass-matrix storage consumed by the solve kernel:
     `"dense"` (the original `nv x nv` block) or `"packed"` (one ancestor chain
@@ -250,11 +274,24 @@ class BatchedEngine:
     Defaults to `$MUJOCO_WARP_MPS_M` (`dense` when unset).
 
     `coop_solver` selects the cooperative solve variant (ignored when `coop` is
-    off): `"v1"` (default) is the row-owned Cholesky with a full-width row scan in
-    the rebuild; `"v2"` walks the trailing triangle and the rebuild's support
-    pairs as flat lists so every lane shares the same iteration count (bit-exact
-    with v1, ~1.04-1.25x faster at 64-2048 worlds on the humanoid). Requires
-    `threadgroup=32`. Defaults to `$MUJOCO_WARP_MPS_COOP` (`v1` when unset).
+    off): `"v1"` is the row-owned Cholesky with a full-width row scan in the
+    rebuild; `"v2"` walks the trailing triangle and the rebuild's support pairs
+    as flat lists so every lane shares the same iteration count (bit-exact with
+    v1, faster at every measured batch size: 1.04-1.25x over v1 and 1.1-1.2x
+    over the packed one-thread solve at 1024-16384 worlds). Requires
+    `threadgroup=32`. Defaults to `$MUJOCO_WARP_MPS_COOP` (`v2` when unset and
+    `threadgroup=32`, else `v1`).
+
+    `tree=True` factorizes the solver Hessian with a tree LDL^T instead of dense
+    Cholesky. It is valid when every active constraint row is supported on one
+    root-to-leaf dof chain (ground contacts, the common locomotion case), which
+    keeps H tree-sparse. A row coupling two branches is not represented, so this
+    is opt-in and intended for scenes whose active contacts are ground contacts;
+    `coop` is disabled in tree mode (the tree path runs on the one-thread solve).
+    The elimination order differs from dense Cholesky, so results are close but
+    not bit-identical. On an 81-dof model the full step is ~2.1-2.3x faster at
+    64-1024 worlds (K1 collision dominates at larger batches); on the 27-dof
+    humanoid the cooperative solve is still faster.
     """
     if threadgroup < 1 or (threadgroup & (threadgroup - 1)) != 0:
       raise ValueError(f"threadgroup must be a power of two, got {threadgroup}")
@@ -269,6 +306,7 @@ class BatchedEngine:
 
     self.iterations = int(iterations if iterations is not None else rig.iterations)
     self.warmstart = bool(warmstart and rig.warmstart)
+    self.tree = bool(tree)
 
     # ---- mass-matrix layout: "dense" (nv x nv block) or "packed" (per-dof
     # ancestor chain, `NCH` floats per dof, applied via dof_pad/rev_dof)
@@ -411,6 +449,9 @@ class BatchedEngine:
       "pair_body2": rig.pair_body2,
       "pair_ndim": rig.pair_ndim,
       "dof_anc": rig.body_isdofancestor,
+      "dof_desc_ptr": rig.dof_desc_ptr,
+      "dof_desc_idx": rig.dof_desc_idx,
+      "dof_depth": rig.dof_depth,
       "rev_dof": rig.rev_dof,
       "tri_pairs": rig.tri_pairs,
       "tri_full": rig.tri_full,
@@ -453,7 +494,11 @@ class BatchedEngine:
 
     # threadgroup memory estimate for the cooperative solve (see fused.solve_source_coop)
     tg_bytes = (2 * rig.nv * rig.nv + 9 * rig.nv + rig.nq + 6 * rig.rowcap + 3 * threadgroup) * 4
-    self.coop = bool(coop and nworld <= coop_max_worlds and tg_bytes <= 24 * 1024)
+    # dense cooperative rows: nworld * rowcap * nv floats (the one-thread path packs by support)
+    coop_j_bytes = nworld * rig.rowcap * rig.nv * 4
+    self.coop = bool(
+      coop and not self.tree and nworld <= coop_max_worlds and tg_bytes <= 24 * 1024 and coop_j_bytes <= coop_max_j_bytes
+    )
     self.threadgroup = int(threadgroup)
     # sparse (packed) rows feed the single-thread solve; the cooperative solve
     # keeps dense rows (its lane-strided loops dislike per-entry dof gathers)
@@ -462,17 +507,21 @@ class BatchedEngine:
     # the packed mass-matrix layout rides the single-thread solve (its M path is
     # per-lane in the cooperative solve, where chains save little); requesting it
     # with `coop` active keeps the dense block
-    self.packed_m = bool(self.packed_m and not self.coop)
+    # tree mode builds H in the same (nv, nch) chain layout as packed M
+    self.packed_m = bool((self.packed_m and not self.coop) or self.tree)
     self.m_layout = "packed" if self.packed_m else "dense"
     # cooperative solve variant: "v1" (row-owned factor) or "v2" (balanced
     # flat-triangle factor); only meaningful when `coop` is active
+    explicit_solver = coop_solver is not None or "MUJOCO_WARP_MPS_COOP" in os.environ
     if coop_solver is None:
-      coop_solver = os.environ.get("MUJOCO_WARP_MPS_COOP", "v1")
+      coop_solver = os.environ.get("MUJOCO_WARP_MPS_COOP", "v2" if threadgroup == 32 else "v1")
     coop_solver = str(coop_solver).lower()
     if coop_solver not in ("v1", "v2"):
       raise ValueError(f"coop_solver must be 'v1' or 'v2', got {coop_solver!r}")
     if coop_solver == "v2" and threadgroup != 32:
-      raise ValueError(f"coop_solver='v2' requires threadgroup=32, got {threadgroup}")
+      if explicit_solver:
+        raise ValueError(f"coop_solver='v2' requires threadgroup=32, got {threadgroup}")
+      coop_solver = "v1"
     self.coop_solver = coop_solver if self.coop else "v1"
     # coop-v2 walks support pairs, so it consumes the per-row meta table; the row
     # storage itself stays dense (v1 dense-row loops elsewhere are unchanged)
@@ -524,10 +573,13 @@ class BatchedEngine:
         "sup_dofs",
         "sup_num",
         "dof_pad",
+        "dof_desc_ptr",
+        "dof_desc_idx",
+        "dof_depth",
         "rev_dof",
       )
     }
-    src_s, hdr_s = solve_source(self._t_solve, _solve_adr, packed_m=self.packed_m)
+    src_s, hdr_s = solve_source(self._t_solve, _solve_adr, packed_m=self.packed_m, tree=self.tree)
     if self.coop:
       src_s, hdr_s = solve_source_coop(
         self._t_solve,
@@ -701,8 +753,7 @@ class BatchedEngine:
         if kin
         else []
       ),
-      output_dtypes=[F, F, F, F, *jmeta_dtypes, F, F, F, mx.int32, mx.int32, mx.int32]
-      + ([F] * 9 + [mx.int32] if kin else []),
+      output_dtypes=[F, F, F, F, *jmeta_dtypes, F, F, F, mx.int32, mx.int32, mx.int32] + ([F] * 9 + [mx.int32] if kin else []),
     )
     self.M, self.smooth, self.qfrc_bias, self.J = dyn_out[:4]
     tail = 5 if self.want_jmeta else 4

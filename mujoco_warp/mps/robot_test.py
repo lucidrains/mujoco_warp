@@ -686,7 +686,6 @@ def test_unconstrained_fast_path(coop: bool):
   np.testing.assert_allclose(vm, d.qvel.numpy(), rtol=1e-5, atol=1e-6)
 
 
-
 @pytest.mark.parametrize("eulerdamp", [False, True])
 def test_packed_m_parity(eulerdamp: bool):
   """Dense and packed mass-matrix routes agree bitwise on M and keep trajectories in step.
@@ -786,3 +785,34 @@ def test_coop_v2_env_switch(monkeypatch):
   assert coop.coop and coop.coop_solver == "v2"
   solo = BatchedEngine(mjm, nworld=4, coop=False)
   assert not solo.coop and solo.coop_solver == "v1"
+
+
+def test_tree_solve_matches_dense():
+  """Tree LDL^T matches the dense solve when constraint rows are chain-supported."""
+  for scene in (
+    "mujoco_warp/test_data/humanoid/humanoid.xml",
+    "mujoco_warp/test_data/humanoid/n_humanoid.xml",
+  ):
+    mjm = mujoco.MjModel.from_xml_path(scene)
+    nworld = 2
+    rng = np.random.default_rng(7)
+    qpos = np.tile(np.array(mjm.qpos0, np.float32), (nworld, 1))
+    qpos[:, :3] += rng.normal(0, 0.005, (nworld, 3)).astype(np.float32)
+    qvel = rng.normal(0, 0.02, (nworld, mjm.nv)).astype(np.float32)
+    ctrl = rng.uniform(-0.3, 0.3, (nworld, mjm.nu)).astype(np.float32)
+
+    dense = BatchedEngine(mjm, nworld=nworld, coop=False, iterations=1)
+    tree = BatchedEngine(mjm, nworld=nworld, tree=True, iterations=1)
+    assert not tree.coop
+    for eng in (dense, tree):
+      eng.set_state(qpos, qvel, ctrl)
+
+    # one step isolates the factorization; chaotic amplification over a trajectory
+    # would dominate the (order-dependent) float rounding
+    dense.step()
+    tree.step()
+    qd, ud = dense.get_state()
+    qt, ut = tree.get_state()
+    assert np.isfinite(qt).all() and np.isfinite(ut).all()
+    np.testing.assert_allclose(qt, qd, atol=1e-5, rtol=0)
+    np.testing.assert_allclose(ut, ud, atol=5e-4, rtol=0)

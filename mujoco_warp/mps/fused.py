@@ -207,6 +207,65 @@ static inline void g_chol_solve_fact(const thread float* L, const thread float* 
   }
 }
 
+// Tree LDL^T: H has nonzeros only between a dof and its ancestors (pad is
+// self-first, -1 padded).  Eliminate leaves first and form the unit upper factor
+// H = U D U^T; U lives in the same lower-triangle slots as the input H.
+// Same factor, H packed as one ancestor chain per dof: h[i*nch] is the diagonal
+// and h[i*nch + c] is H[i, pad[i*nch + c]].
+static inline void g_tree_chol_packed(
+  thread float* h, const device int* pad, const device int* dptr, const device int* didx,
+  const device int* depth, int nv, int nch
+) {
+  for (int d = nv - 1; d >= 0; --d) {
+    int drow = d * nch;
+    int dd = depth[d];
+    float diag = h[drow];
+    for (int t = dptr[d]; t < dptr[d + 1]; ++t) {
+      int q = didx[t];
+      int sq = depth[q] - dd;
+      float u = h[q * nch + sq];
+      diag -= u * u * h[q * nch];
+    }
+    h[drow] = diag;
+    for (int c = 1; c < nch; ++c) {
+      if (pad[drow + c] < 0) break;
+      float u = h[drow + c];
+      for (int t = dptr[d]; t < dptr[d + 1]; ++t) {
+        int q = didx[t];
+        int sq = depth[q] - dd;
+        u -= h[q * nch + c + sq] * h[q * nch] * h[q * nch + sq];
+      }
+      h[drow + c] = u / diag;
+    }
+  }
+}
+
+static inline void g_tree_solve_packed(
+  const thread float* h, const thread float* b, thread float* x,
+  const device int* pad, const device int* dptr, const device int* didx, const device int* depth,
+  int nv, int nch, thread float* z
+) {
+  for (int i = 0; i < nv; ++i) z[i] = b[i];
+  for (int i = nv - 1; i >= 0; --i) {
+    int di = depth[i];
+    for (int t = dptr[i]; t < dptr[i + 1]; ++t) {
+      int q = didx[t];
+      z[i] -= h[q * nch + depth[q] - di] * z[q];
+    }
+  }
+  for (int i = 0; i < nv; ++i) z[i] /= h[i * nch];
+  for (int d = 0; d < nv; ++d) {
+    float xd = z[d];
+    int prowo = d * nch;
+    for (int c = 1; c < nch; ++c) {
+      int i = pad[prowo + c];
+      if (i < 0) break;
+      xd -= h[d * nch + c] * x[i];
+    }
+    x[d] = xd;
+  }
+}
+
 // mask-Newton row cost/grad/hess for one constraint row (batched_engine.eval_rows)
 static inline void g_row_cost(float x, float d, float fl, thread float* c, thread float* g, thread float* hs) {
   if (fl > 0.0f) {
@@ -1541,12 +1600,18 @@ def dyn_source(
 
 
 # --------------------------------------------------------------------- K2 solve+integrate
-def solve_source(t: dict, adr_i: dict[str, int] | None = None, packed_m: bool = False) -> tuple[str, str]:
+def solve_source(t: dict, adr_i: dict[str, int] | None = None, packed_m: bool = False, tree: bool = False) -> tuple[str, str]:
   """K2 source. Templates: NJNT NQ NV RC MS ITER LSITER WARMSTART EULERDAMP NCH RCH.
 
   `packed_m=True` consumes the ancestor-chain mass matrix (`NV * NCH` floats,
   `dof_pad`/`rev_dof` index tables) and applies it by walking the chain plus its
   transpose instead of a dense `NV * NV` block.
+
+  `tree=True` factorizes the packed solver Hessian with the tree LDL^T
+  (`g_tree_chol_packed`) instead of dense Cholesky.  Valid when every active
+  constraint row is supported on one root-to-leaf dof chain, which keeps H
+  tree-sparse; a row that couples two branches would be silently ignored, so
+  callers must gate this on the model.
   """
   NJ, NQ, NV = t["NJNT"], t["NQ"], t["NV"]
   RC, ITER, LSITER = t["RC"], t["ITER"], t["LSITER"]
@@ -1958,6 +2023,27 @@ def solve_source(t: dict, adr_i: dict[str, int] | None = None, packed_m: bool = 
 """
   if packed_m:
     body = _pack_m_body(body, NV, NCH, RCH, _matvec, _h_init_flat)
+  if tree:
+    if not packed_m:
+      raise ValueError("tree solve requires the packed mass-matrix layout")
+    body = _pack_h_body(body, NV, NCH)
+    needed = ("dof_pad", "dof_desc_ptr", "dof_desc_idx", "dof_depth")
+    if not adr_i or any(k not in adr_i for k in needed):
+      raise ValueError(f"tree solve requires {needed}")
+    pad_off = adr_i["dof_pad"]
+    ptr_off = adr_i["dof_desc_ptr"]
+    idx_off = adr_i["dof_desc_idx"]
+    dep_off = adr_i["dof_depth"]
+    assert "int nit = 0;" in body
+    body = body.replace("int nit = 0;", f"int nit = 0;\n  thread float tree_z[{NV}];")
+    args = f"&mif[{pad_off}], &mif[{ptr_off}], &mif[{idx_off}], &mif[{dep_off}], {NV}, {NCH}"
+    body = body.replace(f"g_chol_inplace(h, {NV});", f"g_tree_chol_packed(h, {args});")
+    body, nsub = re.subn(
+      rf"g_chol_solve_fact\(h, ([^,]+), ([^,]+), {NV}\)",
+      rf"g_tree_solve_packed(h, \1, \2, {args}, tree_z)",
+      body,
+    )
+    assert nsub > 0, "tree solve found no Cholesky solve calls"
   for name, off in sorted((adr_i or {}).items(), key=lambda x: -len(x[0])):
     body = body.replace(f"{name}[", f"mif[{off} + ")
   return body, _MSL_HELPERS
@@ -2040,6 +2126,33 @@ def _pack_m_body(body: str, nv: int, nch: int, rch: int, matvec, h_init_flat) ->
   return body
 
 
+def _pack_h_body(body: str, nv: int, nch: int) -> str:
+  """Rewrites the tree solve's dense H into the (nv, nch) ancestor-chain layout."""
+  subs = [
+    (f"thread float h[{nv} * {nv}];", f"thread float h[{nv} * {nch}];"),
+    (
+      f"for (int i = 0; i < {nv}; ++i) for (int j = 0; j <= i; ++j) h[i * {nv} + j] = 0.0f;",
+      f"for (int i = 0; i < {nv} * {nch}; ++i) h[i] = M[i];",
+    ),
+    (
+      f"for (int i = 0; i < {nv}; ++i) \\\n        for (int j = 0; j <= i; ++j) h[i * {nv} + j] = 0.0f; \\\n",
+      f"for (int i = 0; i < {nv} * {nch}; ++i) h[i] = M[i]; \\\n",
+    ),
+    (f"h[i * {nv} + j] = M[i * {nch} + c];", f"h[i * {nch} + c] = M[i * {nch} + c];"),
+    (f"h[i * {nv} + i] += dt * dof_damping[i];", f"h[i * {nch}] += dt * dof_damping[i];"),
+    (
+      f"h[di * {nv} + sup_dofs[base + j]] += dq2 * J_in[jb + j];",
+      f"h[di * {nch} + dof_depth[di] - dof_depth[sup_dofs[base + j]]] += dq2 * J_in[jb + j];",
+    ),
+  ]
+  for old, new in subs:
+    assert old in body, f"packed-H rewrite missed a fragment:\n{old}"
+    body = body.replace(old, new)
+  assert f"h[i * {nv}" not in body, "packed-H rewrite left a dense H read"
+  assert f"h[di * {nv}" not in body, "packed-H rewrite left a dense H update"
+  return body
+
+
 # --------------------------------------------------------------------- K2 cooperative
 def coop_v2_body(src: str, nv: int, tg: int, rc: int, ms: int, off: dict[str, int]) -> str:
   """Rewrites the cooperative solve into the balanced (coop-v2) form.
@@ -2061,7 +2174,9 @@ def coop_v2_body(src: str, nv: int, tg: int, rc: int, ms: int, off: dict[str, in
   substituted table names to `mif` offsets.
   """
   assert tg == 32, "coop-v2 assumes a 32-lane threadgroup"
-  pat = re.compile(r"(#define PAR_CHOL\(A\) \\\n  \{ \\\n    if \(" + str(tg) + r" == 32\) \{ \\\n).*?(\n    \} else \{ \\)", re.S)
+  pat = re.compile(
+    r"(#define PAR_CHOL\(A\) \\\n  \{ \\\n    if \(" + str(tg) + r" == 32\) \{ \\\n).*?(\n    \} else \{ \\)", re.S
+  )
   m = pat.search(src)
   assert m, "coop-v2: PAR_CHOL 32-lane branch not found"
   tri_off = off["tri_pairs"]
@@ -2646,4 +2761,3 @@ def solve_source_coop(t: dict, adr_i: dict[str, int] | None = None, tg: int = 32
   for name, off in sorted((adr_i or {}).items(), key=lambda x: -len(x[0])):
     body = body.replace(f"{name}[", f"mif[{off} + ")
   return body, _MSL_HELPERS
-

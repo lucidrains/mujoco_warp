@@ -181,6 +181,64 @@ func choleskySolve(a: ptr UncheckedArray[float32], n, stride: int, x: ptr Unchec
       s -= a[iRow + k] * x[k]
     x[i] = s / a[iRow + i]
 
+# Tree LDLᵀ for the upper-triangle H layout used by the Newton worker:
+# H = U D Uᵀ, U[i, d] lives at a[i * stride + d] for ancestor i.
+func treeFactorize(a: ptr UncheckedArray[float32], n, stride: int,
+                   parent, descPtr, descIdx: ptr UncheckedArray[int32]) {.inline.} =
+  for d in countdown(n - 1, 0):
+    let dRow = d * stride
+    var diag = a[dRow + d]
+    for t in descPtr[d] ..< descPtr[d + 1]:
+      let q = int(descIdx[t])
+      let u = a[dRow + q]
+      diag -= u * u * a[q * stride + q]
+    a[dRow + d] = diag
+    var i = int(parent[d])
+    while i >= 0:
+      let iRow = i * stride
+      var u = a[iRow + d]
+      for t in descPtr[d] ..< descPtr[d + 1]:
+        let q = int(descIdx[t])
+        u -= a[iRow + q] * a[q * stride + q] * a[dRow + q]
+      a[iRow + d] = u / diag
+      i = int(parent[i])
+
+func treeSolve(a: ptr UncheckedArray[float32], n, stride: int,
+               parent, descPtr, descIdx: ptr UncheckedArray[int32],
+               b, x, work: ptr UncheckedArray[float32]) {.inline.} =
+  for i in countdown(n - 1, 0):
+    var s = b[i]
+    for t in descPtr[i] ..< descPtr[i + 1]:
+      let q = int(descIdx[t])
+      s -= a[i * stride + q] * work[q]
+    work[i] = s
+  for i in 0 ..< n:
+    work[i] = work[i] / a[i * stride + i]
+  for d in 0 ..< n:
+    var v = work[d]
+    var i = int(parent[d])
+    while i >= 0:
+      v -= a[i * stride + d] * x[i]
+      i = int(parent[i])
+    x[d] = v
+
+func denseRowsAreChains(j: ptr UncheckedArray[float32], jBase, nv, nvPad, nefc: int,
+                        anc: ptr UncheckedArray[int8], depth: ptr UncheckedArray[int32]): bool =
+  ## True when every active row's nonzero dofs lie on one root-to-leaf dof chain.
+  for r in 0 ..< nefc:
+    var deepest = -1
+    var maxDepth = -1
+    for i in 0 ..< nv:
+      if j[jBase + r * nvPad + i] != 0.0'f32 and int(depth[i]) > maxDepth:
+        maxDepth = int(depth[i])
+        deepest = i
+    if deepest < 0:
+      continue
+    for i in 0 ..< nv:
+      if i != deepest and j[jBase + r * nvPad + i] != 0.0'f32 and anc[deepest * nv + i] == 0:
+        return false
+  true
+
 # H = M + JᵀDJ, dense per world, upper triangle only (Cholesky reads upper).
 
 type
@@ -245,6 +303,7 @@ proc jtdaJDense*(
 # Cholesky factorize ctx.h (nv x nv upper) and solve for the Newton search direction.
 
 var hCopyBuf {.threadvar.}: seq[float32]
+var jSparseBuf {.threadvar.}: seq[float32]
 
 type
   CholeskySolveArgs = object
@@ -587,7 +646,7 @@ type
     overflow: ptr UncheckedArray[int32]
 
 proc linesearchPyramidalWorld(
-  w, nv, nvPad, njmax, lsIterations: int,
+  w, jBase, nv, nvPad, njmax, lsIterations: int,
   nTol, nLsTol, nMeaninertia, qfrcSmoothStride, qaccStride, maStride: int,
   fuseJv, incremental: bool,
   optTolerance, optLsTolerance, statMeaninertia: ptr UncheckedArray[float32],
@@ -612,7 +671,7 @@ proc linesearchPyramidalWorld(
     if fuseJv:
       let recomputeJv = if incremental: not searchUnchanged[w] else: true
       if recomputeJv:
-        let jWorldOff = w * njmax * nvPad
+        let jWorldOff = jBase
         for efcid in 0 ..< nefc:
           let jRow = jWorldOff + efcid * nvPad
           var jvVal = 0.0'f32
@@ -887,7 +946,7 @@ proc linesearchIterativeWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsa
     if a.done[w]:
       continue
     linesearchPyramidalWorld(
-      w, a.nv, a.nvPad, a.njmax, a.lsIterations,
+      w, w * a.njmax * a.nvPad, a.nv, a.nvPad, a.njmax, a.lsIterations,
       a.nTol, a.nLsTol, a.nMeaninertia, a.qfrcSmoothStride, a.qaccStride, a.maStride,
       a.fuseJv, a.incremental,
       a.optTolerance, a.optLsTolerance, a.statMeaninertia,
@@ -934,9 +993,15 @@ type
     nworld, nv, nvPad, njmax, nC, optIterations, lsIterations: int
     nTol, nLsTol, nMeaninertia: int
     qfrcSmoothStride, qaccSmoothStride, qaccWarmstartStride, qaccStride, qfrcConstraintStride, maStride: int
-    warmstart, hasHfactor: bool
+    warmstart, hasHfactor, tree: bool
     optTolerance, optLsTolerance, statMeaninertia: ptr UncheckedArray[float32]
     mColind, mHinitI, mMulmRowadr, mMulmCol, mMulmMadr: ptr UncheckedArray[int32]
+    parent, descPtr, descIdx: ptr UncheckedArray[int32]
+    anc: ptr UncheckedArray[int8]
+    depth: ptr UncheckedArray[int32]
+    sparse: bool
+    jRowadr, jRownnz, jColind: ptr UncheckedArray[int32]
+    jNnz: int
     ne, nf, nefc, solverNiter, overflow: ptr UncheckedArray[int32]
     M, qfrcSmooth, qaccSmooth, qaccWarmstart, qacc, qfrcConstraint: ptr UncheckedArray[float32]
     efcJ, efcD, efcAref, efcFrictionloss, efcForce, efcMa: ptr UncheckedArray[float32]
@@ -977,6 +1042,8 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
       break
 
     var jrow {.noinit.}: array[JRowMax, float32]
+    var treeWork {.noinit.}: array[JRowMax, float32]
+    let treeWorkPtr = cast[ptr UncheckedArray[float32]](addr treeWork[0])
 
     let ne = int(a.ne[w])
     let nf = int(a.nf[w])
@@ -991,10 +1058,25 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
     let maOff = w * a.maStride
     let mOff = w * a.nC
     let efcOff = w * njmax
-    let jWorldOff = w * njmax * nvPad
+    var jWorldOff = w * njmax * nvPad
     let gradOff = w * nvPad
     let sOff = w * nv
     let mvOff = w * nv
+    var jPtr = a.efcJ
+    if a.sparse and nefc > 0:
+      let jd = scratchNoZero(jSparseBuf, nefc * nvPad)
+      let jW = w * a.jNnz
+      for r in 0 ..< nefc:
+        let row = r * nvPad
+        zeroMem(addr jd[row], nvPad * sizeof(float32))
+        let radr = int(a.jRowadr[w * njmax + r])
+        let rn = int(a.jRownnz[w * njmax + r])
+        for k in 0 ..< rn:
+          jd[row + int(a.jColind[jW + radr + k])] = a.efcJ[jW + radr + k]
+      jPtr = jd
+      jWorldOff = 0
+    let useTree = a.tree and nv <= JRowMax and a.parent != nil and a.anc != nil and a.depth != nil and
+      denseRowsAreChains(jPtr, jWorldOff, nv, nvPad, nefc, a.anc, a.depth)
 
     if a.warmstart and int(a.nefc[w]) > 0:
       copyMem(addr a.qacc[qaOff], addr a.qaccWarmstart[qawOff], nv * sizeof(float32))
@@ -1012,7 +1094,7 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
       let jRow = jWorldOff + efcid * nvPad
       var jr = 0.0'f32
       for i in 0 ..< nv:
-        jr += a.efcJ[jRow + i] * a.qacc[qaOff + i]
+        jr += jPtr[jRow + i] * a.qacc[qaOff + i]
       a.jaref[efcOff + efcid] = jr - a.efcAref[efcOff + efcid]
 
     # Ma = M @ qacc
@@ -1035,7 +1117,7 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
       if force != 0.0'f32:
         let jRow = jWorldOff + efcid * nvPad
         for i in 0 ..< nv:
-          a.qfrcConstraint[qcOff + i] += force * a.efcJ[jRow + i]
+          a.qfrcConstraint[qcOff + i] += force * jPtr[jRow + i]
 
     # Initial gradient & H = M + J^T D_quad J in thread-local L1 buffer
     var gDot = 0.0'f32
@@ -1063,7 +1145,7 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
         # copy the row locally: with raw float pointers gcc must assume the
         # hLocal stores alias the J row and cannot vectorize the update
         for q in 0 ..< nv:
-          jrow[q] = a.efcJ[jk + q]
+          jrow[q] = jPtr[jk + q]
         for i in 0 ..< nv:
           let ji = dk * jrow[i]
           if ji == 0.0'f32:
@@ -1073,22 +1155,28 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
             hLocal[hRow + jj] += ji * jrow[jj]
       else:
         for i in 0 ..< nv:
-          let ji = dk * a.efcJ[jk + i]
+          let ji = dk * jPtr[jk + i]
           if ji == 0.0'f32:
             continue
           let hRow = i * nvPad
           for jj in i ..< nv:
-            hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
+            hLocal[hRow + jj] += ji * jPtr[jk + jj]
 
     for i in 0 ..< nv:
       let rowOff = i * nvPad + i
       copyMem(addr factorPtr[rowOff], addr hLocal[rowOff], (nv - i) * sizeof(float32))
-    choleskyFactorize(factorPtr, nv, nvPad)
+    if useTree:
+      treeFactorize(factorPtr, nv, nvPad, a.parent, a.descPtr, a.descIdx)
+    else:
+      choleskyFactorize(factorPtr, nv, nvPad)
 
     let xw = at(a.search, sOff)
     for i in 0 ..< nv:
       xw[i] = a.grad[gradOff + i]
-    choleskySolve(factorPtr, nv, nvPad, xw)
+    if useTree:
+      treeSolve(factorPtr, nv, nvPad, a.parent, a.descPtr, a.descIdx, xw, xw, treeWorkPtr)
+    else:
+      choleskySolve(factorPtr, nv, nvPad, xw)
 
     var sd = 0.0'f32
     var nd = 0.0'f32
@@ -1120,16 +1208,16 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
           let jRow = jWorldOff + efcid * nvPad
           var jvVal = 0.0'f32
           for i in 0 ..< nv:
-            jvVal += a.efcJ[jRow + i] * a.search[sOff + i]
+            jvVal += jPtr[jRow + i] * a.search[sOff + i]
           a.jv[efcOff + efcid] = jvVal
 
       linesearchPyramidalWorld(
-        w, nv, nvPad, njmax, a.lsIterations,
+        w, jWorldOff, nv, nvPad, njmax, a.lsIterations,
         a.nTol, a.nLsTol, a.nMeaninertia, a.qfrcSmoothStride, a.qaccStride, a.maStride,
         false, true,
         a.optTolerance, a.optLsTolerance, a.statMeaninertia,
         a.ne, a.nf, a.nefc,
-        a.qfrcSmooth, a.efcJ, a.efcD, a.efcFrictionloss,
+        a.qfrcSmooth, jPtr, a.efcD, a.efcFrictionloss,
         a.searchUnchanged, a.lsExhausted,
         a.jaref, a.search, a.searchDot, a.mv, a.jv,
         a.qacc, a.efcMa, a.improvement, a.alpha,
@@ -1172,7 +1260,7 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
           if force != 0.0'f32:
             let jRow = jWorldOff + efcid * nvPad
             for i in 0 ..< nv:
-              a.qfrcConstraint[qcOff + i] += force * a.efcJ[jRow + i]
+              a.qfrcConstraint[qcOff + i] += force * jPtr[jRow + i]
 
         var gDotIter = 0.0'f32
         for i in 0 ..< nv:
@@ -1191,7 +1279,7 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
             let jk = jWorldOff + efcid * nvPad
             if nvPad <= JRowMax:
               for q in 0 ..< nv:
-                jrow[q] = a.efcJ[jk + q]
+                jrow[q] = jPtr[jk + q]
               for i in 0 ..< nv:
                 let ji = dk * jrow[i]
                 if ji == 0.0'f32:
@@ -1201,20 +1289,26 @@ proc newtonSolveWorker(arg: pointer, tid, nthreads: int) {.nimcall, gcsafe.} =
                   hLocal[hRow + jj] += ji * jrow[jj]
             else:
               for i in 0 ..< nv:
-                let ji = dk * a.efcJ[jk + i]
+                let ji = dk * jPtr[jk + i]
                 if ji == 0.0'f32:
                   continue
                 let hRow = i * nvPad
                 for jj in i ..< nv:
-                  hLocal[hRow + jj] += ji * a.efcJ[jk + jj]
+                  hLocal[hRow + jj] += ji * jPtr[jk + jj]
           for i in 0 ..< nv:
             let rowOff = i * nvPad + i
             copyMem(addr factorPtr[rowOff], addr hLocal[rowOff], (nv - i) * sizeof(float32))
-          choleskyFactorize(factorPtr, nv, nvPad)
+          if useTree:
+            treeFactorize(factorPtr, nv, nvPad, a.parent, a.descPtr, a.descIdx)
+          else:
+            choleskyFactorize(factorPtr, nv, nvPad)
 
         for i in 0 ..< nv:
           xw[i] = a.grad[gradOff + i]
-        choleskySolve(factorPtr, nv, nvPad, xw)
+        if useTree:
+          treeSolve(factorPtr, nv, nvPad, a.parent, a.descPtr, a.descIdx, xw, xw, treeWorkPtr)
+        else:
+          choleskySolve(factorPtr, nv, nvPad, xw)
 
         var sdIter = 0.0'f32
         var ndIter = 0.0'f32
@@ -1258,6 +1352,8 @@ proc newtonSolveDense*(
   jaref, search, searchDot, mv, jv, grad, gradDot, newtonDecrement, gradScale: uint64,
   improvement, alpha, H, hfactor: uint64,
   searchUnchanged, done, lsExhausted: uint64,
+  tree: int, parent, descPtr, descIdx, anc, depth: uint64,
+  sparse: int, jRowadr, jRownnz, jColind: uint64, jNnz: int,
 ): void {.exportpy: "newton_solve_dense".} =
   var args = NewtonSolveArgs(
     nworld: nworld, nv: nv, nvPad: nvPad, njmax: njmax, nC: nC,
@@ -1290,6 +1386,12 @@ proc newtonSolveDense*(
     H: toPtr[float32](H), hfactor: toPtr[float32](hfactor),
     searchUnchanged: toPtr[bool](searchUnchanged), done: toPtr[bool](done),
     lsExhausted: toPtr[bool](lsExhausted),
+    tree: tree != 0, parent: toPtr[int32](parent),
+    descPtr: toPtr[int32](descPtr), descIdx: toPtr[int32](descIdx),
+    anc: toPtr[int8](anc), depth: toPtr[int32](depth),
+    sparse: sparse != 0,
+    jRowadr: toPtr[int32](jRowadr), jRownnz: toPtr[int32](jRownnz),
+    jColind: toPtr[int32](jColind), jNnz: jNnz,
   )
   runJob(newtonSolveWorker, addr args, if nworld * nv >= 256: nworld else: 1)
 

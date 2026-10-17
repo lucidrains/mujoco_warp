@@ -22,14 +22,20 @@ loops partitioned across cores.  Import is deferred and best-effort: any missing
 dependency or compile failure falls back to the stock Warp kernels.
 """
 
+import importlib.util
 import os
+import sys
 import warnings
+from pathlib import Path
 
+import numpy as np
 import warp as wp
 
 _OPS = None
 _TRIED = False
 _SKIP = set(filter(None, os.environ.get("MUJOCO_WARP_NIM_SKIP", "").split(",")))
+_TREE_TABLES: dict[tuple, tuple[int, ...]] = {}
+_TREE_ARRAYS: dict[tuple, tuple] = {}
 
 
 def enabled(name: str) -> bool:
@@ -75,6 +81,36 @@ def layout(a) -> tuple[int, int]:
   return (int(a.shape[0]), int(a.strides[0]) // 4)
 
 
+def _import_nim_ops():
+  from mujoco_warp._src import nim_cpu_ops
+
+  return nim_cpu_ops
+
+
+def _compile_nim_ops():
+  """Compile nim_cpu_ops explicitly when nimporter's import hook cannot find it.
+
+  nimporter-plus reconstructs the source path from ``sys.path``, which fails for
+  editable installs imported from outside the repository root.  Its exporter can
+  be pointed at the package root (the directory containing ``mujoco_warp/``).
+  """
+  from nimporter_plus import nimport
+
+  fullname = "mujoco_warp._src.nim_cpu_ops"
+  root = str(Path(__file__).resolve().parents[2])
+  spec = nimport(fullname, [root], library=False)
+  if spec is None:
+    raise ImportError(f"nimporter-plus could not locate {fullname}.nim under {root}")
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[fullname] = module
+  try:
+    spec.loader.exec_module(module)
+  except Exception:
+    sys.modules.pop(fullname, None)
+    raise
+  return module
+
+
 def get_ops():
   """Return the compiled Nim ops module, or None when unavailable."""
   global _OPS, _TRIED
@@ -92,9 +128,70 @@ def get_ops():
   except ImportError:
     return None
   try:
-    from mujoco_warp._src import nim_cpu_ops
-
-    _OPS = nim_cpu_ops
-  except Exception as err:
-    warnings.warn(f"mujoco_warp: Nim CPU fast path disabled: {err}", stacklevel=2)
+    _OPS = _import_nim_ops()
+  except Exception as import_err:
+    try:
+      _OPS = _compile_nim_ops()
+    except Exception as err:
+      warnings.warn(
+        f"mujoco_warp: Nim CPU fast path disabled: {err} (import: {import_err})", stacklevel=2
+      )
   return _OPS
+
+
+def _enabled(m, attr: str, env: str) -> bool:
+  value = getattr(m, attr, None) if m is not None else None
+  if value is not None:
+    return bool(value)
+  return os.environ.get(env, "") not in ("", "0")
+
+
+def tree_enabled(m=None) -> bool:
+  """Whether the opt-in tree-sparse Newton factorization is requested."""
+  return _enabled(m, "_nim_tree", "MUJOCO_WARP_NIM_TREE")
+
+
+def sparse_enabled(m=None) -> bool:
+  """Whether the opt-in Nim sparse-Jacobian Newton solver is requested."""
+  return _enabled(m, "_nim_sparse", "MUJOCO_WARP_NIM_SPARSE")
+
+
+def tree_tables(m) -> tuple[int, ...]:
+  """Device addresses of (parent, descendant CSR, ancestor mask, depth)."""
+  if not tree_enabled(m):
+    return (0, 0, 0, 0, 0)
+  parent = m.dof_parentid.numpy()
+  key = (int(m.nv), int(m.dof_parentid.ptr))
+  cached = _TREE_TABLES.get(key)
+  if cached is not None:
+    return cached
+  nv = int(m.nv)
+  desc = [[] for _ in range(nv)]
+  depth = np.zeros(nv, np.int32)
+  anc = np.zeros((nv, nv), np.int8)
+  for q in range(nv):
+    p = int(parent[q])
+    while p >= 0:
+      desc[p].append(q)
+      depth[q] += 1
+      anc[q, p] = 1
+      p = int(parent[p])
+    anc[q, q] = 1
+  ptr = np.zeros(nv + 1, np.int32)
+  idx: list[int] = []
+  for i, row in enumerate(desc):
+    idx.extend(row)
+    ptr[i + 1] = len(idx)
+  ptr_arr = wp.array(ptr, dtype=int, device="cpu")
+  idx_arr = wp.array(np.asarray(idx, np.int32), dtype=int, device="cpu")
+  anc_arr = wp.array(anc.reshape(-1), dtype=wp.int8, device="cpu")
+  dep_arr = wp.array(depth, dtype=int, device="cpu")
+  _TREE_ARRAYS[key] = (ptr_arr, idx_arr, anc_arr, dep_arr)
+  _TREE_TABLES[key] = (
+    int(m.dof_parentid.ptr),
+    int(ptr_arr.ptr),
+    int(idx_arr.ptr),
+    int(anc_arr.ptr),
+    int(dep_arr.ptr),
+  )
+  return _TREE_TABLES[key]

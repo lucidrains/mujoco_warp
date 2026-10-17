@@ -256,7 +256,12 @@ def m_block_layout(mjm: mujoco.MjModel) -> dict:
   }
 
 
-def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) -> types.Model:
+def put_model(
+  mjm: mujoco.MjModel,
+  batch_sizes: dict[str, int] | None = None,
+  nim_sparse: bool | None = None,
+  nim_tree: bool | None = None,
+) -> types.Model:
   """Creates a model on device.
 
   Args:
@@ -264,6 +269,10 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     batch_sizes: Optional per-field leading batch sizes for `Model` fields whose
       array spec starts with `*`. Fields not listed here keep the default shared
       leading dimension of 1.
+    nim_sparse: Opt-in sparse-Jacobian Nim Newton for `m.is_sparse` models.
+      `None` falls back to `$MUJOCO_WARP_NIM_SPARSE`.
+    nim_tree: Opt-in tree-sparse Hessian factor for the Nim Newton.
+      `None` falls back to `$MUJOCO_WARP_NIM_TREE`.
 
   Returns:
     The model containing kinematic and dynamic information (device).
@@ -1325,6 +1334,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       setattr(m, f.name, _create_array(getattr(m, f.name), f.type, sizes, batch_size))
 
   warp_util.mark_batched(m)
+  m._nim_sparse = nim_sparse
+  m._nim_tree = nim_tree
   return m
 
 

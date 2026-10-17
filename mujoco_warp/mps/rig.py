@@ -379,9 +379,9 @@ class Rig:
     # per-pair polygon base offset (mesh + polyadr), for the plane-convex face
     # manifold; -1 when the second geom carries no mesh polygon data
 
-    self.pair_polyadr = np.asarray([
-      int(mjm.mesh_polyadr[int(mjm.geom_dataid[g2])]) if int(mjm.geom_dataid[g2]) >= 0 else -1 for g2 in g2s
-    ], np.int32)
+    self.pair_polyadr = np.asarray(
+      [int(mjm.mesh_polyadr[int(mjm.geom_dataid[g2])]) if int(mjm.geom_dataid[g2]) >= 0 else -1 for g2 in g2s], np.int32
+    )
     self.pair_body1 = self.geom_bodyid[self.pair_g1].astype(np.int32)
     self.pair_body2 = self.geom_bodyid[self.pair_g2].astype(np.int32)
     if self.npairc > 0:
@@ -459,6 +459,19 @@ class Rig:
     for i, c in enumerate(chains):
       pad[i, : len(c)] = np.asarray(c, np.int32)
     self.dof_pad = np.ascontiguousarray(pad)
+    self.dof_depth = np.asarray([len(c) - 1 for c in chains], np.int32)
+    # descendants of each dof (CSR): the tree factor sums over them
+    desc = [[] for _ in range(nv)]
+    for j, c in enumerate(chains):
+      for a in c[1:]:
+        desc[a].append(j)
+    desc_ptr = np.zeros(nv + 1, np.int32)
+    desc_idx = []
+    for i, r in enumerate(desc):
+      desc_idx.extend(r)
+      desc_ptr[i + 1] = len(desc_idx)
+    self.dof_desc_ptr = np.ascontiguousarray(desc_ptr)
+    self.dof_desc_idx = np.asarray(desc_idx, np.int32)
     rev = [[] for _ in range(nv)]
     for j, c in enumerate(chains):
       for slot, a in enumerate(c):
